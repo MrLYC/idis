@@ -581,6 +581,7 @@ fn ffmpeg_pipeline_produces_valid_h264_annexb_frames() {
             "-t".to_string(),
             "1".to_string(),
         ],
+        video_filter_prefix: None,
         out_width: 320,
         out_height: 240,
         max_pixel_edge: IPAD_MAX_PIXEL_EDGE,

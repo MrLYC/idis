@@ -366,6 +366,32 @@ pub enum WindowMoveLayout {
     FillScreen,
 }
 
+/// Compute destination `(x, y, width, height)` when moving a window into a target monitor work area.
+/// - `FillScreen`: fills the entire work area.
+/// - `KeepSize`: preserves the window's dimensions (clamped to the target work area) and centers it.
+pub fn compute_window_move_rect(
+    cur_w: i32,
+    cur_h: i32,
+    work_x: i32,
+    work_y: i32,
+    work_w: i32,
+    work_h: i32,
+    layout: WindowMoveLayout,
+) -> (i32, i32, i32, i32) {
+    let tw = work_w.max(320);
+    let th = work_h.max(240);
+    match layout {
+        WindowMoveLayout::FillScreen => (work_x, work_y, tw, th),
+        WindowMoveLayout::KeepSize => {
+            let nw = cur_w.max(120).min(tw);
+            let nh = cur_h.max(80).min(th);
+            let nx = work_x + (tw - nw) / 2;
+            let ny = work_y + (th - nh) / 2;
+            (nx, ny, nw, nh)
+        }
+    }
+}
+
 /// Snapshot of a visible desktop window (normal or floating overlay) reported by the OS.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DesktopWindowInfo {
@@ -516,6 +542,11 @@ pub trait DisplayBackend: Send + Sync {
         None
     }
 
+    /// Additional non-primary OS displays `(display_id, name, x, y, width, height)` available for window routing.
+    fn list_additional_displays(&self) -> Vec<(u32, String, i32, i32, u32, u32)> {
+        Vec::new()
+    }
+
     /// Create a zero-encode standalone virtual display (without screen capture or H.264 encoding).
     fn create_standalone_virtual_display(
         &self,
@@ -529,7 +560,7 @@ pub trait DisplayBackend: Send + Sync {
 
     /// List visible desktop windows (including floating overlay widgets such as Notion recording bars).
     fn list_desktop_windows(&self) -> Result<Vec<DesktopWindowInfo>> {
-        anyhow::bail!("当前平台暂不支持桌面窗口枚举（仅 macOS 支持）")
+        anyhow::bail!("当前平台暂不支持桌面窗口枚举（仅 macOS / Windows 支持）")
     }
 
     /// Move a desktop window onto the target OS display ID.
@@ -540,7 +571,7 @@ pub trait DisplayBackend: Send + Sync {
         _target_display_id: u32,
         _layout: WindowMoveLayout,
     ) -> Result<()> {
-        anyhow::bail!("当前平台暂不支持跨屏窗口移动（仅 macOS 支持）")
+        anyhow::bail!("当前平台暂不支持跨屏窗口移动（仅 macOS / Windows 支持）")
     }
 
     fn host_system_info(&self, override_host_name: &str) -> HostSystemInfo;
@@ -572,6 +603,13 @@ pub fn is_host_screen_locked() -> bool {
     {
         false
     }
+}
+
+/// Initialize early per-process platform settings before spawning threads or querying displays.
+/// On Windows, enables Per-Monitor DPI Awareness v2 so display/cursor/window APIs use physical pixels.
+pub fn init_process_runtime() {
+    #[cfg(target_os = "windows")]
+    windows::init_process_dpi_awareness();
 }
 
 pub fn enable_platform_diagnostics() {
@@ -710,6 +748,25 @@ mod tests {
         assert_eq!(
             compute_integer_scaled_logical(1920, 1080, Some((1920, 1080)), 2, WEB_MAX_PIXEL_EDGE),
             (1920, 1080)
+        );
+    }
+
+    #[test]
+    fn compute_window_move_rect_handles_keep_size_and_fill_screen() {
+        // FillScreen covers the target monitor work area verbatim
+        assert_eq!(
+            compute_window_move_rect(800, 600, 1920, 0, 1280, 720, WindowMoveLayout::FillScreen),
+            (1920, 0, 1280, 720)
+        );
+        // KeepSize centers smaller windows inside target work area
+        assert_eq!(
+            compute_window_move_rect(400, 120, 1920, 40, 1280, 680, WindowMoveLayout::KeepSize),
+            (1920 + 440, 40 + 280, 400, 120)
+        );
+        // KeepSize clamps oversized windows to target work area
+        assert_eq!(
+            compute_window_move_rect(2560, 1440, -1280, 0, 1280, 720, WindowMoveLayout::KeepSize),
+            (-1280, 0, 1280, 720)
         );
     }
 }

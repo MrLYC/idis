@@ -1,3 +1,4 @@
+use crate::config::CaptureRect;
 use crate::platform::{clamp_pixel_dimensions, EncodedFrame, FrameSender, IPAD_MAX_PIXEL_EDGE};
 use crate::protocol::annexb::AnnexBSplitter;
 use anyhow::{anyhow, Context, Result};
@@ -13,6 +14,9 @@ use tracing::{debug, info, warn};
 pub struct FfmpegPipelineSpec {
     pub ffmpeg_path: String,
     pub input_args: Vec<String>,
+    /// Optional video filter stage prepended before scaling/pixel-format conversion
+    /// (e.g. `"hwdownload,format=bgra"` for Windows DXGI `ddagrab`).
+    pub video_filter_prefix: Option<String>,
     pub out_width: u32,
     pub out_height: u32,
     pub max_pixel_edge: u32,
@@ -20,6 +24,50 @@ pub struct FfmpegPipelineSpec {
     pub bitrate_mbps: u32,
     pub encoder: String,
     pub all_intra: bool,
+}
+
+/// Build FFmpeg input arguments for Windows DXGI Desktop Duplication (`ddagrab` via `lavfi`).
+#[allow(dead_code)]
+pub fn build_windows_ddagrab_input_args(
+    output_idx: u32,
+    fps: u32,
+    show_cursor: bool,
+) -> Vec<String> {
+    let draw_mouse = if show_cursor { 1 } else { 0 };
+    vec![
+        "-f".to_string(),
+        "lavfi".to_string(),
+        "-i".to_string(),
+        format!(
+            "ddagrab=output_idx={output_idx}:framerate={}:draw_mouse={draw_mouse}",
+            fps.max(1)
+        ),
+    ]
+}
+
+/// Build FFmpeg input arguments for Windows GDI capture (`gdigrab` fallback / custom crop rect).
+#[allow(dead_code)]
+pub fn build_windows_gdigrab_input_args(
+    src_rect: CaptureRect,
+    fps: u32,
+    show_cursor: bool,
+) -> Vec<String> {
+    vec![
+        "-f".to_string(),
+        "gdigrab".to_string(),
+        "-draw_mouse".to_string(),
+        if show_cursor { "1" } else { "0" }.to_string(),
+        "-framerate".to_string(),
+        fps.max(1).to_string(),
+        "-offset_x".to_string(),
+        src_rect.x.to_string(),
+        "-offset_y".to_string(),
+        src_rect.y.to_string(),
+        "-video_size".to_string(),
+        format!("{}x{}", src_rect.width, src_rect.height),
+        "-i".to_string(),
+        "desktop".to_string(),
+    ]
 }
 
 pub struct FfmpegProcess {
@@ -48,10 +96,24 @@ impl FfmpegPipelineSpec {
         let bitrate = format!("{}M", self.bitrate_mbps.max(2));
         let bufsize = format!("{}M", (self.bitrate_mbps.max(2) * 2));
 
-        let vf = if self.encoder == "h264_vaapi" {
+        let base_vf = if self.encoder == "h264_vaapi" {
             format!("scale={w}:{h}:flags=lanczos:out_color_matrix=bt709,format=nv12,hwupload")
+        } else if matches!(
+            self.encoder.as_str(),
+            "h264_nvenc" | "h264_qsv" | "h264_amf"
+        ) {
+            format!("scale={w}:{h}:flags=lanczos:out_color_matrix=bt709,format=nv12")
         } else {
             format!("scale={w}:{h}:flags=lanczos:out_color_matrix=bt709,format=yuv420p")
+        };
+        let vf = match self
+            .video_filter_prefix
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(prefix) => format!("{prefix},{base_vf}"),
+            None => base_vf,
         };
         args.extend([
             "-vf".to_string(),
@@ -138,6 +200,12 @@ impl FfmpegProcess {
         let (args, w, h) = spec.build_args();
         let mut cmd = Command::new(&spec.ffmpeg_path);
         crate::proxy::strip_proxy_env_on_command(&mut cmd);
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
         cmd.args(&args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -247,6 +315,7 @@ mod tests {
         let base = FfmpegPipelineSpec {
             ffmpeg_path: "ffmpeg".to_string(),
             input_args: vec!["-draw_mouse".to_string(), "0".to_string()],
+            video_filter_prefix: None,
             out_width: 1920,
             out_height: 1080,
             max_pixel_edge: 0,
@@ -270,5 +339,39 @@ mod tests {
         let (args_v, _, _) = vaapi.build_args();
         assert!(args_v.iter().any(|a| a.contains("hwupload")));
         assert!(args_v.windows(2).any(|w| w == ["-bsf:v", "dump_extra"]));
+
+        // Windows ddagrab + hardware encoder (NVENC/QSV/AMF) uses hwdownload,format=bgra -> scale -> nv12
+        let ddagrab_nvenc = FfmpegPipelineSpec {
+            ffmpeg_path: "ffmpeg".to_string(),
+            input_args: build_windows_ddagrab_input_args(0, 60, true),
+            video_filter_prefix: Some("hwdownload,format=bgra".to_string()),
+            out_width: 1920,
+            out_height: 1080,
+            max_pixel_edge: 3840,
+            fps: 60,
+            bitrate_mbps: 24,
+            encoder: "h264_nvenc".to_string(),
+            all_intra: false,
+        };
+        let (args_dda, _, _) = ddagrab_nvenc.build_args();
+        assert!(args_dda
+            .windows(2)
+            .any(|w| w == ["-i", "ddagrab=output_idx=0:framerate=60:draw_mouse=1"]));
+        assert!(args_dda.iter().any(|a| a.starts_with("hwdownload,format=bgra,scale=1920:1080:") && a.ends_with(",format=nv12")));
+
+        // Windows gdigrab fallback preserves offset/size and uses yuv420p for libx264
+        let gdi_args = build_windows_gdigrab_input_args(
+            CaptureRect {
+                x: 1920,
+                y: 0,
+                width: 1280,
+                height: 720,
+            },
+            30,
+            false,
+        );
+        assert!(gdi_args.windows(2).any(|w| w == ["-offset_x", "1920"]));
+        assert!(gdi_args.windows(2).any(|w| w == ["-video_size", "1280x720"]));
+        assert!(gdi_args.windows(2).any(|w| w == ["-draw_mouse", "0"]));
     }
 }

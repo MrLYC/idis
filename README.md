@@ -38,8 +38,8 @@
 | 网页扩展屏（MSE H.264/fMP4 + P2P 中继） | ✅（ScreenCaptureKit + VideoToolbox） | ✅（FFmpeg x11grab + VAAPI/NVENC/x264） | ✅（FFmpeg ddagrab/gdigrab + NVENC/QSV/AMF/x264） |
 | 管理端 / 观看端端口隔离与空闲自动关闭 | ✅ | ✅ | ✅ |
 | 独立虚拟扩展屏 | ✅（`CGVirtualDisplay`） | 镜像 / 主屏 | 镜像 / 主屏 |
-| 零编码临时虚拟屏 & 窗口自动路由 | ✅（原生 AX 窗口管理） | — | — |
-| 锁屏自动暂停 / 断开策略 | ✅ | ✅（logind / D-Bus） | ✅（WTS） |
+| 零编码临时虚拟屏 & 窗口自动路由 | ✅（原生 AX 窗口管理） | — | 窗口自动路由 ✅（Win32 多屏/置顶窗） |
+| 锁屏自动暂停 / 断开策略 | ✅ | ✅（logind / D-Bus） | ✅（OpenInputDesktop 真暂停） |
 | 后台按需唤醒（Socket Activation） | ✅（`launchd`） | ✅（`systemd --user`） | — |
 | 可选传统 USB / Wi-Fi 客户端兼容 | ✅ | ✅ | ✅ |
 

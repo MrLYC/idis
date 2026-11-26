@@ -129,6 +129,8 @@ pub enum WindowRouteTarget {
     Device { fingerprint: String },
     /// Route to the standalone Web independent screen when active.
     WebScreen,
+    /// Route to a specific OS display ID (e.g. a secondary physical monitor or Windows Virtual Display Driver).
+    Display { display_id: u32 },
     /// Route back to the host primary display.
     MainDisplay,
 }
@@ -187,6 +189,9 @@ impl WindowRule {
                 let fp = normalize_fingerprint(fingerprint)
                     .ok_or_else(|| anyhow!("窗口规则中的目标设备指纹无效: {fingerprint:?}"))?;
                 *fingerprint = fp;
+            }
+            WindowRouteTarget::Display { display_id } if *display_id == 0 => {
+                return Err(anyhow!("目标显示器 ID 必须大于 0"));
             }
             _ => {}
         }

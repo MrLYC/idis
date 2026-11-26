@@ -340,6 +340,24 @@ impl SessionRegistry {
             }
         }
 
+        for (did, name, x, y, w, h) in self.backend.list_additional_displays() {
+            if did == 0 || !seen_display_ids.insert(did) {
+                continue;
+            }
+            out.push(ScreenTargetInfo {
+                id: format!("display:{did}"),
+                kind: "display".to_string(),
+                name,
+                display_id: did,
+                x,
+                y,
+                width: w,
+                height: h,
+                is_main: false,
+                device_fingerprint: None,
+            });
+        }
+
         out
     }
 
@@ -445,6 +463,10 @@ impl SessionRegistry {
                 .iter()
                 .find(|s| s.kind == "web")
                 .map(|s| s.display_id),
+            WindowRouteTarget::Display { display_id } => screens
+                .iter()
+                .find(|s| s.display_id == *display_id)
+                .map(|s| s.display_id),
             WindowRouteTarget::MainDisplay => screens
                 .iter()
                 .find(|s| s.is_main)
@@ -512,9 +534,13 @@ impl SessionRegistry {
             || !self.sessions.lock().unwrap().is_empty()
             || self.standalone_web_capture.lock().unwrap().is_some();
         has_non_main
-            || rules
-                .iter()
-                .any(|r| r.enabled && matches!(r.target, WindowRouteTarget::MainDisplay))
+            || rules.iter().any(|r| {
+                r.enabled
+                    && matches!(
+                        r.target,
+                        WindowRouteTarget::MainDisplay | WindowRouteTarget::Display { .. }
+                    )
+            })
     }
 
     /// Force-apply all enabled rules right now (ignoring prior anti-fighting dedup).

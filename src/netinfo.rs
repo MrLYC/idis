@@ -258,11 +258,207 @@ fn enumerate_os_ipv4s() -> Vec<(Ipv4Addr, bool)> {
 }
 
 #[cfg(target_os = "windows")]
-fn enumerate_os_ipv4s() -> Vec<(Ipv4Addr, bool)> {
-    let Ok(out) = std::process::Command::new("ipconfig").output() else {
-        return Vec::new();
+struct WinAdapterInfo {
+    friendly_name: String,
+    description: String,
+    if_type: u32,
+    ipv4s: Vec<Ipv4Addr>,
+    ipv6s: Vec<Ipv6Addr>,
+}
+
+#[cfg(target_os = "windows")]
+unsafe fn pwstr_to_string(ptr: *const u16) -> String {
+    if ptr.is_null() {
+        return String::new();
+    }
+    let mut len = 0usize;
+    while len < 1024 && *ptr.add(len) != 0 {
+        len += 1;
+    }
+    String::from_utf16_lossy(std::slice::from_raw_parts(ptr, len))
+}
+
+#[cfg(target_os = "windows")]
+fn enumerate_windows_adapters() -> Vec<WinAdapterInfo> {
+    use std::mem::size_of;
+    use windows_sys::Win32::Foundation::{ERROR_BUFFER_OVERFLOW, NO_ERROR};
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        GetAdaptersAddresses, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER,
+        GAA_FLAG_SKIP_MULTICAST, IP_ADAPTER_ADDRESSES_LH,
     };
-    parse_ipconfig_entries(&String::from_utf8_lossy(&out.stdout))
+    use windows_sys::Win32::NetworkManagement::Ndis::IfOperStatusUp;
+    use windows_sys::Win32::Networking::WinSock::{
+        AF_INET, AF_INET6, AF_UNSPEC, SOCKADDR_IN, SOCKADDR_IN6,
+    };
+
+    let flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
+    let mut buf_bytes: u32 = 16 * 1024;
+    let mut buf: Vec<u64> = Vec::new();
+    let mut ok = false;
+    for _ in 0..4 {
+        let cap_bytes = (buf_bytes as usize).min(4 * 1024 * 1024);
+        buf.resize(cap_bytes.div_ceil(8), 0);
+        buf_bytes = (buf.len() * 8) as u32;
+        let rc = unsafe {
+            GetAdaptersAddresses(
+                AF_UNSPEC as u32,
+                flags,
+                std::ptr::null(),
+                buf.as_mut_ptr() as *mut IP_ADAPTER_ADDRESSES_LH,
+                &mut buf_bytes,
+            )
+        };
+        if rc == NO_ERROR {
+            ok = true;
+            break;
+        }
+        if rc != ERROR_BUFFER_OVERFLOW || buf_bytes == 0 || buf_bytes > 4 * 1024 * 1024 {
+            return Vec::new();
+        }
+    }
+    if !ok {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    let mut cur = buf.as_ptr() as *const IP_ADAPTER_ADDRESSES_LH;
+    while !cur.is_null() {
+        let adapter = unsafe { &*cur };
+        if adapter.OperStatus == IfOperStatusUp {
+            let friendly_name = unsafe { pwstr_to_string(adapter.FriendlyName.cast_const()) };
+            let description = unsafe { pwstr_to_string(adapter.Description.cast_const()) };
+            let mut ipv4s = Vec::new();
+            let mut ipv6s = Vec::new();
+            let mut ua = adapter.FirstUnicastAddress;
+            while !ua.is_null() {
+                let u = unsafe { &*ua };
+                let sa = u.Address.lpSockaddr;
+                let sa_len = u.Address.iSockaddrLength;
+                if !sa.is_null() && sa_len >= 2 {
+                    let family = unsafe { (*sa).sa_family };
+                    if family == AF_INET && sa_len >= size_of::<SOCKADDR_IN>() as i32 {
+                        let sin = unsafe { &*(sa as *const SOCKADDR_IN) };
+                        let b = unsafe { sin.sin_addr.S_un.S_un_b };
+                        let ip = Ipv4Addr::new(b.s_b1, b.s_b2, b.s_b3, b.s_b4);
+                        if !ipv4s.contains(&ip) {
+                            ipv4s.push(ip);
+                        }
+                    } else if family == AF_INET6 && sa_len >= size_of::<SOCKADDR_IN6>() as i32 {
+                        let sin6 = unsafe { &*(sa as *const SOCKADDR_IN6) };
+                        let ip = Ipv6Addr::from(unsafe { sin6.sin6_addr.u.Byte });
+                        if !ipv6s.contains(&ip) {
+                            ipv6s.push(ip);
+                        }
+                    }
+                }
+                ua = u.Next;
+            }
+            if !ipv4s.is_empty() || !ipv6s.is_empty() {
+                out.push(WinAdapterInfo {
+                    friendly_name,
+                    description,
+                    if_type: adapter.IfType,
+                    ipv4s,
+                    ipv6s,
+                });
+            }
+        }
+        cur = adapter.Next;
+    }
+    out
+}
+
+#[allow(dead_code)]
+fn is_windows_virtual_adapter(friendly_name: &str, description: &str, if_type: u32) -> bool {
+    const IF_TYPE_PPP: u32 = 23;
+    const IF_TYPE_SOFTWARE_LOOPBACK: u32 = 24;
+    const IF_TYPE_TUNNEL: u32 = 131;
+    if matches!(
+        if_type,
+        IF_TYPE_PPP | IF_TYPE_SOFTWARE_LOOPBACK | IF_TYPE_TUNNEL
+    ) {
+        return true;
+    }
+    if is_virtual_iface_name(friendly_name.trim()) {
+        return true;
+    }
+    let hay = format!(
+        "{} {}",
+        friendly_name.to_lowercase(),
+        description.to_lowercase()
+    );
+    let markers = [
+        "vethernet",
+        "wsl",
+        "vmware",
+        "virtualbox",
+        "tailscale",
+        "wireguard",
+        "wintun",
+        "docker",
+        "clash",
+        "mihomo",
+        "flclash",
+        "sing-box",
+        "singbox",
+        "openvpn",
+        "zerotier",
+        "hyper-v",
+        "radmin",
+        "vpn",
+        "tap-windows",
+        "loopback",
+        "teredo",
+        "isatap",
+        "6to4",
+        "bluetooth",
+        "npcap",
+        "hamachi",
+        "nordlynx",
+        "mullvad",
+        "proton",
+        "km-test",
+        "virtual",
+        "unknown adapter",
+        "未知适配器",
+    ];
+    markers.iter().any(|m| hay.contains(m))
+}
+
+#[allow(dead_code)]
+fn windows_adapter_matches_iface(
+    friendly_name: &str,
+    description: &str,
+    target: &str,
+    exact_only: bool,
+) -> bool {
+    let needle = target.trim().to_lowercase();
+    if needle.is_empty() {
+        return false;
+    }
+    let friendly = friendly_name.trim().to_lowercase();
+    if exact_only {
+        return friendly == needle;
+    }
+    friendly.contains(&needle) || description.to_lowercase().contains(&needle)
+}
+
+#[cfg(target_os = "windows")]
+fn enumerate_os_ipv4s() -> Vec<(Ipv4Addr, bool)> {
+    let mut out = Vec::new();
+    for adapter in enumerate_windows_adapters() {
+        let is_virt = is_windows_virtual_adapter(
+            &adapter.friendly_name,
+            &adapter.description,
+            adapter.if_type,
+        );
+        for ip in adapter.ipv4s {
+            if !out.iter().any(|(existing, _)| *existing == ip) {
+                out.push((ip, is_virt));
+            }
+        }
+    }
+    out
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
@@ -326,11 +522,29 @@ pub fn resolve_interface_ip(iface_name: &str) -> Result<IpAddr> {
         {
             return Ok(IpAddr::V4(Ipv4Addr::LOCALHOST));
         }
-        if let Ok(out) = std::process::Command::new("ipconfig").output() {
-            if out.status.success() {
-                let text = String::from_utf8_lossy(&out.stdout);
-                if let Some(ip) = parse_ipconfig_iface_ip(&text, iface) {
-                    return Ok(ip);
+        let adapters = enumerate_windows_adapters();
+        let pick_ip = |a: &WinAdapterInfo| -> Option<IpAddr> {
+            if let Some(&v4) = a.ipv4s.first() {
+                return Some(IpAddr::V4(v4));
+            }
+            a.ipv6s
+                .iter()
+                .copied()
+                .find(|v6| (v6.segments()[0] & 0xffc0) != 0xfe80)
+                .or_else(|| a.ipv6s.first().copied())
+                .map(IpAddr::V6)
+        };
+        for exact_only in [true, false] {
+            for adapter in &adapters {
+                if windows_adapter_matches_iface(
+                    &adapter.friendly_name,
+                    &adapter.description,
+                    iface,
+                    exact_only,
+                ) {
+                    if let Some(ip) = pick_ip(adapter) {
+                        return Ok(ip);
+                    }
                 }
             }
         }
@@ -635,6 +849,50 @@ mod tests {
 
         let win = "   IPv4 Address. . . . . . . . . . . : 198.51.100.18(Preferred)\r\n";
         assert_eq!(parse_ipconfig_ipv4s(win), vec![Ipv4Addr::new(198, 51, 100, 18)]);
+
+        assert!(!is_windows_virtual_adapter(
+            "以太网",
+            "Realtek PCIe GbE Family Controller",
+            6
+        ));
+        assert!(!is_windows_virtual_adapter(
+            "WLAN",
+            "Intel(R) Wi-Fi 6E AX211 160MHz",
+            71
+        ));
+        assert!(is_windows_virtual_adapter(
+            "vEthernet (WSL)",
+            "Hyper-V Virtual Ethernet Adapter",
+            6
+        ));
+        assert!(is_windows_virtual_adapter(
+            "Meta",
+            "Wintun Userspace Tunnel",
+            53
+        ));
+        assert!(is_windows_virtual_adapter(
+            "Tailscale",
+            "Tailscale Tunnel",
+            131
+        ));
+        assert!(windows_adapter_matches_iface(
+            "以太网",
+            "Realtek PCIe GbE Family Controller",
+            "以太网",
+            true
+        ));
+        assert!(!windows_adapter_matches_iface(
+            "以太网 2",
+            "Realtek PCIe GbE Family Controller",
+            "以太网",
+            true
+        ));
+        assert!(windows_adapter_matches_iface(
+            "以太网 2",
+            "Realtek PCIe GbE Family Controller",
+            "Realtek",
+            false
+        ));
 
         let mac_multi = "\
 utun3: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1500

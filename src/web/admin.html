@@ -3242,6 +3242,7 @@ function describeRuleTarget(target) {
     case 'any_ipad': return '任意 iPad 扩展屏';
     case 'device': return `指定 iPad · ${target.fingerprint || '-'}`;
     case 'web_screen': return '网页独立屏';
+    case 'display': return `显示器 · ID ${target.display_id || '-'}`;
     case 'main_display': return '电脑主屏幕';
     default: return String(target.kind || '-');
   }
@@ -3254,7 +3255,10 @@ function renderVirtualDisplaysAndRules(d) {
   const hint = document.getElementById('windowRoutingUnsupportedHint');
   if (hint) {
     if (!supportsVd && !supportsRouting) {
-      hint.textContent = '当前主机平台暂不支持独立虚拟屏与跨屏窗口归位（目前仅 macOS 支持）。';
+      hint.textContent = '当前主机平台暂不支持独立虚拟屏与跨屏窗口归位。';
+      hint.classList.remove('hidden');
+    } else if (!supportsVd && supportsRouting) {
+      hint.textContent = '当前平台支持多屏窗口列表、一键挪窗与自动归位规则；独立虚拟屏创建仅 macOS 原生支持（Windows 可配合虚拟显示器驱动使用）。';
       hint.classList.remove('hidden');
     } else if (caps.accessibility_permission_required && !caps.accessibility_granted) {
       hint.textContent = '未授予 macOS 辅助功能权限，可正常创建虚拟屏，但自动/手动挪动窗口需在系统设置中开启辅助功能授权。';
@@ -3418,7 +3422,9 @@ function renderDesktopWindowsTable() {
     return;
   }
   const defaultTarget = screens.find(s => s.kind === 'virtual')
+    || screens.find(s => s.kind === 'web')
     || screens.find(s => s.kind === 'ipad')
+    || screens.find(s => !s.is_main)
     || screens[0];
   body.innerHTML = filtered.map((w, idx) => {
     const curScreen = screenById.get(w.display_id);
@@ -3484,6 +3490,7 @@ async function saveRuleFromWindowRow(windowId, rowIdx) {
     else if (targetScreen.kind === 'ipad' && targetScreen.device_fingerprint) target = { kind: 'device', fingerprint: targetScreen.device_fingerprint };
     else if (targetScreen.kind === 'ipad') target = { kind: 'any_ipad' };
     else if (targetScreen.kind === 'web') target = { kind: 'web_screen' };
+    else if (targetScreen.kind === 'display') target = { kind: 'display', display_id: targetScreen.display_id };
     else if (targetScreen.is_main) target = { kind: 'main_display' };
   }
   const rule = {

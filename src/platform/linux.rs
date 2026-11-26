@@ -213,6 +213,7 @@ impl LinuxCaptureHandle {
                 "-i".to_string(),
                 input,
             ],
+            video_filter_prefix: None,
             out_width: w,
             out_height: h,
             max_pixel_edge: self.max_pixel_edge,

@@ -17,9 +17,9 @@ Turn any browser on your local network (tablet, laptop, phone, secondary PC) int
   - The Web Admin Console defaults to loopback-only (`127.0.0.1:8787`, passwordless locally) and strictly rejects viewer/streaming endpoints.
   - Enabling Web viewing with a passcode dynamically opens an isolated random port on `0.0.0.0` strictly for viewer traffic; disabling viewing, entering low-power mode, or exceeding the idle timeout (`--port-idle-close-secs`, default `300s`) closes the external port immediately.
   - Optional legacy Wi-Fi compatibility ports also support dynamic runtime toggling and idle auto-close from the Admin Console.
-- **macOS Ephemeral Virtual Displays & Window Routing**
-  - Spin up to 4 **zero-encode** temporary virtual displays directly from the Admin Console without attaching any external monitor or viewer (automatically destroyed on exit).
-  - Inspect regular windows and **floating overlays/widgets**, move them across displays in one click, and define persistent `window_rules` (e.g. automatically tucking floating recording controls onto a virtual screen without moving main app windows).
+- **Ephemeral Virtual Displays (macOS) & Automatic Window Routing (macOS / Windows)**
+  - On macOS, spin up to 4 **zero-encode** temporary virtual displays directly from the Admin Console without attaching any external monitor or viewer (automatically destroyed on exit).
+  - On both macOS and Windows, inspect regular windows and **floating overlays/topmost widgets**, move them across displays in one click, and define persistent `window_rules` (e.g. automatically tucking floating recording controls onto a virtual or secondary screen without moving main app windows).
 - **Deep-Sleep Friendly & Low-Power Ready**
   - Event-driven **zero-wakeup standby** when idle (never blocks OS deep sleep); pauses capture and encoding automatically when tabs are backgrounded or the host locks.
   - Reversible **low-power mode**, configurable **lock-screen policies** (pause / disconnect / keep with grace delay), 4 built-in + custom YAML presets, and `launchd` / `systemd` Socket Activation templates.

@@ -86,6 +86,7 @@ fn main() -> Result<()> {
             std::process::exit(rc);
         }
     }
+    platform::init_process_runtime();
     let config = AppConfig::parse();
     // Apply proxy policy AND adopt OS-activated sockets BEFORE initializing Sentry or spawning any
     // threads so `std::env::remove_var` (proxy & systemd LISTEN_* vars) runs strictly single-threaded.

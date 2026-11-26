@@ -285,11 +285,14 @@ fn detect_os_system_proxy() -> Option<ResolvedProxy> {
 
 #[cfg(target_os = "windows")]
 fn detect_os_system_proxy() -> Option<ResolvedProxy> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let output = Command::new("reg")
         .args([
             "query",
             r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings",
         ])
+        .creation_flags(CREATE_NO_WINDOW)
         .output()
         .ok()?;
     if !output.status.success() {

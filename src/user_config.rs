@@ -531,10 +531,80 @@ impl Default for UserConfigFile {
     }
 }
 
+pub const MAX_TRUSTED_DEVICES: usize = 256;
+pub const MAX_YAML_CONFIG_BYTES: usize = 256 * 1024;
+
+/// Reject YAML anchors (`&name`) and aliases (`*name`) outside quoted strings before passing
+/// untrusted YAML to `serde_yaml::from_str`, preventing exponential "Billion Laughs" OOM bombs.
+fn contains_yaml_anchor_or_alias(raw: &str) -> bool {
+    for line in raw.lines() {
+        let bytes = line.as_bytes();
+        let mut i = 0usize;
+        let mut in_single = false;
+        let mut in_double = false;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if in_double {
+                if b == b'\\' {
+                    i += 2;
+                    continue;
+                }
+                if b == b'"' {
+                    in_double = false;
+                }
+                i += 1;
+                continue;
+            }
+            if in_single {
+                if b == b'\'' {
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                        i += 2;
+                        continue;
+                    }
+                    in_single = false;
+                }
+                i += 1;
+                continue;
+            }
+            match b {
+                b'#' => break, // rest of line is YAML comment
+                b'"' => in_double = true,
+                b'\'' => in_single = true,
+                b'&' | b'*' => {
+                    let prev_delim = i == 0
+                        || matches!(
+                            bytes[i - 1],
+                            b' ' | b'\t' | b':' | b'-' | b'[' | b'{' | b','
+                        );
+                    let next_ident = bytes
+                        .get(i + 1)
+                        .is_some_and(|&n| n.is_ascii_alphanumeric() || n == b'_' || n == b'-');
+                    if prev_delim && next_ident {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+    }
+    false
+}
+
 impl UserConfigFile {
-    /// Parse YAML, validate every trusted device MAC address, deduplicate by normalized MAC,
-    /// and clamp numeric ranges to safe bounds.
+    /// Parse YAML, validate every trusted device fingerprint, deduplicate,
+    /// reject YAML anchor/alias bombs and oversized files, and clamp numeric ranges to safe bounds.
     pub fn from_yaml_str(raw: &str) -> Result<Self> {
+        if raw.len() > MAX_YAML_CONFIG_BYTES {
+            return Err(anyhow!(
+                "YAML 配置文件过大（{} 字节，上限 {} 字节）",
+                raw.len(),
+                MAX_YAML_CONFIG_BYTES
+            ));
+        }
+        if contains_yaml_anchor_or_alias(raw) {
+            return Err(anyhow!("YAML 配置禁止使用锚点（&）或别名（*）引用"));
+        }
         let trimmed = raw.trim();
         let mut cfg: Self = if trimmed.is_empty() {
             Self::default()
@@ -550,6 +620,7 @@ impl UserConfigFile {
         self.max_web_viewers = self.max_web_viewers.min(128);
         self.max_in_flight = self.max_in_flight.min(12);
         self.lock_delay_secs = self.lock_delay_secs.min(3600);
+        self.port_idle_close_secs = self.port_idle_close_secs.min(86_400);
         if self.web_screen_mode == WebScreenMode::FollowIpad && self.web_independent_screen {
             self.web_screen_mode = WebScreenMode::Independent;
         }
@@ -586,7 +657,8 @@ impl UserConfigFile {
             .active_preset
             .as_deref()
             .and_then(|s| ConfigPreset::sanitize_name(s).ok());
-        let mut normalized_presets: Vec<ConfigPreset> = Vec::with_capacity(self.presets.len());
+        let mut normalized_presets: Vec<ConfigPreset> =
+            Vec::with_capacity(self.presets.len().min(MAX_CUSTOM_PRESETS));
         for (idx, mut p) in std::mem::take(&mut self.presets).into_iter().enumerate() {
             p.validate_and_normalize()
                 .with_context(|| format!("presets[{idx}] 配置无效"))?;
@@ -598,13 +670,24 @@ impl UserConfigFile {
         }
         self.presets = normalized_presets;
 
-        let mut normalized_rules: Vec<WindowRule> = Vec::with_capacity(self.window_rules.len());
-        for (idx, mut rule) in std::mem::take(&mut self.window_rules)
-            .into_iter()
-            .enumerate()
-        {
+        let raw_rules = std::mem::take(&mut self.window_rules);
+        let mut used_rule_ids: std::collections::HashSet<String> = raw_rules
+            .iter()
+            .map(|r| r.id.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let mut normalized_rules: Vec<WindowRule> =
+            Vec::with_capacity(raw_rules.len().min(MAX_WINDOW_RULES));
+        let mut auto_rule_seq = 1usize;
+        for (idx, mut rule) in raw_rules.into_iter().enumerate() {
             if rule.id.trim().is_empty() {
-                rule.id = format!("rule-{}", idx + 1);
+                let mut candidate = format!("rule-{auto_rule_seq}");
+                while !used_rule_ids.insert(candidate.clone()) {
+                    auto_rule_seq += 1;
+                    candidate = format!("rule-{auto_rule_seq}");
+                }
+                auto_rule_seq += 1;
+                rule.id = candidate;
             }
             rule.validate_and_normalize()
                 .with_context(|| format!("window_rules[{idx}] 配置无效"))?;
@@ -616,11 +699,19 @@ impl UserConfigFile {
         }
         self.window_rules = normalized_rules;
 
-        let mut normalized: Vec<TrustedDevice> = Vec::with_capacity(self.trusted_devices.len());
-        for (idx, mut dev) in std::mem::take(&mut self.trusted_devices)
-            .into_iter()
-            .enumerate()
-        {
+        let raw_devices = std::mem::take(&mut self.trusted_devices);
+        let mut normalized: Vec<TrustedDevice> =
+            Vec::with_capacity(raw_devices.len().min(MAX_TRUSTED_DEVICES));
+        let clean_field = |s: &str| -> String {
+            s.chars()
+                .map(|c| if c.is_control() { ' ' } else { c })
+                .collect::<String>()
+                .trim()
+                .chars()
+                .take(128)
+                .collect()
+        };
+        for (idx, mut dev) in raw_devices.into_iter().enumerate() {
             let Some(fp) = normalize_fingerprint(&dev.fingerprint) else {
                 if dev.fingerprint.trim().is_empty() && !dev.mac.trim().is_empty() {
                     tracing::warn!(
@@ -638,11 +729,14 @@ impl UserConfigFile {
             };
             dev.fingerprint = fp;
             dev.mac.clear();
-            dev.name = dev.name.replace(['\t', '\r', '\n'], " ").trim().to_string();
-            dev.model = dev.model.replace(['\t', '\r', '\n'], " ").trim().to_string();
-            dev.uid = dev.uid.replace(['\t', '\r', '\n'], " ").trim().to_string();
+            dev.name = clean_field(&dev.name);
+            dev.model = clean_field(&dev.model);
+            dev.uid = clean_field(&dev.uid);
             dev.prefs.normalize();
             normalized.retain(|d| d.fingerprint != dev.fingerprint);
+            if normalized.len() >= MAX_TRUSTED_DEVICES {
+                return Err(anyhow!("受信设备数量不能超过 {MAX_TRUSTED_DEVICES} 台"));
+            }
             normalized.push(dev);
         }
         self.trusted_devices = normalized;
@@ -679,6 +773,16 @@ pub fn default_config_path() -> Option<PathBuf> {
 }
 
 pub fn load_yaml_file(path: &Path) -> Result<UserConfigFile> {
+    let meta = fs::metadata(path)
+        .with_context(|| format!("failed to stat config file {}", path.display()))?;
+    if meta.len() > MAX_YAML_CONFIG_BYTES as u64 {
+        return Err(anyhow!(
+            "config file {} is too large ({} bytes, max {})",
+            path.display(),
+            meta.len(),
+            MAX_YAML_CONFIG_BYTES
+        ));
+    }
     let raw = fs::read_to_string(path)
         .with_context(|| format!("failed to read config file {}", path.display()))?;
     UserConfigFile::from_yaml_str(&raw)

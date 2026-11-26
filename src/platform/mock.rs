@@ -90,6 +90,17 @@ impl Default for MockBackend {
 }
 
 impl MockBackend {
+    /// Return all currently live mock virtual display IDs (`id >= 100`) for ghost-display oracle checks.
+    pub fn live_virtual_display_ids(&self) -> std::collections::BTreeSet<u32> {
+        self.mock_display_bounds
+            .lock()
+            .unwrap()
+            .keys()
+            .copied()
+            .filter(|&id| id >= 100)
+            .collect()
+    }
+
     pub fn new() -> Self {
         Self::default()
     }

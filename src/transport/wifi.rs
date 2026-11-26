@@ -163,6 +163,10 @@ impl WifiServerController {
 
     pub fn stop(&self) -> bool {
         let _op = self.op_lock.lock().unwrap();
+        self.stop_locked()
+    }
+
+    fn stop_locked(&self) -> bool {
         let old = self.state.lock().unwrap().take();
         if let Some((mut handle, _)) = old {
             let tel = handle.telemetry_addr;
@@ -219,14 +223,16 @@ impl WifiServerController {
         if limit_secs == 0 {
             return false;
         }
+        let _op = self.op_lock.lock().unwrap();
         if let Some(idle) = self.idle_duration() {
-            if idle >= Duration::from_secs(limit_secs) {
+            if idle >= Duration::from_secs(limit_secs) && !self.registry.has_active_wifi_sessions()
+            {
                 info!(
                     "iPad Wi-Fi port idle for {}s (limit={}s) — auto-closing.",
                     idle.as_secs(),
                     limit_secs
                 );
-                return self.stop();
+                return self.stop_locked();
             }
         }
         false

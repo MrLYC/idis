@@ -205,6 +205,11 @@ pub struct AbrController {
     congested_streak: u32,
     healthy_streak: u32,
     last_change: Instant,
+    /// Timestamp of the most recent step-up probe (`tier -> tier - 1`).
+    last_up_at: Option<Instant>,
+    /// Consecutive step-up probes that quickly regressed back down (exponential probe backoff
+    /// prevents sawtooth thrashing on steady mid-tier bandwidth bottlenecks).
+    failed_up_probes: u32,
 }
 
 impl AbrController {
@@ -222,6 +227,8 @@ impl AbrController {
             congested_streak: 0,
             healthy_streak: 0,
             last_change: past,
+            last_up_at: None,
+            failed_up_probes: 0,
         }
     }
 
@@ -238,6 +245,7 @@ impl AbrController {
             self.sensitivity = sensitivity;
             self.congested_streak = 0;
             self.healthy_streak = 0;
+            self.failed_up_probes = 0;
         }
     }
 
@@ -248,6 +256,8 @@ impl AbrController {
         self.congested_streak = 0;
         self.healthy_streak = 0;
         self.last_change = now;
+        self.last_up_at = None;
+        self.failed_up_probes = 0;
         changed
     }
 
@@ -284,6 +294,16 @@ impl AbrController {
                 && self.congested_streak >= policy.down_streak_required
                 && now.saturating_duration_since(self.last_change) >= policy.down_cooldown
             {
+                // If we just stepped UP within the last 20s and immediately congested again,
+                // back off future step-up probes exponentially (1x -> 2x -> 4x) to eliminate sawtooth thrashing.
+                if self
+                    .last_up_at
+                    .is_some_and(|up_ts| now.saturating_duration_since(up_ts) <= Duration::from_secs(20))
+                {
+                    self.failed_up_probes = (self.failed_up_probes + 1).min(2);
+                } else {
+                    self.failed_up_probes = 0;
+                }
                 self.tier += 1;
                 self.congested_streak = 0;
                 self.last_change = now;
@@ -293,6 +313,18 @@ impl AbrController {
         }
 
         self.congested_streak = 0;
+        // Clear failed-probe backoff once a step-up holds stably for >= 20s without congestion.
+        if self
+            .last_up_at
+            .is_some_and(|up_ts| now.saturating_duration_since(up_ts) > Duration::from_secs(20))
+        {
+            self.failed_up_probes = 0;
+        }
+        // Mostly-idle desktop (e.g. 1 Hz blinking cursor, 0 drops, unsaturated): neither congested
+        // nor enough traffic to prove capacity, so hold recovery streak steady instead of decaying it.
+        if sample.sent_frames < 2 && sample.dropped_frames == 0 && !sample.in_flight_saturated {
+            return None;
+        }
         let healthy = sample.sent_frames >= 2
             && !sample.in_flight_saturated
             && (sample.dropped_frames == 0 || (total >= 12 && drop_ratio < 0.10))
@@ -304,13 +336,17 @@ impl AbrController {
 
         if healthy {
             self.healthy_streak = self.healthy_streak.saturating_add(1);
+            let backoff_mult = 1u32 << self.failed_up_probes;
+            let eff_up_streak = policy.up_streak_required.saturating_mul(backoff_mult);
+            let eff_up_cooldown = policy.up_cooldown.saturating_mul(backoff_mult);
             if self.tier > 0
-                && self.healthy_streak >= policy.up_streak_required
-                && now.saturating_duration_since(self.last_change) >= policy.up_cooldown
+                && self.healthy_streak >= eff_up_streak
+                && now.saturating_duration_since(self.last_change) >= eff_up_cooldown
             {
                 self.tier -= 1;
                 self.healthy_streak = 0;
                 self.last_change = now;
+                self.last_up_at = Some(now);
                 return Some(self.tier);
             }
         } else {
@@ -430,18 +466,24 @@ impl InFlightController {
             0.0
         };
 
+        // Require genuine delivery pressure before treating raw high RTT as congestion so Wi-Fi
+        // 802.11 PSM wake latency (0 drops, fast socket writes, unsaturated pipeline) never collapses
+        // `max_in_flight` to 1 and triggers a coupled false ABR downgrade.
+        let has_delivery_pressure = sample.dropped_frames > 0
+            || sample.avg_send_ms >= 15.0
+            || sample.in_flight_saturated;
         // Only collapse `max_in_flight` all the way to 1 when TCP socket writes themselves are
-        // blocking or RTT is extreme — normal Wi-Fi airtime jitter (e.g. sharing Wi-Fi with Web
-        // viewers at avg_send_ms < 10ms) must keep >=2 frames in flight to avoid starving IPPP!
+        // blocking or RTT is extreme under active delivery pressure — normal Wi-Fi airtime jitter
+        // (e.g. sharing Wi-Fi with Web viewers at avg_send_ms < 10ms) keeps >=2 frames in flight!
         let severe_congestion = (queue_ms >= 55.0 && sample.avg_send_ms >= 50.0)
             || sample.avg_send_ms >= 80.0
             || sample.max_send_ms >= 180
-            || sample.avg_ack_rtt_ms.is_some_and(|r| r >= 200.0);
+            || (has_delivery_pressure && sample.avg_ack_rtt_ms.is_some_and(|r| r >= 200.0));
         let congested = severe_congestion
-            || queue_ms >= 35.0
+            || (has_delivery_pressure && queue_ms >= 35.0)
             || sample.avg_send_ms >= 45.0
             || sample.max_send_ms >= 120
-            || sample.avg_ack_rtt_ms.is_some_and(|r| r >= 140.0);
+            || (has_delivery_pressure && sample.avg_ack_rtt_ms.is_some_and(|r| r >= 140.0));
 
         if congested {
             self.expand_streak = 0;

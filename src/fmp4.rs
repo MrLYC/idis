@@ -60,6 +60,17 @@ impl Fmp4Muxer {
     /// Convert an H.264 Annex-B frame into an optional fMP4 init segment + media segment.
     /// Returns `None` if the frame has no VCL slice NALs or SPS/PPS have not been seen yet.
     pub fn mux_frame(&mut self, width: u32, height: u32, annex_b: &[u8]) -> Option<MuxedChunk> {
+        self.mux_frame_at(width, height, annex_b, Instant::now())
+    }
+
+    /// Logical-clock variant of [`Self::mux_frame`] for deterministic testing and fuzzing.
+    pub fn mux_frame_at(
+        &mut self,
+        width: u32,
+        height: u32,
+        annex_b: &[u8],
+        now: Instant,
+    ) -> Option<MuxedChunk> {
         let nals = split_annexb_nals(annex_b);
         if nals.is_empty() {
             return None;
@@ -68,7 +79,8 @@ impl Fmp4Muxer {
         let mut new_sps: Option<&[u8]> = None;
         let mut new_pps: Option<&[u8]> = None;
         let mut vcl_nals: Vec<&[u8]> = Vec::new();
-        let mut is_idr = false;
+        let mut has_idr = false;
+        let mut has_non_idr = false;
 
         for nal in nals {
             if nal.is_empty() {
@@ -79,11 +91,12 @@ impl Fmp4Muxer {
                 8 => new_pps = Some(nal),
                 9 => {} // AUD: skip in AVCC mdat
                 5 => {
-                    is_idr = true;
+                    has_idr = true;
                     vcl_nals.push(nal);
                 }
                 1 => {
                     // Non-IDR P-frame slice (IPPP temporal compression).
+                    has_non_idr = true;
                     vcl_nals.push(nal);
                 }
                 _ => {}
@@ -93,6 +106,8 @@ impl Fmp4Muxer {
         if vcl_nals.is_empty() {
             return None;
         }
+        // Never mark a malformed mixed IDR+P frame as a pure sync sample.
+        let is_idr = has_idr && !has_non_idr;
         // Require the very first emitted frame of a stream/timeline to be an IDR with valid SPS/PPS.
         if !self.initialized && !is_idr {
             return None;
@@ -100,7 +115,15 @@ impl Fmp4Muxer {
 
         let cand_sps = new_sps.unwrap_or(self.sps.as_slice());
         let cand_pps = new_pps.unwrap_or(self.pps.as_slice());
-        if cand_sps.len() < 4 || cand_pps.is_empty() || width == 0 || height == 0 {
+        if cand_sps.len() < 4
+            || cand_sps.len() > u16::MAX as usize
+            || cand_pps.is_empty()
+            || cand_pps.len() > u16::MAX as usize
+            || width == 0
+            || height == 0
+            || width > u16::MAX as u32
+            || height > u16::MAX as u32
+        {
             return None;
         }
         let config_changed = cand_sps != self.sps.as_slice()
@@ -135,7 +158,6 @@ impl Fmp4Muxer {
         };
 
         let default_duration = (TIMESCALE / self.fps.max(1)).max(1);
-        let now = Instant::now();
         // Bound duration tightly around the nominal frame interval (max ~2x nominal, <= 100ms)
         // and clamp as u64 before casting to u32 so static->motion idle pauses never bloat Frame N's
         // future duration (preventing 300ms latency locks or unnecessary MSE seeks).

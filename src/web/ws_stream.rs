@@ -113,6 +113,8 @@ pub(super) fn handle_ws_stream(
         let mut ctrl_win_start = Instant::now();
         let mut ctrl_win_count: u32 = 0;
         let mut sig_win_count: u32 = 0;
+        let mut ping_sec: u64 = 0;
+        let mut ping_count: u32 = 0;
         let mut last_idr_req = Instant::now() - Duration::from_secs(1);
         let mut last_vis_req = Instant::now() - Duration::from_secs(1);
         while !reader_closed.load(Ordering::Relaxed) {
@@ -256,9 +258,17 @@ pub(super) fn handle_ws_stream(
                         }
                         0x9 => {
                             reader_pong.store(now_ms, Ordering::Release);
-                            if let Ok(mut w) = reader_writer.lock() {
-                                if write_ws_frame(&mut *w, 0xA, &payload).is_err() {
-                                    break;
+                            let now_s = now_ms / 1000;
+                            if now_s != ping_sec {
+                                ping_sec = now_s;
+                                ping_count = 0;
+                            }
+                            ping_count = ping_count.saturating_add(1);
+                            if ping_count <= 30 {
+                                if let Ok(mut w) = reader_writer.lock() {
+                                    if write_ws_frame(&mut *w, 0xA, &payload).is_err() {
+                                        break;
+                                    }
                                 }
                             }
                         }

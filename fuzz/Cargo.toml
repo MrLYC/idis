@@ -1,0 +1,51 @@
+[package]
+name = "idis-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Keep completely isolated from the root crate so `cargo test --locked --all-targets`
+# and `cargo clippy --locked --all-targets` on stable Rust / macOS / Windows never touch libFuzzer.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+idis = { path = ".." }
+
+[[bin]]
+name = "keyed_archive"
+path = "fuzz_targets/keyed_archive.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "framing_video"
+path = "fuzz_targets/framing_video.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "http_ws"
+path = "fuzz_targets/http_ws.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "annexb_fmp4"
+path = "fuzz_targets/annexb_fmp4.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "yaml_config"
+path = "fuzz_targets/yaml_config.rs"
+test = false
+doc = false
+bench = false

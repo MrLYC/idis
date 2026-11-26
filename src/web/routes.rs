@@ -202,6 +202,10 @@ pub(super) fn handle_connection(
     // - Admin port (`ListenerScope::Admin`) serves Admin Console & `/api/admin/*` only.
     // - Viewer port (`ListenerScope::Viewer`, dynamic `0.0.0.0:<random_port>`) serves `/view`,
     //   `/api/view/*`, and `/ws/stream` only and NEVER grants Admin privileges (even on loopback).
+    // Localhost convenience contract:
+    // - On `0.0.0.0` Admin bind, direct `127.0.0.1` access with safe loopback `Host` stays passwordless
+    //   while LAN / proxied / non-loopback `Host` requests require the Admin token.
+    // - On `127.0.0.1` Admin bind, passing explicit `--web-admin-token` enforces password login even locally.
     let loopback_auto_admin = scope == ListenerScope::Admin
         && (!state.admin_token_explicit || !state.web_addr.ip().is_loopback())
         && is_loopback_peer(peer.ip())
@@ -903,8 +907,21 @@ pub(super) fn handle_connection(
                     &serde_json::json!({ "error": "unauthorized" }),
                 );
             }
-            let payload = serde_json::from_slice::<KickViewerReq>(&req.body)
-                .unwrap_or(KickViewerReq { id: None });
+            let payload = if req.body.is_empty() {
+                KickViewerReq { id: None }
+            } else {
+                match serde_json::from_slice::<KickViewerReq>(&req.body) {
+                    Ok(p) => p,
+                    Err(_) => {
+                        return send_json(
+                            &mut stream,
+                            "400 Bad Request",
+                            &[],
+                            &serde_json::json!({ "error": "invalid json" }),
+                        );
+                    }
+                }
+            };
             if let Some(id) = payload.id {
                 if let Some(Some(fp)) = state.registry.kick_web_viewer(id) {
                     state.revoke_web_viewer_once(&fp);
@@ -2101,8 +2118,21 @@ fn handle_admin_config_reset(
     state: &WebState,
     body: &[u8],
 ) -> Result<()> {
-    let payload = serde_json::from_slice::<ResetConfigReq>(body)
-        .unwrap_or(ResetConfigReq { keep_trusted: true });
+    let payload = if body.is_empty() {
+        ResetConfigReq { keep_trusted: true }
+    } else {
+        match serde_json::from_slice::<ResetConfigReq>(body) {
+            Ok(p) => p,
+            Err(_) => {
+                return send_json(
+                    stream,
+                    "400 Bad Request",
+                    &[],
+                    &serde_json::json!({ "error": "invalid json" }),
+                );
+            }
+        }
+    };
     if state.registry.is_config_corrupt() && payload.keep_trusted {
         return send_json(
             stream,

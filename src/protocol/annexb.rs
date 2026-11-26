@@ -40,6 +40,9 @@ impl AnnexBSplitter {
                 }
                 if self.buf.len() > 8 * 1024 * 1024 {
                     self.buf.clear();
+                    self.current_au.clear();
+                    self.has_vcl = false;
+                    self.au_is_idr = false;
                 }
                 return frames;
             };
@@ -56,6 +59,9 @@ impl AnnexBSplitter {
         } else if self.buf.len() > 8 * 1024 * 1024 {
             // Prevent unbounded growth if garbage arrives without start codes
             self.buf.clear();
+            self.current_au.clear();
+            self.has_vcl = false;
+            self.au_is_idr = false;
         }
         frames
     }
@@ -104,10 +110,13 @@ impl AnnexBSplitter {
                 }
             }
             5 => {
+                if nal.len() < 2 {
+                    return None;
+                }
                 // IDR slice: only start a new Access Unit when `first_mb_in_slice == 0`
                 // (Exp-Golomb 0 -> MSB of nal[1] is 1). Multi-slice IDR frames stay merged!
-                let starts_new_picture = nal.len() >= 2 && (nal[1] & 0x80) != 0;
-                if self.has_vcl && starts_new_picture {
+                let starts_new_picture = (nal[1] & 0x80) != 0;
+                if self.has_vcl && (starts_new_picture || !self.au_is_idr) {
                     completed = Some(self.take_au());
                 }
                 self.current_au.extend_from_slice(&[0, 0, 0, 1]);
@@ -116,9 +125,12 @@ impl AnnexBSplitter {
                 self.au_is_idr = true;
             }
             1 => {
+                if nal.len() < 2 {
+                    return None;
+                }
                 // Non-IDR VCL slice: merge continuation slices into the same Access Unit.
-                let starts_new_picture = nal.len() >= 2 && (nal[1] & 0x80) != 0;
-                if self.has_vcl && starts_new_picture {
+                let starts_new_picture = (nal[1] & 0x80) != 0;
+                if self.has_vcl && (starts_new_picture || self.au_is_idr) {
                     completed = Some(self.take_au());
                 }
                 self.current_au.extend_from_slice(&[0, 0, 0, 1]);
@@ -158,9 +170,8 @@ impl Default for AnnexBSplitter {
     }
 }
 
-/// Check that an Annex-B Access Unit contains SPS (7), PPS (8), and at least one IDR slice (5).
-/// Because intermediate frames may be dropped under backpressure, only self-contained IDR frames
-/// should be transmitted to legacy iDisplay / browser MSE decoders.
+/// Check that an Annex-B Access Unit contains valid SPS (7, len >= 4) and PPS (8, len >= 1)
+/// preceding at least one IDR slice (5, len >= 2) with no non-IDR VCL slices mixed in.
 pub fn is_self_contained_idr(annex_b: &[u8]) -> bool {
     let mut has_sps = false;
     let mut has_pps = false;
@@ -168,20 +179,27 @@ pub fn is_self_contained_idr(annex_b: &[u8]) -> bool {
     let mut pos = 0;
     while let Some((sc_pos, sc_len)) = find_start_code(annex_b, pos) {
         let nal_start = sc_pos + sc_len;
-        if nal_start < annex_b.len() {
-            match annex_b[nal_start] & 0x1F {
-                7 => has_sps = true,
+        let nal_end = find_start_code(annex_b, nal_start)
+            .map(|(next_pos, _)| next_pos)
+            .unwrap_or(annex_b.len());
+        if nal_start < nal_end {
+            let nal = &annex_b[nal_start..nal_end];
+            match nal[0] & 0x1F {
+                7 if nal.len() >= 4 => has_sps = true,
                 8 => has_pps = true,
-                5 => has_idr = true,
+                5 if nal.len() >= 2 => {
+                    if !has_sps || !has_pps {
+                        return false;
+                    }
+                    has_idr = true;
+                }
+                1 => return false,
                 _ => {}
             }
-            if has_sps && has_pps && has_idr {
-                return true;
-            }
         }
-        pos = nal_start;
+        pos = nal_end;
     }
-    false
+    has_sps && has_pps && has_idr
 }
 
 fn find_start_code(data: &[u8], from: usize) -> Option<(usize, usize)> {

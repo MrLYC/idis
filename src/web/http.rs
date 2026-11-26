@@ -3,7 +3,7 @@ use anyhow::Result;
 use base64::Engine as _;
 use serde::Serialize;
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::net::{IpAddr, TcpStream};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -15,48 +15,36 @@ pub(super) struct HttpRequest {
     pub(super) body: Vec<u8>,
 }
 
-/// Read a single `\n`-terminated line with both a strict byte upper bound and a hard wall-clock
-/// `deadline` re-applied before every underlying `read()` syscall (defeats Slowloris byte-by-byte trickle DoS).
-fn read_line_limited(
-    reader: &mut BufReader<TcpStream>,
+/// Read a single `\n`-terminated line directly from `reader` without over-reading past `\n`
+/// (preserving any pipelined WebSocket upgrade frames coalesced after `\r\n\r\n`).
+fn read_line_unbuffered<R: Read>(
+    reader: &mut R,
     max_bytes: usize,
     deadline: Instant,
+    mut before_read: impl FnMut(Instant) -> Result<()>,
 ) -> Result<Option<String>> {
-    let mut buf = Vec::new();
+    let mut buf = Vec::with_capacity(128);
+    let mut byte = [0u8; 1];
     loop {
-        if reader.buffer().is_empty() {
-            let rem = deadline.saturating_duration_since(Instant::now());
-            if rem.is_zero() {
-                anyhow::bail!("HTTP request deadline exceeded");
+        before_read(deadline)?;
+        match reader.read(&mut byte) {
+            Ok(0) => {
+                if buf.is_empty() {
+                    return Ok(None);
+                }
+                break;
             }
-            reader.get_ref().set_read_timeout(Some(rem))?;
-        }
-        let available = match reader.fill_buf() {
-            Ok(b) => b,
+            Ok(_) => {
+                if buf.len() + 1 > max_bytes {
+                    anyhow::bail!("HTTP header line exceeds limit");
+                }
+                buf.push(byte[0]);
+                if byte[0] == b'\n' {
+                    break;
+                }
+            }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e.into()),
-        };
-        if available.is_empty() {
-            if buf.is_empty() {
-                return Ok(None);
-            }
-            break;
-        }
-        if let Some(pos) = available.iter().position(|&b| b == b'\n') {
-            let take = pos + 1;
-            if buf.len() + take > max_bytes {
-                anyhow::bail!("HTTP header line exceeds limit");
-            }
-            buf.extend_from_slice(&available[..take]);
-            reader.consume(take);
-            break;
-        } else {
-            let take = available.len();
-            if buf.len() + take > max_bytes {
-                anyhow::bail!("HTTP header line exceeds limit");
-            }
-            buf.extend_from_slice(available);
-            reader.consume(take);
         }
     }
     String::from_utf8(buf)
@@ -65,20 +53,26 @@ fn read_line_limited(
 }
 
 pub(super) fn read_http_request(stream: &TcpStream) -> Result<Option<HttpRequest>> {
-    // Enforce a hard total request deadline (defeats Slowloris byte-by-byte trickle DoS).
     let deadline = Instant::now() + HTTP_REQUEST_DEADLINE;
-    let update_timeout = |s: &TcpStream| -> Result<()> {
-        let rem = deadline.saturating_duration_since(Instant::now());
+    let mut s = stream.try_clone()?;
+    read_http_request_from(&mut s, deadline, |dl| {
+        let rem = dl.saturating_duration_since(Instant::now());
         if rem.is_zero() {
             anyhow::bail!("HTTP request deadline exceeded");
         }
-        s.set_read_timeout(Some(rem))?;
+        stream.set_read_timeout(Some(rem))?;
         Ok(())
-    };
-    update_timeout(stream)?;
-    let mut reader = BufReader::new(stream.try_clone()?);
+    })
+}
+
+pub(super) fn read_http_request_from<R: Read>(
+    reader: &mut R,
+    deadline: Instant,
+    mut before_read: impl FnMut(Instant) -> Result<()>,
+) -> Result<Option<HttpRequest>> {
     let mut remaining = MAX_HTTP_REQUEST_BYTES;
-    let Some(request_line) = read_line_limited(&mut reader, remaining, deadline)? else {
+    let Some(request_line) = read_line_unbuffered(reader, remaining, deadline, &mut before_read)?
+    else {
         return Ok(None);
     };
     remaining = remaining.saturating_sub(request_line.len());
@@ -99,7 +93,8 @@ pub(super) fn read_http_request(stream: &TcpStream) -> Result<Option<HttpRequest
         if remaining == 0 {
             anyhow::bail!("HTTP headers too large");
         }
-        let Some(line) = read_line_limited(&mut reader, remaining, deadline)? else {
+        let Some(line) = read_line_unbuffered(reader, remaining, deadline, &mut before_read)?
+        else {
             break;
         };
         remaining = remaining.saturating_sub(line.len());
@@ -108,33 +103,40 @@ pub(super) fn read_http_request(stream: &TcpStream) -> Result<Option<HttpRequest
             saw_header_end = true;
             break;
         }
-        if let Some((k, v)) = trimmed.split_once(':') {
-            let key = k.trim().to_ascii_lowercase();
-            // Reject duplicate security-sensitive headers (RFC 9112 §3.2 / §6.3)
-            if matches!(
-                key.as_str(),
-                "host"
-                    | "content-length"
-                    | "origin"
-                    | "sec-fetch-site"
-                    | "sec-fetch-mode"
-                    | "sec-fetch-dest"
-                    | "content-type"
-            ) && headers.contains_key(&key)
-            {
-                anyhow::bail!("duplicate security-sensitive HTTP header: {key}");
-            }
-            if key == "cookie" {
-                headers
-                    .entry(key)
-                    .and_modify(|existing: &mut String| {
-                        existing.push_str("; ");
-                        existing.push_str(v.trim());
-                    })
-                    .or_insert_with(|| v.trim().to_string());
-            } else {
-                headers.insert(key, v.trim().to_string());
-            }
+        let Some((k, v)) = trimmed.split_once(':') else {
+            anyhow::bail!("malformed HTTP header line");
+        };
+        let key = k.trim().to_ascii_lowercase();
+        if key == "transfer-encoding" {
+            anyhow::bail!("Transfer-Encoding is not supported");
+        }
+        // Reject duplicate security-sensitive headers (RFC 9112 §3.2 / §6.3)
+        if matches!(
+            key.as_str(),
+            "host"
+                | "content-length"
+                | "origin"
+                | "sec-fetch-site"
+                | "sec-fetch-mode"
+                | "sec-fetch-dest"
+                | "content-type"
+                | "sec-websocket-key"
+                | "upgrade"
+                | "connection"
+        ) && headers.contains_key(&key)
+        {
+            anyhow::bail!("duplicate security-sensitive HTTP header: {key}");
+        }
+        if key == "cookie" {
+            headers
+                .entry(key)
+                .and_modify(|existing: &mut String| {
+                    existing.push_str("; ");
+                    existing.push_str(v.trim());
+                })
+                .or_insert_with(|| v.trim().to_string());
+        } else {
+            headers.insert(key, v.trim().to_string());
         }
     }
     if !saw_header_end {
@@ -154,7 +156,7 @@ pub(super) fn read_http_request(stream: &TcpStream) -> Result<Option<HttpRequest
     let mut body = vec![0u8; content_len];
     let mut filled = 0usize;
     while filled < content_len {
-        update_timeout(stream)?;
+        before_read(deadline)?;
         match reader.read(&mut body[filled..]) {
             Ok(0) => anyhow::bail!("premature EOF reading HTTP body"),
             Ok(n) => filled += n,
@@ -343,12 +345,17 @@ pub(super) fn origin_matches_host(headers: &HashMap<String, String>) -> bool {
         return false;
     };
     let origin_host = rest.split('/').next().unwrap_or("");
+    if origin_host.contains('@') || origin_host.contains('?') || origin_host.contains('#') {
+        return false;
+    }
+    // `idis` serves plain HTTP, so `Host` defaults to port 80 when no explicit port is given
+    // (rejects `Origin: https://localhost` against plain-HTTP `Host: localhost`).
     match (
         normalize_host_port(origin_host, default_port),
-        normalize_host_port(host, default_port),
+        normalize_host_port(host, 80),
     ) {
         (Some(o), Some(h)) => o == h,
-        _ => origin_host.eq_ignore_ascii_case(host.trim()),
+        _ => false,
     }
 }
 
@@ -480,8 +487,16 @@ pub(super) fn read_ws_control_frame<R: Read>(reader: &mut R) -> std::io::Result<
             format!("incomplete websocket frame header: {e}"),
         ));
     }
+    let fin = (hdr[0] & 0x80) != 0;
+    let rsv = hdr[0] & 0x70;
     let opcode = hdr[0] & 0x0F;
     let masked = (hdr[1] & 0x80) != 0;
+    if rsv != 0 || !masked || (opcode >= 0x8 && !fin) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid RFC 6455 client websocket frame flags",
+        ));
+    }
     let mut len = (hdr[1] & 0x7F) as u64;
     if len == 126 {
         let mut ext = [0u8; 2];

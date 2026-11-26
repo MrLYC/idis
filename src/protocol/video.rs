@@ -74,6 +74,9 @@ pub fn parse_video_header(packet: &[u8]) -> Option<ParsedVideoHeader> {
         return None;
     }
     let header_len = u32::from_le_bytes([packet[0], packet[1], packet[2], packet[3]]);
+    if header_len < 13 {
+        return None;
+    }
     let width = u32::from_le_bytes([packet[4], packet[5], packet[6], packet[7]]);
     let height = u32::from_le_bytes([packet[8], packet[9], packet[10], packet[11]]);
     let compression = packet[12];

@@ -25,6 +25,34 @@ pub use http::{generate_random_hex, percent_encode_query_val};
 pub use log_buffer::{LogBuffer, LogBufferLayer, LogEntry};
 use p2p::P2pRelayHub;
 pub use p2p::SharedWebMuxer;
+
+/// Internal parser & topology hooks exposed strictly for deterministic Tier-0/Tier-2 fuzz tests.
+#[doc(hidden)]
+pub mod fuzz_hooks {
+    pub use super::p2p::P2pRelayHub;
+    use super::http;
+    use std::collections::HashMap;
+    use std::io::Cursor;
+    use std::time::{Duration, Instant};
+
+    pub type ParsedHttpRequest = (String, String, HashMap<String, String>, Vec<u8>);
+
+    pub fn parse_http_bytes(raw: &[u8]) -> anyhow::Result<Option<ParsedHttpRequest>> {
+        let mut cursor = Cursor::new(raw);
+        let dl = Instant::now() + Duration::from_secs(1);
+        let req = http::read_http_request_from(&mut cursor, dl, |_| Ok(()))?;
+        Ok(req.map(|r| (r.method, r.path, r.headers, r.body)))
+    }
+
+    pub fn origin_matches_host(headers: &HashMap<String, String>) -> bool {
+        http::origin_matches_host(headers)
+    }
+
+    pub fn parse_ws_client_frame(raw: &[u8]) -> std::io::Result<Option<(u8, Vec<u8>)>> {
+        let mut cursor = Cursor::new(raw);
+        http::read_ws_control_frame(&mut cursor)
+    }
+}
 use routes::handle_connection;
 use serde::Serialize;
 use std::collections::HashMap;

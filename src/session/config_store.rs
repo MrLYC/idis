@@ -499,8 +499,10 @@ impl SessionRegistry {
     /// Also clears saved per-device overrides across trusted devices (including offline ones) atomically
     /// with disk persistence (rolling back on I/O error) and preserves low-power runtime caps (Iter-6 P2-C4).
     pub fn reset_video_settings(&self) -> Result<VideoSettings> {
+        // Hold `config_tx_lock` across both disk persistence AND runtime low-power cap application
+        // so a concurrent `set_low_power(true)` cannot race between disk save and runtime apply.
+        let _tx = self.config_tx_lock.lock().unwrap();
         {
-            let _tx = self.config_tx_lock.lock().unwrap();
             let _save = self.settings_save_lock.lock().unwrap();
             if let Some(ref path) = self.config_path {
                 if self.config_read_only_corrupt.load(Ordering::Acquire) {

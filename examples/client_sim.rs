@@ -51,6 +51,51 @@ enum SimMode {
     Web(WebArgs),
     /// Simulate 1..N legacy iPad Wi-Fi clients (Canal telemetry + data + H.264 Annex-B)
     Ipad(IpadArgs),
+    /// Run a multi-profile 4D Pareto Scenario Matrix and print a Markdown/JSON scorecard
+    Matrix(MatrixArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+struct MatrixArgs {
+    /// Target client protocol to benchmark (`web` or `ipad`)
+    #[arg(long, default_value = "web")]
+    target: String,
+
+    /// Seconds per scenario profile
+    #[arg(long, default_value_t = 6)]
+    per_profile_secs: u64,
+
+    /// Spin up an embedded loopback `idis` mock host automatically (zero external setup)
+    #[arg(long, default_value_t = false)]
+    self_host: bool,
+
+    /// Admin URL for live Web host (ignored when `--self-host` is set)
+    #[arg(long, default_value = "http://127.0.0.1:8787")]
+    admin_url: String,
+
+    /// Viewing passcode for live Web host (ignored when `--self-host` is set)
+    #[arg(long, default_value = "")]
+    token: String,
+
+    /// iPad host for live host (ignored when `--self-host` is set)
+    #[arg(long, default_value = "127.0.0.1")]
+    host: String,
+
+    /// iPad telemetry port for live host (ignored when `--self-host` is set)
+    #[arg(long, default_value_t = 56845)]
+    port: u16,
+
+    /// Enable real `ffmpeg` H.264/fMP4 decode verification across all matrix scenarios
+    #[arg(long, default_value_t = false)]
+    verify_decode: bool,
+
+    /// Deterministic PRNG seed
+    #[arg(long, default_value_t = 20261127)]
+    seed: u64,
+
+    /// Print JSON scorecard instead of Markdown table
+    #[arg(long, default_value_t = false)]
+    json_summary: bool,
 }
 
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,6 +144,8 @@ impl DevicePreset {
 enum NetProfile {
     /// Clean LAN (0ms delay, unlimited bandwidth, no stalls)
     Lan,
+    /// Wi-Fi 802.11 PSM idle wakeup latency (180ms +-30ms, unlimited bw, 0% drops/stalls)
+    WifiPsm,
     /// Congested Wi-Fi (35ms +-25ms, 8 Mbps, 3% 250ms burst stalls)
     WifiBusy,
     /// Weak/far Wi-Fi (90ms +-60ms, 3 Mbps, 8% 500ms burst stalls)
@@ -107,6 +154,8 @@ enum NetProfile {
     Cellular,
     /// Frequent roaming stalls (45ms +-40ms, 4 Mbps, 15% 900ms burst stalls)
     LossyBurst,
+    /// Non-stationary wave: clean LAN -> weak Wi-Fi -> clean LAN recovery
+    RecoveryWave,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -125,6 +174,14 @@ impl NetProfile {
             NetProfile::Lan => EffectiveNetConfig {
                 latency_ms: 0,
                 jitter_ms: 0,
+                bandwidth_kbps: 0,
+                stall_prob: 0.0,
+                stall_ms: 0,
+                drop_ack_rate: 0.0,
+            },
+            NetProfile::WifiPsm => EffectiveNetConfig {
+                latency_ms: 180,
+                jitter_ms: 30,
                 bandwidth_kbps: 0,
                 stall_prob: 0.0,
                 stall_ms: 0,
@@ -161,6 +218,14 @@ impl NetProfile {
                 stall_prob: 0.15,
                 stall_ms: 900,
                 drop_ack_rate: 0.05,
+            },
+            NetProfile::RecoveryWave => EffectiveNetConfig {
+                latency_ms: 70,
+                jitter_ms: 40,
+                bandwidth_kbps: 3_500,
+                stall_prob: 0.05,
+                stall_ms: 300,
+                drop_ack_rate: 0.01,
             },
         }
     }
@@ -664,6 +729,7 @@ struct ClientSummary {
     elapsed_secs: f64,
     frames_received: u64,
     keyframes_received: u64,
+    idr_ratio: f64,
     init_segments: u64,
     bytes_received: u64,
     avg_fps: f64,
@@ -673,11 +739,40 @@ struct ClientSummary {
     reconnects: u64,
     pings_ok: u64,
     avg_ping_rtt_ms: f64,
+    frame_gap_p50_ms: u64,
+    frame_gap_p95_ms: u64,
+    frame_gap_p99_ms: u64,
     max_frame_gap_ms: u64,
+    stall_ratio_pct: f64,
+    leaked_paused_frames: u64,
     stalls_injected: u64,
     dropped_acks: u64,
     integrity_errors: Vec<String>,
     decode_errors: Vec<String>,
+}
+
+fn finalize_gap_percentiles(summary: &mut ClientSummary, gaps: &mut [u64]) {
+    if summary.frames_received > 0 {
+        summary.idr_ratio =
+            ((summary.keyframes_received as f64 / summary.frames_received as f64) * 1000.0).round()
+                / 1000.0;
+    }
+    if gaps.is_empty() {
+        return;
+    }
+    gaps.sort_unstable();
+    let pct = |p: usize| -> u64 {
+        let idx = ((gaps.len() - 1) * p) / 100;
+        gaps[idx]
+    };
+    summary.frame_gap_p50_ms = pct(50);
+    summary.frame_gap_p95_ms = pct(95);
+    summary.frame_gap_p99_ms = pct(99);
+    let total_ms: u64 = gaps.iter().copied().sum();
+    let stall_ms: u64 = gaps.iter().copied().filter(|&g| g > 120).sum();
+    if total_ms > 0 {
+        summary.stall_ratio_pct = ((stall_ms as f64 / total_ms as f64) * 1000.0).round() / 10.0;
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -1191,6 +1286,7 @@ fn run_ipad_client(
     let mut cur_orient: i64 = if cur_w > cur_h { 1 } else { 0 };
     let mut cycle_idx = 0usize;
     let mut ping_rtt_sum_ms = 0.0f64;
+    let mut frame_gaps_ms: Vec<u64> = Vec::new();
     let mut last_log = Instant::now();
     let mut win_frames = 0u64;
     let mut win_bytes = 0u64;
@@ -1371,10 +1467,14 @@ fn run_ipad_client(
                 Ok(Some(frame)) => {
                     shaper.pace_receive(frame.len(), &stop);
                     let now = Instant::now();
+                    if paused && pause_state_since.elapsed() > Duration::from_millis(500) {
+                        summary.leaked_paused_frames += 1;
+                    }
                     if let Some(prev) = last_frame_at {
                         let gap_ms = now.duration_since(prev).as_millis() as u64;
                         if !paused {
                             summary.max_frame_gap_ms = summary.max_frame_gap_ms.max(gap_ms);
+                            frame_gaps_ms.push(gap_ms);
                         }
                     }
                     last_frame_at = Some(now);
@@ -1509,6 +1609,13 @@ fn run_ipad_client(
     summary.resolutions_seen = resolutions.into_iter().collect();
     summary.stalls_injected = shaper.stalls_injected;
     summary.dropped_acks = shaper.dropped_acks;
+    if summary.leaked_paused_frames > 0 {
+        summary.integrity_errors.push(format!(
+            "{} frame(s) leaked after StopStream pause grace",
+            summary.leaked_paused_frames
+        ));
+    }
+    finalize_gap_percentiles(&mut summary, &mut frame_gaps_ms);
     if summary.pings_ok > 0 {
         summary.avg_ping_rtt_ms =
             (ping_rtt_sum_ms / summary.pings_ok as f64 * 10.0).round() / 10.0;
@@ -1622,6 +1729,7 @@ fn run_web_client(
     };
     let mut resolutions: BTreeSet<String> = BTreeSet::new();
     let mut cycle_idx = 0usize;
+    let mut frame_gaps_ms: Vec<u64> = Vec::new();
     let mut last_log = Instant::now();
     let mut win_frames = 0u64;
     let mut win_bytes = 0u64;
@@ -1845,10 +1953,14 @@ fn run_web_client(
                             expect_init_binary = false;
                         }
                         let now = Instant::now();
+                        if !visible && vis_since.elapsed() > Duration::from_millis(500) {
+                            summary.leaked_paused_frames += 1;
+                        }
                         if let Some(prev) = last_frame_at {
                             let gap_ms = now.duration_since(prev).as_millis() as u64;
                             if visible {
                                 summary.max_frame_gap_ms = summary.max_frame_gap_ms.max(gap_ms);
+                                frame_gaps_ms.push(gap_ms);
                             }
                         }
                         last_frame_at = Some(now);
@@ -1961,7 +2073,202 @@ fn run_web_client(
         ((summary.bytes_received as f64 * 8.0) / (elapsed * 1_000_000.0) * 100.0).round() / 100.0;
     summary.resolutions_seen = resolutions.into_iter().collect();
     summary.stalls_injected = shaper.stalls_injected;
+    if summary.leaked_paused_frames > 0 {
+        summary.integrity_errors.push(format!(
+            "{} frame(s) leaked while tab hidden past grace window",
+            summary.leaked_paused_frames
+        ));
+    }
+    finalize_gap_percentiles(&mut summary, &mut frame_gaps_ms);
     Ok(summary)
+}
+
+fn run_pareto_matrix(args: &MatrixArgs, stop: Arc<AtomicBool>) -> Result<()> {
+    use idis::config::AppConfig;
+    use idis::platform::mock::MockBackend;
+    use idis::session::SessionRegistry;
+    use idis::transport::wifi::start_wifi_server;
+    use idis::web::{start_web_server, LogBuffer};
+
+    let profiles = [
+        NetProfile::Lan,
+        NetProfile::WifiPsm,
+        NetProfile::WifiBusy,
+        NetProfile::WifiWeak,
+        NetProfile::LossyBurst,
+        NetProfile::RecoveryWave,
+    ];
+
+    let is_ipad = args.target.eq_ignore_ascii_case("ipad");
+    let mut _wifi_guard = None;
+    let mut _web_guard = None;
+    let host_stop = Arc::new(AtomicBool::new(false));
+
+    let (eff_admin_url, eff_token, eff_host, eff_port) = if args.self_host {
+        let mut cfg = AppConfig::parse_from(["idis"]);
+        cfg.telemetry_port = 0;
+        cfg.data_port = 0;
+        cfg.auto_accept = true;
+        cfg.no_confirm = false;
+        cfg.allow_input = true;
+        cfg.mock = true;
+        cfg.wifi = is_ipad;
+        cfg.no_bonjour = true;
+        cfg.no_usb = true;
+        cfg.web = !is_ipad;
+        cfg.web_bind = "127.0.0.1:0".to_string();
+        cfg.max_web_viewers = 4;
+        cfg.web_view_token = Some("matrix-pass".to_string());
+        cfg.config_file = Some("none".to_string());
+        cfg.trusted_devices_file = Some("none".to_string());
+
+        let backend = Arc::new(MockBackend::new());
+        let registry = Arc::new(SessionRegistry::new(cfg.clone(), backend.clone()));
+        if is_ipad {
+            let srv = start_wifi_server(cfg, backend, registry, host_stop.clone())?;
+            let port = srv.telemetry_addr.port();
+            _wifi_guard = Some(srv);
+            (String::new(), String::new(), "127.0.0.1".to_string(), port)
+        } else {
+            let srv = start_web_server(
+                "127.0.0.1:0",
+                None,
+                cfg.web_view_token.clone(),
+                registry,
+                LogBuffer::new(),
+                host_stop.clone(),
+            )?;
+            let url = format!("http://{}", srv.addr);
+            _web_guard = Some(srv);
+            (url, "matrix-pass".to_string(), "127.0.0.1".to_string(), 0)
+        }
+    } else {
+        (
+            args.admin_url.clone(),
+            args.token.clone(),
+            args.host.clone(),
+            args.port,
+        )
+    };
+
+    let mut rows: Vec<RunSummary> = Vec::new();
+    let mut all_passed = true;
+
+    for (p_idx, profile) in profiles.iter().copied().enumerate() {
+        if stop.load(Ordering::Acquire) {
+            break;
+        }
+        let common = CommonArgs {
+            preset: DevicePreset::IpadAir,
+            res: None,
+            cycle_res: Some("1280x720,720x1280".to_string()),
+            rotate_every: (args.per_profile_secs / 2).max(2),
+            net_profile: profile,
+            latency_ms: None,
+            jitter_ms: None,
+            bandwidth_kbps: None,
+            stall_prob: None,
+            stall_ms: None,
+            drop_ack_rate: None,
+            reconnect_every: 0,
+            seed: args.seed.wrapping_add(p_idx as u64 * 101),
+            clients: 1,
+            duration: args.per_profile_secs.max(3),
+            min_frames: 3,
+            verify_decode: args.verify_decode,
+            preview: false,
+            ffmpeg_path: "ffmpeg".to_string(),
+            ffplay_path: "ffplay".to_string(),
+            json_summary: args.json_summary,
+            strict: true,
+        };
+        let summary = if is_ipad {
+            let ia = IpadArgs {
+                host: eff_host.clone(),
+                port: eff_port,
+                proto: 5,
+                uid: format!("matrix-ipad-{p_idx}"),
+                name: Some(format!("Matrix iPad {profile:?}")),
+                ios_version: "12.5.8".to_string(),
+                send_touch_every: 0,
+                pause_cycle: None,
+                ping_every: 2,
+                common: common.clone(),
+            };
+            run_ipad_client(0, &ia, stop.clone())?
+        } else {
+            let adm = parse_http_url(&eff_admin_url)?;
+            let v_raw = discover_viewer_url_from_admin(&adm)?;
+            let v_url = parse_http_url(&v_raw)?;
+            let wa = WebArgs {
+                viewer_url: Some(v_raw),
+                admin_url: eff_admin_url.clone(),
+                token: eff_token.clone(),
+                request_approval: false,
+                p2p_hello: false,
+                visibility_cycle: None,
+                common: common.clone(),
+            };
+            run_web_client(0, &wa, &v_url, Some(&adm), stop.clone())?
+        };
+
+        let passed = summary.frames_received >= common.min_frames
+            && summary.integrity_errors.is_empty()
+            && summary.decode_errors.is_empty();
+        if !passed {
+            all_passed = false;
+        }
+        rows.push(RunSummary {
+            mode: if is_ipad { "ipad" } else { "web" }.to_string(),
+            net_profile: format!("{profile:?}").to_lowercase(),
+            total_frames: summary.frames_received,
+            total_bytes: summary.bytes_received,
+            total_integrity_errors: summary.integrity_errors.len(),
+            total_decode_errors: summary.decode_errors.len(),
+            clients: vec![summary],
+            passed,
+        });
+    }
+
+    host_stop.store(true, Ordering::SeqCst);
+    if let Some(mut srv) = _wifi_guard {
+        srv.stop();
+    }
+    drop(_web_guard);
+
+    if args.json_summary {
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+    } else {
+        println!(
+            "\n### idis 4D Pareto Scenario Matrix Scorecard ({})\n",
+            if is_ipad { "ipad" } else { "web" }
+        );
+        println!("| Profile | FPS | Mbps | Gap p50/p95/p99 (ms) | Stall % | IDR % | Resolutions | Errors | Status |");
+        println!("|---|---:|---:|---|---:|---:|---|---:|---|");
+        for r in &rows {
+            let c = &r.clients[0];
+            println!(
+                "| `{}` | {:.1} | {:.2} | {}/{}/{} | {:.1}% | {:.1}% | `{}` | {} / {} | {} |",
+                r.net_profile,
+                c.avg_fps,
+                c.avg_mbps,
+                c.frame_gap_p50_ms,
+                c.frame_gap_p95_ms,
+                c.frame_gap_p99_ms,
+                c.stall_ratio_pct,
+                c.idr_ratio * 100.0,
+                c.resolutions_seen.join(","),
+                r.total_integrity_errors,
+                r.total_decode_errors,
+                if r.passed { "PASS" } else { "FAIL" }
+            );
+        }
+    }
+
+    if !all_passed {
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -1973,6 +2280,7 @@ fn main() -> Result<()> {
     });
 
     let (mode_name, common, summaries) = match cli.mode {
+        SimMode::Matrix(args) => return run_pareto_matrix(&args, stop),
         SimMode::Ipad(args) => {
             let count = args.common.clients.max(1);
             let mut handles = Vec::with_capacity(count);
@@ -2062,17 +2370,22 @@ fn main() -> Result<()> {
         println!("\n=== idis client_sim summary ({}) ===", report.mode);
         for c in &report.clients {
             println!(
-                "  client #{}: {} frames ({} IDR, {} init) | {:.1} fps | {:.2} Mbps | res={:?} | rot={} | reconn={} | max_gap={}ms | stalls={} | err={} | decode_err={}",
+                "  client #{}: {} frames ({} IDR={:.1}%, {} init) | {:.1} fps | {:.2} Mbps | gap p50/p95/p99/max={}/{}/{}/{}ms (stall {:.1}%) | res={:?} | rot={} | reconn={} | stalls={} | err={} | decode_err={}",
                 c.client_index,
                 c.frames_received,
                 c.keyframes_received,
+                c.idr_ratio * 100.0,
                 c.init_segments,
                 c.avg_fps,
                 c.avg_mbps,
+                c.frame_gap_p50_ms,
+                c.frame_gap_p95_ms,
+                c.frame_gap_p99_ms,
+                c.max_frame_gap_ms,
+                c.stall_ratio_pct,
                 c.resolutions_seen,
                 c.rotations_sent,
                 c.reconnects,
-                c.max_frame_gap_ms,
                 c.stalls_injected,
                 c.integrity_errors.len(),
                 c.decode_errors.len()

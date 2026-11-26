@@ -95,28 +95,18 @@ impl FlowControl {
 
     /// Returns `true` if a new frame may be sent now, or `false` if it should wait for backpressure.
     pub fn try_acquire_send(&self) -> bool {
-        self.try_acquire_send_inner(true)
+        self.try_acquire_send_at(self.elapsed_ms(), true)
     }
 
     /// Acquire a send slot without falsely inflating `dropped_frames` when a held `pending_frame`
     /// is merely re-checking readiness (real overwrites are counted via [`Self::record_drops`]).
     pub fn try_acquire_send_no_drop_count(&self) -> bool {
-        self.try_acquire_send_inner(false)
+        self.try_acquire_send_at(self.elapsed_ms(), false)
     }
 
-    fn record_send_timestamp(&self, now: u64, cap: usize) {
-        if let Ok(mut g) = self.rtt.lock() {
-            let cap = cap.clamp(1, MAX_RTT_TIMESTAMP_QUEUE);
-            while g.send_times_ms.len() >= cap {
-                g.send_times_ms.pop_front();
-            }
-            g.send_times_ms.push_back(now);
-        }
-    }
-
-    fn try_acquire_send_inner(&self, count_drop: bool) -> bool {
+    /// Logical-clock variant of [`Self::try_acquire_send`] for zero-sleep deterministic fuzzing.
+    pub fn try_acquire_send_at(&self, now: u64, count_drop: bool) -> bool {
         let limit = self.max_in_flight.load(Ordering::Relaxed);
-        let now = self.elapsed_ms();
         if limit == 0 || !self.acked_ever.load(Ordering::Acquire) {
             self.last_sent_ms.store(now, Ordering::Relaxed);
             self.record_send_timestamp(now, 4);
@@ -170,15 +160,24 @@ impl FlowControl {
         false
     }
 
+    fn record_send_timestamp(&self, now: u64, cap: usize) {
+        if let Ok(mut g) = self.rtt.lock() {
+            let cap = cap.clamp(1, MAX_RTT_TIMESTAMP_QUEUE);
+            while g.send_times_ms.len() >= cap {
+                g.send_times_ms.pop_front();
+            }
+            g.send_times_ms.push_back(now);
+        }
+    }
+
     pub fn record_drops(&self, n: u64) {
         if n > 0 {
             self.dropped_frames.fetch_add(n, Ordering::Relaxed);
         }
     }
 
-    fn decrement_in_flight(&self) {
+    fn decrement_in_flight_at(&self, now: u64) {
         self.acked_ever.store(true, Ordering::Release);
-        let now = self.elapsed_ms();
         if let Ok(mut g) = self.rtt.lock() {
             // Discard obviously expired timestamps (>2000ms) from lost ACKs before sampling.
             while let Some(&oldest) = g.send_times_ms.front() {
@@ -219,7 +218,10 @@ impl FlowControl {
     /// Smoothed client ACK round-trip latency (milliseconds), if a fresh ACK sample arrived
     /// within the last 3 seconds (stale samples expire so old spikes never trap ABR).
     pub fn ewma_rtt_ms(&self) -> Option<f64> {
-        let now = self.elapsed_ms();
+        self.ewma_rtt_ms_at(self.elapsed_ms())
+    }
+
+    pub fn ewma_rtt_ms_at(&self, now: u64) -> Option<f64> {
         self.rtt
             .lock()
             .ok()
@@ -236,14 +238,22 @@ impl FlowControl {
     /// Record a `FrameReceived` acknowledgment from the client.
     /// Ignored once the client has demonstrated `PictureRendered` end-to-end ACKs to prevent double-counting.
     pub fn on_frame_received(&self) {
+        self.on_frame_received_at(self.elapsed_ms());
+    }
+
+    pub fn on_frame_received_at(&self, now: u64) {
         if self.seen_picture_rendered.load(Ordering::Acquire) {
             return;
         }
-        self.decrement_in_flight();
+        self.decrement_in_flight_at(now);
     }
 
     /// Record a `PictureRendered` end-to-end acknowledgment from the client.
     pub fn on_picture_rendered(&self) {
+        self.on_picture_rendered_at(self.elapsed_ms());
+    }
+
+    pub fn on_picture_rendered_at(&self, now: u64) {
         let was_seen = self.seen_picture_rendered.swap(true, Ordering::AcqRel);
         if !was_seen {
             // Reset EWMA when transitioning from network-only `FrameReceived` to end-to-end
@@ -253,12 +263,12 @@ impl FlowControl {
                 g.last_rtt_sample_ms = None;
             }
         }
-        self.decrement_in_flight();
+        self.decrement_in_flight_at(now);
     }
 
     /// Record a generic ACK (used in tests).
     pub fn on_ack(&self) {
-        self.decrement_in_flight();
+        self.decrement_in_flight_at(self.elapsed_ms());
     }
 
     pub fn in_flight(&self) -> u32 {

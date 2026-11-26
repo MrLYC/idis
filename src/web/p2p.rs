@@ -150,14 +150,21 @@ impl SharedWebMuxer {
             self.hits.fetch_add(1, Ordering::Relaxed);
             return Some(hit.clone());
         }
-        if let Some(newest) = g.recent_packets.back() {
-            // Strictly reject out-of-order frames older than the ring window even across source switches.
-            if frame_seq < newest.seq {
-                return None;
+        // Strictly reject frames from an older source_epoch so late pre-switch/pre-lock frames
+        // can NEVER roll back the shared muxer timeline or wipe newer epoch packets.
+        if g.source_epoch > 0 && source_epoch < g.source_epoch {
+            return None;
+        }
+        let same_timeline = g.source == source && g.source_epoch == source_epoch;
+        if same_timeline {
+            if let Some(newest) = g.recent_packets.back() {
+                if frame_seq < newest.seq {
+                    return None;
+                }
             }
         }
         let eff_fps = fps.max(1);
-        if g.source != source || g.source_epoch != source_epoch {
+        if !same_timeline {
             // Never reset the shared muxer or wipe recent packets/last_idr_packet on a stale
             // non-IDR P-frame during a source/epoch transition; wait for an IDR from the new epoch.
             if !frame.is_keyframe {
@@ -227,6 +234,10 @@ impl SharedWebMuxer {
             return None;
         }
         let mut g = self.inner.lock().unwrap();
+        // Never allow an older source_epoch seed to clobber a newer live timeline.
+        if g.source_epoch > 0 && source_epoch < g.source_epoch {
+            return None;
+        }
         if let Some(ref idr) = g.last_idr_packet {
             if g.source == source && g.source_epoch == source_epoch {
                 return Some(idr.clone());
@@ -315,6 +326,12 @@ impl SharedWebMuxer {
             self.hits.load(Ordering::Relaxed),
             self.misses.load(Ordering::Relaxed),
         )
+    }
+
+    /// Inspect internal `(source, source_epoch, mux_epoch, ring_len)` for deterministic fuzz/shadow tests.
+    pub fn debug_state(&self) -> (&'static str, u64, u64, usize) {
+        let g = self.inner.lock().unwrap();
+        (g.source, g.source_epoch, g.epoch, g.recent_packets.len())
     }
 }
 
@@ -604,8 +621,9 @@ impl P2pRelayHub {
                 return;
             }
             node.relay_priority = next_prio;
-            if next_prio == 0 && !node.children.is_empty() {
-                let kids = std::mem::take(&mut node.children);
+            let allowed_fanout = node.max_fanout();
+            if node.children.len() > allowed_fanout {
+                let kids = node.children.split_off(allowed_fanout);
                 for &cid in &kids {
                     Self::send_json(
                         node,
@@ -665,6 +683,10 @@ impl P2pRelayHub {
 
     /// Child reports P2P stall/failure -> immediately resume direct WS video and try another parent.
     pub fn on_p2p_fallback(&self, viewer_id: u64, reason: &str) {
+        self.on_p2p_fallback_at(viewer_id, reason, Instant::now());
+    }
+
+    pub fn on_p2p_fallback_at(&self, viewer_id: u64, reason: &str, now: Instant) {
         let mut nodes = self.nodes.lock().unwrap();
         let order = self.join_order.lock().unwrap();
         let old_parent = {
@@ -675,7 +697,7 @@ impl P2pRelayHub {
             if let Some(pid) = prev {
                 let prev_count = node.avoid_parents.get(&pid).map(|(_, c)| *c).unwrap_or(0);
                 node.avoid_parents
-                    .insert(pid, (Instant::now(), prev_count.saturating_add(1)));
+                    .insert(pid, (now, prev_count.saturating_add(1)));
             }
             node.fallback_count = node.fallback_count.saturating_add(1);
             node.last_fallback_reason = Some(reason.to_string());
@@ -699,7 +721,7 @@ impl P2pRelayHub {
         }
         Self::recompute_depths_locked(&mut nodes);
         if self.is_enabled() {
-            self.rebalance_locked(&mut nodes, &order);
+            self.rebalance_locked_at(&mut nodes, &order, now);
         }
     }
 
@@ -863,9 +885,98 @@ impl P2pRelayHub {
         }
     }
 
+    fn subtree_height(nodes: &HashMap<u64, P2pPeerNode>, node_id: u64, guard: u8) -> u8 {
+        if guard > 16 {
+            return 16;
+        }
+        let Some(node) = nodes.get(&node_id) else {
+            return 0;
+        };
+        let mut max_child = 0u8;
+        for &cid in &node.children {
+            let h = 1u8.saturating_add(Self::subtree_height(nodes, cid, guard + 1));
+            if h > max_child {
+                max_child = h;
+            }
+        }
+        max_child
+    }
+
+    pub fn rebalance_at(&self, now: Instant) {
+        if !self.is_enabled() {
+            return;
+        }
+        let mut nodes = self.nodes.lock().unwrap();
+        let order = self.join_order.lock().unwrap();
+        self.rebalance_locked_at(&mut nodes, &order, now);
+    }
+
+    /// Verify all structural forest invariants on the live P2P relay graph (used by fuzz/property tests).
+    pub fn check_invariants(&self) -> Result<(), String> {
+        let nodes = self.nodes.lock().unwrap();
+        for (&id, node) in nodes.iter() {
+            if node.children.len() > node.max_fanout() {
+                return Err(format!(
+                    "node #{id} fanout overflow: children={} > max_fanout={}",
+                    node.children.len(),
+                    node.max_fanout()
+                ));
+            }
+            if node.depth > MAX_P2P_DEPTH {
+                return Err(format!(
+                    "node #{id} depth overflow: depth={} > MAX_P2P_DEPTH={MAX_P2P_DEPTH}",
+                    node.depth
+                ));
+            }
+            let paused = node.ws_direct_paused.load(Ordering::Acquire);
+            if paused != node.p2p_active {
+                return Err(format!(
+                    "node #{id} ws_direct_paused ({paused}) != p2p_active ({})",
+                    node.p2p_active
+                ));
+            }
+            if node.parent_id.is_none() && paused {
+                return Err(format!("node #{id} has no parent but ws_direct_paused=true"));
+            }
+            if let Some(pid) = node.parent_id {
+                let Some(parent) = nodes.get(&pid) else {
+                    return Err(format!("node #{id} points to missing parent #{pid}"));
+                };
+                if !parent.children.contains(&id) {
+                    return Err(format!(
+                        "asymmetric edge: node #{id}.parent_id=Some({pid}) but parent missing child"
+                    ));
+                }
+                if Self::is_ancestor(&nodes, id, pid) {
+                    return Err(format!("cycle detected involving node #{id} and parent #{pid}"));
+                }
+            }
+            for &cid in &node.children {
+                let Some(child) = nodes.get(&cid) else {
+                    return Err(format!("node #{id} references missing child #{cid}"));
+                };
+                if child.parent_id != Some(id) {
+                    return Err(format!(
+                        "asymmetric edge: node #{id} lists child #{cid} with parent_id={:?}",
+                        child.parent_id
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Assign P2P parents to eligible viewers beyond `MAX_DIRECT_ROOTS` while preserving low depth.
     fn rebalance_locked(&self, nodes: &mut HashMap<u64, P2pPeerNode>, order: &[u64]) {
-        let now = Instant::now();
+        self.rebalance_locked_at(nodes, order, Instant::now());
+    }
+
+    fn rebalance_locked_at(
+        &self,
+        nodes: &mut HashMap<u64, P2pPeerNode>,
+        order: &[u64],
+        now: Instant,
+    ) {
         for node in nodes.values_mut() {
             node.avoid_parents
                 .retain(|_, (ts, count)| now.saturating_duration_since(*ts) < avoid_ttl_for_failures(*count));
@@ -900,8 +1011,9 @@ impl P2pRelayHub {
             .collect();
 
         for cid in unassigned {
+            let cid_height = Self::subtree_height(nodes, cid, 0);
             // Only pick a parent that is either a direct root (`parent_id == None`) or an already-active
-            // P2P relay (`p2p_active == true`) with spare fanout and depth < MAX_P2P_DEPTH.
+            // P2P relay (`p2p_active == true`) with spare fanout and enough depth headroom for cid's subtree.
             let best_parent = order
                 .iter()
                 .copied()
@@ -917,7 +1029,7 @@ impl P2pRelayHub {
                     };
                     if !p.can_relay()
                         || p.children.len() >= p.max_fanout()
-                        || p.depth >= MAX_P2P_DEPTH
+                        || p.depth.saturating_add(1).saturating_add(cid_height) > MAX_P2P_DEPTH
                         || c.avoid_parents.contains_key(&pid)
                     {
                         return false;

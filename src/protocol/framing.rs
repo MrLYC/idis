@@ -114,10 +114,13 @@ pub fn read_canal_block<R: Read>(reader: &mut R) -> Result<Option<Vec<u8>>> {
 
 /// Read an `MSMCanalSocket` length-prefixed block with an explicit maximum payload size.
 /// Returns `Ok(None)` on clean EOF at frame boundary.
+/// Reads large payloads incrementally so a malicious 4-byte length header followed by EOF
+/// cannot trigger an immediate multi-megabyte allocation spike.
 pub fn read_canal_block_limited<R: Read>(
     reader: &mut R,
     max_size: usize,
 ) -> Result<Option<Vec<u8>>> {
+    let cap = max_size.min(MAX_FRAME_SIZE);
     let mut len_buf = [0u8; 4];
     loop {
         match reader.read(&mut len_buf[..1]) {
@@ -132,11 +135,24 @@ pub fn read_canal_block_limited<R: Read>(
     if len == 0 {
         return Ok(Some(Vec::new()));
     }
-    if len > max_size {
-        bail!("MSMCanalSocket incoming frame too large: {} bytes (limit={})", len, max_size);
+    if len > cap {
+        bail!("MSMCanalSocket incoming frame too large: {} bytes (limit={})", len, cap);
     }
-    let mut payload = vec![0u8; len];
-    reader.read_exact(&mut payload)?;
+    let mut payload = Vec::with_capacity(len.min(65536));
+    let mut remaining = len;
+    let mut chunk = [0u8; 16384];
+    while remaining > 0 {
+        let to_read = remaining.min(chunk.len());
+        match reader.read(&mut chunk[..to_read]) {
+            Ok(0) => bail!("unexpected EOF reading MSMCanalSocket frame"),
+            Ok(n) => {
+                payload.extend_from_slice(&chunk[..n]);
+                remaining -= n;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
     Ok(Some(payload))
 }
 
@@ -175,6 +191,7 @@ pub fn read_canal_block_limited_deadline(
         Ok(true)
     }
 
+    let cap = max_size.min(MAX_FRAME_SIZE);
     let mut len_buf = [0u8; 4];
     if !read_exact_deadline(stream, &mut len_buf, deadline, true)? {
         return Ok(None);
@@ -183,11 +200,18 @@ pub fn read_canal_block_limited_deadline(
     if len == 0 {
         return Ok(Some(Vec::new()));
     }
-    if len > max_size {
-        bail!("MSMCanalSocket incoming frame too large: {} bytes (limit={})", len, max_size);
+    if len > cap {
+        bail!("MSMCanalSocket incoming frame too large: {} bytes (limit={})", len, cap);
     }
-    let mut payload = vec![0u8; len];
-    read_exact_deadline(stream, &mut payload, deadline, false)?;
+    let mut payload = Vec::with_capacity(len.min(65536));
+    let mut remaining = len;
+    let mut chunk = [0u8; 16384];
+    while remaining > 0 {
+        let to_read = remaining.min(chunk.len());
+        read_exact_deadline(stream, &mut chunk[..to_read], deadline, false)?;
+        payload.extend_from_slice(&chunk[..to_read]);
+        remaining -= to_read;
+    }
     Ok(Some(payload))
 }
 

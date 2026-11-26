@@ -1,0 +1,61 @@
+name: Coverage-Guided Fuzzing (Biweekly)
+
+on:
+  schedule:
+    # Run every two weeks (1st and 15th of each month at 03:00 UTC)
+    - cron: '0 3 1,15 * *'
+  workflow_dispatch:
+    inputs:
+      max_total_time:
+        description: 'Fuzz duration per target in seconds'
+        required: false
+        default: '90'
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  libfuzzer:
+    name: libFuzzer (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - keyed_archive
+          - framing_video
+          - http_ws
+          - annexb_fmp4
+          - yaml_config
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust nightly toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: Run libFuzzer target
+        env:
+          MAX_TIME: ${{ inputs.max_total_time || '90' }}
+        run: |
+          cargo +nightly fuzz run --fuzz-dir fuzz "${{ matrix.target }}" -- \
+            -max_total_time="${MAX_TIME}" \
+            -max_len=65536 \
+            -rss_limit_mb=2048
+
+      - name: Upload crash artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crash-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}
+          if-no-files-found: ignore

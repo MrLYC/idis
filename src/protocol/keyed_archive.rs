@@ -670,8 +670,15 @@ fn decode_object_dict(
                     ArchivedValue::String(s) => s,
                     ArchivedValue::Int(i) => i.to_string(),
                     ArchivedValue::Uint(u) => u.to_string(),
+                    ArchivedValue::Bool(b) => b.to_string(),
+                    ArchivedValue::Real(f) => format!("{f}"),
+                    ArchivedValue::Data(d) => {
+                        let s = format!("<data:{}>", d.len());
+                        budget.consume_bytes(s.len())?;
+                        s
+                    }
                     _ => {
-                        let s = format!("{k_dec:?}");
+                        let s = "<non-string-key>".to_string();
                         budget.consume_bytes(s.len())?;
                         s
                     }

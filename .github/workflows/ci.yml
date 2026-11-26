@@ -39,7 +39,7 @@ jobs:
       - name: Run cargo test
         env:
           MACOSX_DEPLOYMENT_TARGET: "12.3"
-        run: cargo test --locked
+        run: cargo test --locked --all-targets
 
       - name: Run cargo clippy
         env:

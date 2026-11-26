@@ -15,8 +15,8 @@ Thank you for your interest in contributing to `idis`!
 Before opening a pull request, please ensure all checks pass cleanly:
 
 ```bash
-# Unit + end-to-end integration tests
-cargo test --locked
+# Unit + end-to-end integration tests (including the dual-mode client simulator)
+cargo test --locked --all-targets
 
 # Zero-warning lint check
 cargo clippy --locked --all-targets -- -D warnings
@@ -26,6 +26,26 @@ node tests/web_frontend_test.mjs
 
 # Optional: TLA+ formal model checking
 ./docs/tla/check.sh --download
+```
+
+## Dual-Mode End-to-End Client Simulator (`examples/client_sim.rs`)
+
+You can test a live `idis` host without a physical tablet or extra browser using the built-in `client_sim` example (supports multi-resolution presets, live rotation, weak-network profiles, real `ffmpeg` H.264/fMP4 decode verification, and `ffplay` live preview):
+
+```bash
+# 1) Simulate 2 Web Extended Screen viewers with rotation, weak Wi-Fi profile, and real FFmpeg decode check
+cargo run --example client_sim -- web \
+  --admin-url http://127.0.0.1:8787 \
+  --token "your-passcode" \
+  --clients 2 --p2p-hello \
+  --cycle-res 1280x720,720x1280,1920x1080 --rotate-every 5 \
+  --net-profile wifi-weak --verify-decode --duration 20
+
+# 2) Simulate a legacy iPad Air Wi-Fi client with orientation rotation, jitter/stalls, and live ffplay preview
+cargo run --example client_sim -- ipad \
+  --host 127.0.0.1 --port 56845 \
+  --preset ipad-air --rotate-every 5 \
+  --net-profile lossy-burst --verify-decode --preview --duration 30
 ```
 
 ## Guidelines

@@ -1,0 +1,2166 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>idis 网页扩展屏</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --panel: #161b22;
+    --panel-alt: #1c2128;
+    --border: #30363d;
+    --text: #e6edf3;
+    --muted: #8b949e;
+    --accent: #2f81f7;
+    --ok: #3fb950;
+    --warn: #d29922;
+    --danger: #f85149;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg); color: var(--text); font-size: 14px; line-height: 1.5;
+  }
+  header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 12px 20px; background: var(--panel); border-bottom: 1px solid var(--border);
+    position: sticky; top: 0; z-index: 10;
+  }
+  .brand { font-weight: 700; font-size: 16px; display: flex; align-items: center; gap: 8px; }
+  .tabs { display: flex; gap: 8px; }
+  .tab {
+    background: transparent; color: var(--muted); border: 1px solid var(--border);
+    padding: 6px 14px; border-radius: 6px; cursor: pointer; font-size: 13px;
+  }
+  .tab.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+  main { max-width: 1180px; margin: 18px auto; padding: 0 16px 48px; }
+  body.viewer-mode main { max-width: 1440px; margin: 12px auto; }
+  .card {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    padding: 16px 18px; margin-bottom: 14px;
+  }
+  .card h2 {
+    margin: 0 0 12px; font-size: 15px; display: flex; align-items: center;
+    justify-content: space-between; flex-wrap: wrap; gap: 8px;
+  }
+  details.card > summary {
+    list-style: none; cursor: pointer; display: flex; align-items: center;
+    justify-content: space-between; flex-wrap: wrap; gap: 8px; font-size: 15px; font-weight: 700;
+  }
+  details.card > summary::-webkit-details-marker { display: none; }
+  details.card > summary .summary-title::before {
+    content: '▸'; display: inline-block; width: 16px; color: var(--muted); transition: transform .15s;
+  }
+  details.card[open] > summary .summary-title::before { transform: rotate(90deg); }
+  details.card[open] > summary { margin-bottom: 12px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; }
+  .stat { background: var(--panel-alt); border: 1px solid var(--border); border-radius: 8px; padding: 12px; min-width: 0; }
+  #hostStats .stat { min-height: 78px; display: flex; flex-direction: column; justify-content: space-between; }
+  .stat .label { color: var(--muted); font-size: 12px; }
+  .stat .val {
+    font-size: 13px; font-weight: 600; margin-top: 6px; line-height: 1.45;
+    font-variant-numeric: tabular-nums; word-break: break-word;
+  }
+  .metric-lines { display: flex; flex-direction: column; gap: 2px; font-variant-numeric: tabular-nums; }
+  .metric-line { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  .table-wrap { width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  .table-wrap table { min-width: 560px; }
+  .sub-panel {
+    background: var(--panel-alt); border: 1px solid var(--border); border-radius: 8px;
+    padding: 10px 12px; margin-top: 10px;
+  }
+  .seg-group {
+    display: inline-flex; border: 1px solid var(--border); border-radius: 6px; overflow: hidden;
+  }
+  .seg-group button {
+    border: none; border-right: 1px solid var(--border); border-radius: 0;
+    padding: 6px 10px; font-size: 12px; background: var(--bg); color: var(--muted);
+  }
+  .seg-group button:last-child { border-right: none; }
+  .seg-group button.active { background: var(--accent); color: #fff; font-weight: 600; }
+  .seg-group button.active-ok { background: #238636; color: #fff; font-weight: 600; }
+  input[type=text], input[type=password], input[type=number], select {
+    background: var(--bg); color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 7px 10px; font-size: 13px; min-width: 110px;
+  }
+  button {
+    background: var(--panel-alt); color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 7px 12px; font-size: 13px; cursor: pointer;
+    transition: border-color .15s, background .15s, transform .08s, box-shadow .15s;
+  }
+  button:hover:not(:disabled) { border-color: #6e7681; }
+  button:active:not(:disabled) { transform: translateY(1px); }
+  button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-visible {
+    outline: 2px solid var(--accent); outline-offset: 2px;
+  }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.primary.pulse { box-shadow: 0 0 0 3px rgba(47,129,247,.38); }
+  button.ok { background: #238636; border-color: #2ea043; color: #fff; }
+  button.danger { background: #da3633; border-color: #f85149; color: #fff; }
+  button.warn { background: #9e6a03; border-color: var(--warn); color: #fff; }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); font-variant-numeric: tabular-nums; }
+  th { color: var(--muted); font-weight: 500; white-space: nowrap; }
+  .badge {
+    display: inline-block; padding: 2px 7px; border-radius: 12px; font-size: 11px; font-weight: 600;
+  }
+  .badge.ok { background: rgba(63,185,80,.18); color: var(--ok); }
+  .badge.warn { background: rgba(210,153,34,.2); color: var(--warn); }
+  .badge.err { background: rgba(248,81,73,.2); color: var(--danger); }
+  .badge.info { background: rgba(47,129,247,.2); color: #79c0ff; }
+  .pending-box { border-color: var(--warn); background: rgba(210,153,34,.07); }
+  .log-box {
+    background: #010409; border: 1px solid var(--border); border-radius: 6px;
+    padding: 10px; max-height: 260px; overflow-y: auto; font-family: ui-monospace, SFMono-Regular, monospace;
+    font-size: 12px; white-space: pre-wrap; word-break: break-all;
+  }
+  .hidden { display: none !important; }
+  .login-wrap { max-width: 420px; margin: 60px auto; }
+  .msg { margin-top: 8px; font-size: 13px; }
+  .msg:empty { display: none; }
+  .msg.err { color: var(--danger); }
+  .msg.ok { color: var(--ok); }
+  .toast-stack {
+    position: fixed; right: 16px; bottom: 16px; z-index: 10050;
+    display: flex; flex-direction: column; gap: 8px; max-width: min(380px, calc(100vw - 32px));
+    pointer-events: none;
+  }
+  .toast {
+    background: rgba(22, 27, 34, 0.96); color: var(--text);
+    border: 1px solid var(--border); border-left: 3px solid var(--accent);
+    border-radius: 8px; padding: 9px 13px; font-size: 13px;
+    box-shadow: 0 6px 20px rgba(0,0,0,.45); backdrop-filter: blur(8px);
+    animation: toastIn .18s ease-out;
+  }
+  .toast.ok { border-left-color: var(--ok); }
+  .toast.warn { border-left-color: var(--warn); }
+  .toast.err { border-left-color: var(--danger); }
+  @keyframes toastIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+  .viewer-stage {
+    position: relative; background: #000; border-radius: 10px; overflow: hidden;
+    border: 1px solid var(--border); min-height: 420px; display: flex; align-items: center; justify-content: center;
+    touch-action: none; user-select: none; -webkit-user-select: none;
+  }
+  .viewer-stage.zoomed { cursor: grab; }
+  .viewer-stage.dragging { cursor: grabbing; }
+  .viewer-stage video {
+    width: 100%; max-height: 82vh; background: #000; display: block; object-fit: contain;
+    transform-origin: center center; will-change: transform; pointer-events: none;
+  }
+  .viewer-stage.fill video { object-fit: cover; }
+  .stage-overlay {
+    position: absolute; inset: 0; z-index: 20;
+    display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px;
+    padding: 24px; text-align: center; background: rgba(13, 17, 23, 0.76); backdrop-filter: blur(6px);
+  }
+  .stage-overlay .ov-title { font-size: 16px; font-weight: 600; color: var(--text); max-width: 460px; }
+  .stage-overlay .ov-sub { font-size: 12px; color: var(--muted); max-width: 460px; }
+  .zoom-group { display: inline-flex; align-items: center; gap: 4px; }
+  .zoom-group button { padding: 6px 9px; min-width: 32px; }
+  .viewer-toolbar {
+    display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between;
+    gap: 10px; margin-bottom: 10px;
+  }
+  .conn-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(310px, 1fr)); gap: 14px; }
+  .conn-card {
+    background: var(--panel-alt); border: 1px solid var(--border); border-radius: 8px; padding: 14px;
+    display: flex; gap: 14px; align-items: flex-start; justify-content: space-between;
+  }
+  .conn-meta { flex: 1; min-width: 0; }
+  .conn-meta .label { color: var(--muted); font-size: 12px; margin-bottom: 6px; }
+  .conn-ep {
+    display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin: 6px 0;
+  }
+  .conn-ep code { word-break: break-all; font-size: 13px; padding: 4px 8px; }
+  .qr-col {
+    display: flex; flex-direction: column; align-items: center; gap: 6px; flex: 0 0 156px;
+  }
+  .qr-box {
+    width: 152px; height: 152px; flex: 0 0 152px; background: #fff; border-radius: 8px;
+    padding: 6px; display: flex; align-items: center; justify-content: center;
+    box-shadow: 0 2px 10px rgba(0,0,0,.35);
+  }
+  .qr-box.empty {
+    background: var(--bg); border: 1px dashed var(--border); box-shadow: none;
+    flex-direction: column; gap: 8px; text-align: center; color: var(--muted); font-size: 12px; padding: 12px;
+  }
+  .qr-box svg { width: 100%; height: 100%; display: block; }
+  .qr-caption { font-size: 11px; color: var(--muted); text-align: center; }
+  a.btn-link {
+    display: inline-block; background: var(--panel-alt); color: var(--text);
+    border: 1px solid var(--border); border-radius: 6px; padding: 6px 10px;
+    font-size: 13px; text-decoration: none;
+  }
+  a.btn-link:hover { border-color: #6e7681; }
+  .fs-hud {
+    display: none; position: fixed; top: 14px; right: 16px; z-index: 10001;
+    max-width: calc(100vw - 32px);
+    background: rgba(13, 17, 23, 0.82); backdrop-filter: blur(8px);
+    border: 1px solid rgba(255,255,255,0.16); border-radius: 10px;
+    padding: 8px 10px; gap: 8px; align-items: center; flex-wrap: wrap;
+    transition: opacity 0.25s ease;
+  }
+  body.page-fullscreen { overflow: hidden; background: #000; }
+  body.page-fullscreen header { display: none !important; }
+  body.page-fullscreen main { max-width: none; margin: 0; padding: 0; }
+  body.page-fullscreen #secViewStage .card {
+    border: none; border-radius: 0; padding: 0; margin: 0; background: #000;
+  }
+  body.page-fullscreen .viewer-toolbar { display: none !important; }
+  body.page-fullscreen .viewer-stage {
+    position: fixed; inset: 0; width: 100vw; height: 100vh; height: 100dvh;
+    min-height: 0; border: none; border-radius: 0; z-index: 9999; background: #000;
+  }
+  body.page-fullscreen .viewer-stage video {
+    width: 100%; height: 100%; max-height: none;
+  }
+  body.page-fullscreen .fs-hud { display: flex; }
+  body.page-fullscreen .fs-hud.idle { opacity: 0; pointer-events: none; }
+  code { background: var(--panel-alt); padding: 2px 6px; border-radius: 4px; font-size: 12px; }
+  .sku-form { display: flex; flex-direction: column; gap: 11px; }
+  .sku-row { display: flex; align-items: flex-start; gap: 10px; flex-wrap: wrap; }
+  .sku-label {
+    flex: 0 0 118px; color: var(--muted); font-size: 12px; padding-top: 7px; font-weight: 500;
+  }
+  .sku-body { flex: 1; min-width: 220px; display: flex; flex-direction: column; gap: 6px; }
+  .sku-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+  .sku-chip {
+    background: var(--panel-alt); color: var(--text); border: 1px solid var(--border);
+    border-radius: 7px; padding: 6px 11px; font-size: 12px; cursor: pointer;
+    transition: border-color .14s, background .14s, color .14s;
+  }
+  .sku-chip:hover:not(:disabled) { border-color: #6e7681; background: #262c36; }
+  .sku-chip.selected {
+    background: rgba(88, 166, 255, 0.16); border-color: var(--accent); color: #b8dcff; font-weight: 600;
+  }
+  .sku-chip.selected-ok {
+    background: rgba(46, 160, 67, 0.18); border-color: var(--ok); color: #7ee787; font-weight: 600;
+  }
+  .sku-chip:disabled { opacity: 0.45; cursor: not-allowed; }
+  .sku-custom { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding-top: 2px; }
+  .sku-actions {
+    display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between;
+    gap: 10px; margin-top: 4px; padding-top: 12px; border-top: 1px solid var(--border);
+  }
+  .sku-preview { color: var(--muted); font-size: 12px; }
+  .conn-section-hd {
+    font-size: 13px; margin: 14px 0 8px; display: flex; justify-content: space-between;
+    align-items: center; flex-wrap: wrap; gap: 8px; color: var(--text);
+  }
+  @media (max-width: 720px) {
+    header { padding: 10px 12px; }
+    main { margin: 10px auto; padding: 0 10px 32px; }
+    .card { padding: 12px 14px; }
+    .conn-grid { grid-template-columns: 1fr; }
+    .conn-card { flex-direction: column; }
+    .qr-col { align-self: center; }
+    .sku-label { flex: 1 1 100%; padding-top: 0; }
+    .viewer-stage { min-height: 260px; }
+    .viewer-stage video { max-height: 70vh; }
+    .fs-hud { left: 10px; right: 10px; top: 10px; max-width: calc(100vw - 20px); justify-content: center; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">
+    <span>idis</span>
+    <span class="badge info" id="hdrVersion">扩展屏观看</span>
+    <span class="badge warn hidden" id="hdrDebugBadge" title="DEBUG 日志级别已开启">DEBUG 日志</span>
+  </div>
+  <div class="tabs">
+    <a class="tab hidden" id="tabAdmin" href="/" style="text-decoration:none;display:inline-flex;align-items:center">管理后台</a>
+    <button class="tab active" id="tabView">扩展屏观看</button>
+  </div>
+</header>
+
+<main>
+  <!-- ==================== VIEWER LOGIN ==================== -->
+  <section id="secViewLogin" class="login-wrap hidden">
+    <div class="card">
+      <h2>观看扩展屏</h2>
+      <p style="color:var(--muted);margin-top:0">请输入管理员指定的<strong>观看口令</strong>以实时查看主机扩展屏。</p>
+      <div class="row">
+        <input id="viewPassInput" type="password" placeholder="观看口令" style="flex:1" onkeydown="if(event.key==='Enter')viewerLogin()">
+        <button class="primary" onclick="viewerLogin()">进入观看</button>
+      </div>
+      <div id="viewLoginMsg" class="msg"></div>
+    </div>
+  </section>
+
+  <!-- ==================== VIEWER APPROVAL ==================== -->
+  <section id="secViewApproval" class="login-wrap hidden">
+    <div class="card">
+      <h2>等待管理员审批</h2>
+      <p style="color:var(--muted);margin-top:0">主机已开启网页观看审批，请在管理后台或主机终端点击「允许并信任」或「仅本次允许」。</p>
+      <div class="stat" style="margin-bottom:12px">
+        <div style="font-size:13px"><strong>浏览器：</strong><span id="approvalClientLabel">-</span></div>
+        <div style="font-size:12px;color:var(--muted);margin-top:4px">设备指纹：<code id="approvalClientFp">-</code></div>
+      </div>
+      <div id="viewApprovalMsg" class="msg">正在向主机发送审批请求...</div>
+      <div class="row" style="margin-top:12px">
+        <button class="primary" id="btnRetryApproval" onclick="requestViewerApproval(true)">重新申请审批</button>
+        <button onclick="viewerLogout()">退出观看</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- ==================== VIEWER STAGE ==================== -->
+  <section id="secViewStage" class="hidden">
+    <div class="card">
+      <div class="viewer-toolbar">
+        <div class="row">
+          <span class="badge info" id="streamStatus">未连接</span>
+          <span class="badge info hidden" id="streamSourceBadge"></span>
+          <span class="badge ok hidden" id="streamP2pBadge"></span>
+          <span class="badge info" title="网页观看端为只读模式，支持滚轮/双指缩放和拖拽浏览">只读 · 滚轮/双指缩放 · 拖拽</span>
+          <span id="streamMeta" style="color:var(--muted);font-size:12px"></span>
+        </div>
+        <div class="row">
+          <button class="hidden" id="btnToggleWebIndepView" onclick="toggleWebIndependentScreen()">切换为独立扩展屏</button>
+          <span class="zoom-group" title="缩放画面（支持鼠标滚轮、触控板/双指捏合，放大后可拖拽，按 0 重置）">
+            <button onclick="stepViewZoom(-0.25)">−</button>
+            <button id="btnZoomReset" onclick="resetViewZoom()">100%</button>
+            <button onclick="stepViewZoom(0.25)">+</button>
+          </span>
+          <button onclick="reconnectStream()">重连画面</button>
+          <button onclick="toggleFit()">适应/铺满</button>
+          <button class="primary" id="btnFullscreen" onclick="togglePageFullscreen()">网页全屏 (F)</button>
+          <button onclick="viewerLogout()">退出观看</button>
+        </div>
+      </div>
+      <div class="viewer-stage" id="viewerStage" onmousemove="wakeFsHud()" ontouchstart="wakeFsHud()">
+        <video id="screenVideo" autoplay muted playsinline></video>
+        <div class="stage-overlay hidden" id="stageOverlay" onclick="event.stopPropagation()" onmousedown="event.stopPropagation()" ontouchstart="event.stopPropagation()">
+          <div class="ov-title" id="stageOverlayTitle">连接中...</div>
+          <div class="ov-sub" id="stageOverlaySub"></div>
+          <button class="primary hidden" id="stageOverlayBtn" onclick="reconnectStream()">重连画面</button>
+        </div>
+        <div class="fs-hud" id="fsHud" onclick="event.stopPropagation()" onmousedown="event.stopPropagation()" ontouchstart="event.stopPropagation()">
+          <span class="badge info" id="fsStreamStatus">未连接</span>
+          <span class="badge info hidden" id="fsStreamSourceBadge"></span>
+          <span class="badge ok hidden" id="fsStreamP2pBadge"></span>
+          <span id="fsStreamMeta" style="color:var(--muted);font-size:12px"></span>
+          <span class="zoom-group">
+            <button onclick="stepViewZoom(-0.25)">−</button>
+            <button id="fsBtnZoomReset" onclick="resetViewZoom()">100%</button>
+            <button onclick="stepViewZoom(0.25)">+</button>
+          </span>
+          <button onclick="toggleFit()">适应/铺满</button>
+          <button onclick="reconnectStream()">重连</button>
+          <button class="primary" onclick="exitPageFullscreen()">退出全屏 (Esc)</button>
+        </div>
+      </div>
+    </div>
+  </section>
+</main>
+<div class="toast-stack" id="toastStack" aria-live="polite"></div>
+
+
+<script>
+let currentTab = 'view';
+let authStatus = { admin_logged_in: false, viewer_logged_in: false, viewer_enabled: false };
+let lastWebIndependent = false;
+let lastWebScreenMode = 'follow_ipad';
+let supportsWebIndependent = false;
+let viewerApprovalInFlight = false;
+let viewerApprovalDenied = false;
+let viewerApprovalAbort = null;
+let ws = null;
+let streamGen = 0;
+let manualReconnectRequired = false;
+let currentEpoch = null;
+let mediaSource = null;
+let sourceBuffer = null;
+let sbQueue = [];
+let lastInitPayload = null;
+let pendingInit = null;
+let currentCodec = null;
+let currentDims = '';
+let reconnectTimer = null;
+let reconnectAttempt = 0;
+let wsWatchdogTimer = null;
+let lastServerActivityAt = 0;
+let mseRecoverTimer = null;
+let fsHudTimer = null;
+let debugStatsTimer = null;
+let mseErrorWindowStart = 0;
+let mseErrorCount = 0;
+let mseAwaitingIdr = true;
+let lastNeedIdrAt = 0;
+let tabHidePauseTimer = null;
+let tabVisibilitySentHidden = false;
+let urlTokenFailed = false;
+if (new URLSearchParams(location.search).has('token')) {
+  urlTokenFailed = true;
+  history.replaceState(null, '', '/view');
+}
+function debugTrace(event, data = {}) {
+  if (!authStatus || !(authStatus.debug_trace_active ?? authStatus.debug_enabled)) return;
+  try {
+    fetch('/api/debug/event', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ event, data }),
+      keepalive: true,
+    }).catch(() => {});
+  } catch (_) {}
+}
+
+function esc(s) {
+  return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+async function api(url, opts = {}) {
+  try {
+    const res = await fetch(url, {
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json', ...(opts.headers || {}) },
+      ...opts,
+    });
+    const data = await res.json().catch(() => ({}));
+    return { ok: res.ok, status: res.status, networkError: false, data };
+  } catch (e) {
+    return { ok: false, status: 0, networkError: true, data: { error: '无法连接服务器' } };
+  }
+}
+
+async function checkAuth() {
+  const r = await api('/api/auth/status');
+  if (r.networkError) {
+    scheduleReconnect('无法连接主机');
+    return;
+  }
+  reconnectAttempt = 0;
+  if (r.ok) {
+    authStatus = r.data;
+    if (typeof authStatus.web_screen_mode === 'string') {
+      lastWebScreenMode = authStatus.web_screen_mode;
+    }
+    if (typeof authStatus.web_independent_screen === 'boolean') {
+      lastWebIndependent = authStatus.web_independent_screen;
+    }
+    if (typeof authStatus.supports_independent_web_screen === 'boolean') {
+      supportsWebIndependent = authStatus.supports_independent_web_screen;
+    }
+  }
+  const dbgBadge = document.getElementById('hdrDebugBadge');
+  if (dbgBadge) {
+    dbgBadge.classList.toggle('hidden', !(authStatus.debug_logging_enabled ?? authStatus.debug_enabled));
+  }
+  renderView();
+}
+function showToast(text, kind = 'info') {
+  const stack = document.getElementById('toastStack');
+  if (!stack || !text) return;
+  const el = document.createElement('div');
+  el.className = 'toast ' + kind;
+  el.textContent = text;
+  stack.appendChild(el);
+  while (stack.children.length > 3) stack.removeChild(stack.firstChild);
+  setTimeout(() => {
+    el.style.transition = 'opacity .2s';
+    el.style.opacity = '0';
+    setTimeout(() => { if (el.parentNode) el.parentNode.removeChild(el); }, 220);
+  }, 2600);
+}
+
+
+function renderView() {
+  document.body.classList.toggle('viewer-mode', !!authStatus.viewer_logged_in);
+  const tabAdmin = document.getElementById('tabAdmin');
+  if (tabAdmin) {
+    tabAdmin.classList.toggle('hidden', !authStatus.admin_logged_in);
+  }
+  document.getElementById('secViewLogin').classList.add('hidden');
+  document.getElementById('secViewApproval').classList.add('hidden');
+  document.getElementById('secViewStage').classList.add('hidden');
+  if (authStatus.viewer_logged_in) {
+    urlTokenFailed = false;
+    if (authStatus.web_require_approval && authStatus.viewer_approved === false) {
+      exitPageFullscreen();
+      stopStream();
+      document.getElementById('secViewApproval').classList.remove('hidden');
+      const lbl = document.getElementById('approvalClientLabel');
+      const fp = document.getElementById('approvalClientFp');
+      if (lbl) lbl.textContent = authStatus.viewer_label || 'Web Browser';
+      if (fp) fp.textContent = authStatus.viewer_fingerprint || '-';
+      if (!viewerApprovalInFlight && !viewerApprovalDenied) {
+        requestViewerApproval(false);
+      }
+      return;
+    }
+    viewerApprovalDenied = false;
+    document.getElementById('secViewStage').classList.remove('hidden');
+    updateViewerModeButton();
+    if (authStatus.host_lock_disconnect_blocked) {
+      manualReconnectRequired = true;
+      stopStream();
+      setStreamStatus('主机已锁屏，已自动断开投屏（解锁后点击「重连画面」）', 'warn');
+      return;
+    }
+    startStream();
+  } else {
+    viewerApprovalDenied = false;
+    exitPageFullscreen();
+    stopStream();
+    document.getElementById('secViewLogin').classList.remove('hidden');
+    const msg = document.getElementById('viewLoginMsg');
+    if (!authStatus.viewer_enabled) {
+      msg.className = 'msg err';
+      msg.textContent = '管理员尚未开启网页观看口令，请先在管理后台设置口令或启动时传 --web-view-token。';
+    } else if (urlTokenFailed) {
+      urlTokenFailed = false;
+      msg.className = 'msg err';
+      msg.textContent = 'URL 参数中的观看口令无效，请重新输入观看口令。';
+    } else if (msg.textContent.includes('尚未开启')) {
+      msg.textContent = '';
+    }
+  }
+}
+async function viewerLogin() {
+  manualReconnectRequired = false;
+  const token = document.getElementById('viewPassInput').value;
+  const msg = document.getElementById('viewLoginMsg');
+  const r = await api('/api/view/login', { method: 'POST', body: JSON.stringify({ token }) });
+  if (r.ok) {
+    document.getElementById('viewPassInput').value = '';
+    msg.textContent = '';
+    await checkAuth();
+  } else {
+    msg.className = 'msg err';
+    msg.textContent = r.data.error || '口令验证失败';
+  }
+}
+
+async function requestViewerApproval(manual) {
+  if (viewerApprovalInFlight) return;
+  viewerApprovalInFlight = true;
+  if (manual) viewerApprovalDenied = false;
+  const msg = document.getElementById('viewApprovalMsg');
+  const btn = document.getElementById('btnRetryApproval');
+  if (btn) btn.disabled = true;
+  if (msg) {
+    msg.className = 'msg';
+    msg.textContent = '已发送审批请求，等待主机管理员确认（最长 60 秒）...';
+  }
+  if (viewerApprovalAbort) {
+    try { viewerApprovalAbort.abort(); } catch (_) {}
+  }
+  const ctrl = typeof AbortController === 'function' ? new AbortController() : null;
+  viewerApprovalAbort = ctrl;
+  try {
+    const r = await api('/api/view/request-approval', {
+      method: 'POST',
+      body: '{}',
+      ...(ctrl ? { signal: ctrl.signal } : {}),
+    });
+    if (viewerApprovalAbort !== ctrl) return;
+    if (r.status === 401) {
+      viewerApprovalDenied = false;
+      await checkAuth();
+      return;
+    }
+    if (r.ok && r.data && r.data.approved) {
+      viewerApprovalDenied = false;
+      manualReconnectRequired = false;
+      if (msg) {
+        msg.className = 'msg ok';
+        msg.textContent = r.data.decision === 'allow_and_trust'
+          ? '已获管理员批准并加入受信列表，正在进入画面...'
+          : '已获管理员本次允许，正在进入画面...';
+      }
+      await checkAuth();
+    } else {
+      viewerApprovalDenied = true;
+      if (msg) {
+        msg.className = 'msg err';
+        msg.textContent = (r.data && r.data.error) || '审批未通过，请点击下方按钮重试。';
+      }
+    }
+  } finally {
+    if (viewerApprovalAbort === ctrl) {
+      viewerApprovalAbort = null;
+      viewerApprovalInFlight = false;
+      if (btn) btn.disabled = false;
+    }
+  }
+}
+
+async function viewerLogout() {
+  manualReconnectRequired = false;
+  if (viewerApprovalAbort) {
+    try { viewerApprovalAbort.abort(); } catch (_) {}
+    viewerApprovalAbort = null;
+  }
+  viewerApprovalInFlight = false;
+  const retryBtn = document.getElementById('btnRetryApproval');
+  if (retryBtn) retryBtn.disabled = false;
+  exitPageFullscreen();
+  stopStream();
+  await api('/api/view/logout', { method: 'POST', body: '{}' });
+  if (authStatus.admin_logged_in) {
+    location.href = '/';
+    return;
+  }
+  await checkAuth();
+}
+
+
+function updateViewerModeButton() {
+  const btn = document.getElementById('btnToggleWebIndepView');
+  if (!btn) return;
+  const show = !!authStatus.admin_logged_in;
+  btn.classList.toggle('hidden', !show);
+  if (lastWebScreenMode === 'main') {
+    btn.textContent = '切回跟随 iPad';
+    btn.title = '当前网页正在观看电脑主屏幕，点击切回跟随 iPad';
+  } else if (lastWebScreenMode === 'independent') {
+    btn.textContent = '切至电脑主屏幕';
+    btn.title = '当前网页使用独立虚拟扩展屏，点击切换为观看电脑主屏幕';
+  } else if (supportsWebIndependent) {
+    btn.textContent = '独立扩展屏';
+    btn.title = '当前跟随 iPad，点击切换为独立虚拟扩展屏';
+  } else {
+    btn.textContent = '观看电脑主屏幕';
+    btn.title = '当前跟随 iPad，点击切换为观看电脑主屏幕';
+  }
+}
+
+function setStreamSourceBadge(source, independent) {
+  if (source === 'main') {
+    lastWebScreenMode = 'main';
+    lastWebIndependent = false;
+    updateViewerModeButton();
+  } else if (typeof independent === 'boolean') {
+    lastWebIndependent = independent;
+    lastWebScreenMode = independent ? 'independent' : 'follow_ipad';
+    updateViewerModeButton();
+  }
+  const label = source === 'main'
+    ? '电脑主屏幕'
+    : (source === 'standalone'
+        ? '独立扩展屏'
+        : (source === 'ipad' ? '跟随 iPad 屏幕' : ''));
+  const cls = (source === 'main' || source === 'standalone') ? 'ok' : 'info';
+  for (const id of ['streamSourceBadge', 'fsStreamSourceBadge']) {
+    const el = document.getElementById(id);
+    if (!el) continue;
+    if (!label) {
+      el.classList.add('hidden');
+    } else {
+      el.textContent = label;
+      el.className = 'badge ' + cls;
+    }
+  }
+}
+
+async function toggleWebIndependentScreen() {
+  const targetMode = lastWebScreenMode === 'follow_ipad'
+    ? (supportsWebIndependent ? 'independent' : 'main')
+    : (lastWebScreenMode === 'independent' ? 'main' : 'follow_ipad');
+  debugTrace('switch_web_screen_mode', { targetMode });
+  const btn = document.getElementById('btnToggleWebIndepView');
+  if (btn) btn.disabled = true;
+  try {
+    const r = await api('/api/admin/settings', {
+      method: 'POST',
+      body: JSON.stringify({ web_screen_mode: targetMode }),
+    });
+    if (r.ok) {
+      lastWebScreenMode = r.data.web_screen_mode || targetMode;
+      lastWebIndependent = lastWebScreenMode === 'independent';
+      updateViewerModeButton();
+      if (r.data.web_screen) {
+        setStreamSourceBadge(r.data.web_screen.source, lastWebIndependent);
+      }
+      const modeName = lastWebScreenMode === 'main'
+        ? '电脑主屏幕'
+        : (lastWebScreenMode === 'independent' ? '独立网页扩展屏' : '跟随 iPad 模式');
+      showToast('已切换为 ' + modeName, 'ok');
+    } else {
+      const errTxt = (r.data && r.data.error) || '切换网页屏幕来源失败';
+      setStreamStatus(errTxt, 'err');
+    }
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+
+// ==================== MSE fMP4 EXTENDED SCREEN VIEWER ====================
+function setStageOverlay(visible, title = '', sub = '', showReconnectBtn = false) {
+  const ov = document.getElementById('stageOverlay');
+  if (!ov) return;
+  ov.classList.toggle('hidden', !visible);
+  if (visible) {
+    const t = document.getElementById('stageOverlayTitle');
+    const s = document.getElementById('stageOverlaySub');
+    const b = document.getElementById('stageOverlayBtn');
+    if (t) t.textContent = title;
+    if (s) s.textContent = sub;
+    if (b) b.classList.toggle('hidden', !showReconnectBtn);
+  }
+}
+
+function setStreamStatus(text, cls) {
+  for (const id of ['streamStatus', 'fsStreamStatus']) {
+    const el = document.getElementById(id);
+    if (el) {
+      el.textContent = text;
+      el.className = 'badge ' + cls;
+    }
+  }
+  if (cls === 'ok' && text === '实时画面中') {
+    setStageOverlay(false);
+  } else {
+    const needBtn = cls === 'err' || text.includes('断开') || text.includes('已满');
+    const sub = text.includes('锁屏')
+      ? '解锁主机后将自动恢复画面，无需刷新页面'
+      : (text.includes('连接') ? '支持鼠标滚轮 / 双指缩放与拖拽浏览（只读模式）' : '');
+    setStageOverlay(true, text, sub, needBtn);
+  }
+}
+
+function scheduleReconnect(prefix, minDelayMs = 0) {
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+  if (document.hidden) {
+    setStreamStatus(`${prefix}，切回前台后将自动重连`, 'warn');
+    return;
+  }
+  const base = Math.min(15000, Math.max(minDelayMs, 1000 * Math.pow(2, Math.min(reconnectAttempt, 4))));
+  const delay = Math.round(base + Math.random() * 500);
+  reconnectAttempt += 1;
+  const secs = Math.max(1, Math.round(delay / 1000));
+  setStreamStatus(`${prefix}，${secs} 秒后自动重连...`, 'err');
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    if (currentTab === 'view' && !document.hidden) {
+      checkAuth();
+    }
+  }, delay);
+}
+
+function tryRecoverMediaSource(reason) {
+  const now = Date.now();
+  if (now - mseErrorWindowStart > 15000) {
+    mseErrorWindowStart = now;
+    mseErrorCount = 0;
+  }
+  mseErrorCount += 1;
+  if (mseRecoverTimer) { clearTimeout(mseRecoverTimer); mseRecoverTimer = null; }
+  if (mseErrorCount > 5) {
+    sourceBuffer = null;
+    sbQueue = [];
+    setStreamStatus('解码反复异常，请点击「重连画面」或降低画质', 'err');
+    return;
+  }
+  if (currentTab === 'view' && authStatus.viewer_logged_in) {
+    const backoffMs = Math.min(2000, 300 * Math.pow(2, mseErrorCount - 1));
+    sourceBuffer = null;
+    sbQueue = [];
+    setStreamStatus(`${reason}，正在自动恢复 (${mseErrorCount}/5)...`, 'warn');
+    mseRecoverTimer = setTimeout(() => {
+      mseRecoverTimer = null;
+      if (currentTab === 'view' && authStatus.viewer_logged_in && !document.hidden && !manualReconnectRequired) {
+        // Reconnect WS so server starts a fresh tfdt=0 timeline and immediately seeds a cached IDR
+        // (avoids black screen on static desktops after MSE eviction/wake).
+        reconnectStream(true);
+      }
+    }, backoffMs);
+  }
+}
+
+function resetMediaSource(codec, initToReplay = null) {
+  const video = document.getElementById('screenVideo');
+  sbQueue = [];
+  sourceBuffer = null;
+  currentCodec = codec;
+  pendingInit = initToReplay || null;
+
+  const MS = window.MediaSource || window.ManagedMediaSource;
+  if (!MS) {
+    setStreamStatus('当前浏览器不支持 MSE/fMP4 播放', 'err');
+    return;
+  }
+  const mime = `video/mp4; codecs="${codec}"`;
+  if (!MS.isTypeSupported(mime)) {
+    setStreamStatus('浏览器不支持编解码器 ' + codec, 'err');
+    return;
+  }
+
+  if (video._msUrl) {
+    try { URL.revokeObjectURL(video._msUrl); } catch (_) {}
+    video._msUrl = null;
+  }
+  const myMs = new MS();
+  mediaSource = myMs;
+  // Required by Apple ManagedMediaSource on iOS 17+/iPadOS 17+ Safari before assigning src,
+  // otherwise `sourceopen` never fires and the screen stays black.
+  try { video.disableRemotePlayback = true; } catch (_) {}
+  const objUrl = URL.createObjectURL(myMs);
+  video._msUrl = objUrl;
+  video.src = objUrl;
+  video.onplaying = () => {
+    if (mediaSource !== myMs) return;
+    mseErrorCount = 0;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      setStreamStatus('实时画面中', 'ok');
+    }
+  };
+  video.onerror = () => {
+    if (mediaSource !== myMs) return;
+    debugTrace('video_error', {
+      code: video.error ? video.error.code : null,
+      message: video.error ? video.error.message : null,
+      codec: currentCodec,
+      dims: currentDims,
+    });
+    tryRecoverMediaSource('解码异常');
+  };
+  myMs.addEventListener('sourceopen', () => {
+    if (mediaSource !== myMs) return;
+    debugTrace('mse_sourceopen', { codec, dims: currentDims, ua: navigator.userAgent });
+    try {
+      const mySb = myMs.addSourceBuffer(mime);
+      sourceBuffer = mySb;
+      mySb.mode = 'segments';
+      mySb.addEventListener('error', () => {
+        if (sourceBuffer !== mySb) return;
+        debugTrace('mse_sb_error', { codec: currentCodec, dims: currentDims });
+        tryRecoverMediaSource('缓冲异常');
+      });
+      mySb.addEventListener('updateend', () => {
+        if (sourceBuffer !== mySb) return;
+        trimAndChaseLive(video);
+        pumpQueue();
+      });
+      if (pendingInit) {
+        sbQueue.unshift({ kind: 1, payload: pendingInit });
+        pendingInit = null;
+      }
+      pumpQueue();
+    } catch (e) {
+      setStreamStatus('MSE 初始化失败: ' + e.message, 'err');
+    }
+  });
+  video.play().catch(() => {});
+}
+
+function requestStreamIdr() {
+  const now = Date.now();
+  if (now - lastNeedIdrAt < 400) return;
+  lastNeedIdrAt = now;
+  sendWsJson({ type: 'need_idr' });
+}
+
+function pumpQueue() {
+  if (!sourceBuffer || sourceBuffer.updating || sbQueue.length === 0) return;
+  const next = sbQueue.shift();
+  try {
+    sourceBuffer.appendBuffer(next.payload);
+  } catch (e) {
+    if (e.name === 'QuotaExceededError') {
+      // Preserve init segment (including `next` itself if it was an init segment) when evicting media backlog.
+      if (next.kind === 1) {
+        sbQueue.unshift(next);
+      }
+      sbQueue = sbQueue.filter(item => item.kind === 1);
+      mseAwaitingIdr = true;
+      requestStreamIdr();
+      const video = document.getElementById('screenVideo');
+      let evicted = false;
+      if (video && video.buffered.length > 0) {
+        const end = video.buffered.end(video.buffered.length - 1);
+        const target = Math.max(0, end - 0.5);
+        if (target > 0.05) {
+          try {
+            sourceBuffer.remove(0, target);
+            evicted = true;
+          } catch (_) {}
+        }
+      }
+      if (!evicted) {
+        tryRecoverMediaSource('解码缓冲配额已满');
+      }
+    } else if (currentCodec) {
+      // Route through the 5-retry circuit breaker instead of resetting unconditionally.
+      tryRecoverMediaSource('解码缓冲异常');
+    }
+  }
+}
+
+function trimAndChaseLive(video) {
+  if (!sourceBuffer || sourceBuffer.updating) return;
+  if (video.buffered.length > 0) {
+    const start = video.buffered.start(0);
+    const end = video.buffered.end(video.buffered.length - 1);
+    const lag = end - video.currentTime;
+    // 3-stage smooth live catch-up: gentle playbackRate ramp for small drift, hard seek only when >450ms behind.
+    if (video.currentTime < start || lag > 0.45) {
+      video.playbackRate = 1.0;
+      video.currentTime = Math.max(start, end - 0.04);
+    } else if (lag > 0.25) {
+      if (video.playbackRate !== 1.15) video.playbackRate = 1.15;
+    } else if (lag > 0.12) {
+      if (video.playbackRate !== 1.06) video.playbackRate = 1.06;
+    } else if (lag <= 0.10 && video.playbackRate !== 1.0) {
+      video.playbackRate = 1.0;
+    }
+    if (video.paused && !document.hidden) {
+      video.play().catch(() => {});
+    }
+    // Keep ~3.0s of history (safe for 2s GOP IPPP and Safari MSE QuotaExceededError).
+    if (end - start > 3.5 && video.currentTime - start > 2.2) {
+      try { sourceBuffer.remove(start, Math.max(start, video.currentTime - 1.2)); } catch (_) {}
+    }
+  }
+}
+
+// ==================== LAN WEBRTC DATACHANNEL P2P RELAY ====================
+const P2P_CHUNK_SIZE = 16000;
+const P2P_MAX_BUFFERED_BYTES = 384 * 1024;
+let myViewerId = null;
+let p2pHubEnabled = false;
+let p2pParentId = null;
+let p2pParentPc = null;
+let p2pParentDc = null;
+let p2pActive = false;
+let p2pLastRecvAt = 0;
+let p2pHostLocked = false;
+let p2pChildren = new Map(); // childId -> { pc, dc }
+let p2pReassembly = new Map(); // "type:seq" -> { total, got, parts, ts }
+let p2pTxSeq = 1;
+let p2pTimer = null;
+let lastStreamMetaJson = null;
+let lastMediaPayload = null;
+let activeStreamNeedsFreshMs = true;
+
+function isMobileBrowser() {
+  return /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent || '');
+}
+
+function getP2pRelayPriority() {
+  if (typeof RTCPeerConnection !== 'function' || document.hidden) return 0;
+  // Prefer desktop foreground tabs (priority 2, fanout 3); allow foreground mobile/tablet
+  // browsers as fallback roots (priority 1, fanout 2) when no desktop viewer is online.
+  return isMobileBrowser() ? 1 : 2;
+}
+
+function canActAsP2pRelay() {
+  return getP2pRelayPriority() > 0;
+}
+
+function sendWsJson(obj) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    try { ws.send(JSON.stringify(obj)); } catch (_) {}
+  }
+}
+
+function updateP2pBadge() {
+  const openKids = Array.from(p2pChildren.values()).filter(c => c.dc && c.dc.readyState === 'open').length;
+  let text = '';
+  let cls = 'ok';
+  if (p2pActive && openKids > 0) {
+    text = `P2P 加速 · 中继 ${openKids} 人`;
+    cls = 'ok';
+  } else if (p2pActive) {
+    text = 'P2P 局域网加速';
+    cls = 'ok';
+  } else if (openKids > 0) {
+    text = `P2P 根节点 · 中继 ${openKids} 人`;
+    cls = 'info';
+  }
+  for (const id of ['streamP2pBadge', 'fsStreamP2pBadge']) {
+    const el = document.getElementById(id);
+    if (!el) continue;
+    if (!text) {
+      el.classList.add('hidden');
+    } else {
+      el.textContent = text;
+      el.className = 'badge ' + cls;
+    }
+  }
+}
+
+function p2pSendChunked(dc, msgType, payloadBytes, childEntry = null) {
+  if (!dc || dc.readyState !== 'open') return false;
+  if (childEntry && msgType === 5 && childEntry.awaitingIdr) {
+    // Child needs a fresh live IDR before any P-frame can be forwarded (protects IPPP DPB).
+    return false;
+  }
+  if ((msgType === 2 || msgType === 5) && dc.bufferedAmount > P2P_MAX_BUFFERED_BYTES) {
+    // Isolate slow downstream child: drop this media segment and gate child on next live IDR.
+    if (childEntry) childEntry.awaitingIdr = true;
+    return false;
+  }
+  const seq = (p2pTxSeq = (p2pTxSeq + 1) >>> 0) || 1;
+  const totalLen = payloadBytes.byteLength;
+  const totalChunks = Math.max(1, Math.ceil(totalLen / P2P_CHUNK_SIZE));
+  for (let i = 0; i < totalChunks; i++) {
+    const start = i * P2P_CHUNK_SIZE;
+    const end = Math.min(totalLen, start + P2P_CHUNK_SIZE);
+    const slice = payloadBytes.subarray(start, end);
+    const pkt = new Uint8Array(9 + slice.byteLength);
+    pkt[0] = msgType;
+    pkt[1] = (seq >>> 24) & 0xff;
+    pkt[2] = (seq >>> 16) & 0xff;
+    pkt[3] = (seq >>> 8) & 0xff;
+    pkt[4] = seq & 0xff;
+    pkt[5] = (i >>> 8) & 0xff;
+    pkt[6] = i & 0xff;
+    pkt[7] = (totalChunks >>> 8) & 0xff;
+    pkt[8] = totalChunks & 0xff;
+    pkt.set(slice, 9);
+    try { dc.send(pkt); } catch (_) {
+      if (childEntry && (msgType === 2 || msgType === 5)) childEntry.awaitingIdr = true;
+      return false;
+    }
+  }
+  if (childEntry && msgType === 2) {
+    childEntry.awaitingIdr = false;
+  }
+  return true;
+}
+
+function relayToP2pChildren(msgType, payloadBytes) {
+  if (p2pChildren.size === 0) return;
+  for (const child of p2pChildren.values()) {
+    if (child.dc && child.dc.readyState === 'open') {
+      p2pSendChunked(child.dc, msgType, payloadBytes, child);
+    }
+  }
+}
+
+function seedP2pChild(child) {
+  const dc = child && child.dc;
+  if (!dc || dc.readyState !== 'open') return;
+  if (lastStreamMetaJson) {
+    p2pSendChunked(dc, 3, new TextEncoder().encode(lastStreamMetaJson));
+  }
+  if (lastInitPayload) {
+    p2pSendChunked(dc, 1, lastInitPayload);
+  }
+  if (lastMediaPayload) {
+    // Send static cached IDR preview with msgType=6 (seed-only: does NOT flip child's p2pActive
+    // or pause direct WS early, preventing tfdt regression until a fresh live IDR msgType=2 arrives).
+    p2pSendChunked(dc, 6, lastMediaPayload);
+  }
+  child.awaitingIdr = true;
+  requestStreamIdr();
+}
+
+function closeP2pChild(childId) {
+  const entry = p2pChildren.get(childId);
+  if (!entry) return;
+  p2pChildren.delete(childId);
+  if (entry.disconnectTimer) {
+    clearTimeout(entry.disconnectTimer);
+    entry.disconnectTimer = null;
+  }
+  try { if (entry.dc) entry.dc.close(); } catch (_) {}
+  try { if (entry.pc) entry.pc.close(); } catch (_) {}
+  updateP2pBadge();
+}
+
+function closeP2pParent(notifyFallbackReason = null) {
+  const wasActive = p2pActive || p2pParentId !== null;
+  const wasStreamingP2p = p2pActive;
+  p2pActive = false;
+  p2pParentId = null;
+  if (wasStreamingP2p) {
+    // Only gate MSE on next live IDR when actually tearing down an active P2P data path
+    // (never interrupt an ongoing WS direct stream during initial P2P negotiation).
+    mseAwaitingIdr = true;
+  }
+  p2pReassembly.clear();
+  if (p2pParentDc) {
+    try { p2pParentDc.onopen = null; p2pParentDc.onmessage = null; p2pParentDc.onclose = null; p2pParentDc.close(); } catch (_) {}
+    p2pParentDc = null;
+  }
+  if (p2pParentPc) {
+    if (p2pParentPc._connectDeadline) {
+      clearTimeout(p2pParentPc._connectDeadline);
+      p2pParentPc._connectDeadline = null;
+    }
+    if (p2pParentPc._disconnectGrace) {
+      clearTimeout(p2pParentPc._disconnectGrace);
+      p2pParentPc._disconnectGrace = null;
+    }
+    try { p2pParentPc.onicecandidate = null; p2pParentPc.ondatachannel = null; p2pParentPc.onconnectionstatechange = null; p2pParentPc.close(); } catch (_) {}
+    p2pParentPc = null;
+  }
+  updateP2pBadge();
+  if (notifyFallbackReason && wasActive) {
+    sendWsJson({ type: 'p2p_fallback', reason: notifyFallbackReason });
+  }
+}
+
+function teardownP2p() {
+  if (p2pTimer) { clearInterval(p2pTimer); p2pTimer = null; }
+  closeP2pParent(null);
+  for (const cid of Array.from(p2pChildren.keys())) {
+    closeP2pChild(cid);
+  }
+  myViewerId = null;
+  p2pHubEnabled = false;
+  p2pHostLocked = false;
+  lastStreamMetaJson = null;
+  lastMediaPayload = null;
+  updateP2pBadge();
+}
+
+function ensureP2pTimer() {
+  if (p2pTimer) return;
+  const pingByte = new Uint8Array([4]);
+  p2pTimer = setInterval(() => {
+    // 1) Parent sends 1-byte keepalive every 1s so children on static desktops never false-timeout.
+    for (const child of p2pChildren.values()) {
+      if (child.dc && child.dc.readyState === 'open' && child.dc.bufferedAmount < 65536) {
+        try { child.dc.send(pingByte); } catch (_) {}
+      }
+    }
+    // 2) Child stall watchdog: if parent silent >2.5s while active & unlocked, instant WS fallback!
+    if (p2pActive && !p2pHostLocked && !document.hidden && p2pLastRecvAt > 0) {
+      if (Date.now() - p2pLastRecvAt > 2500) {
+        debugTrace('p2p_child_stall_fallback', { parent_id: p2pParentId, silent_ms: Date.now() - p2pLastRecvAt });
+        closeP2pParent('stall_timeout');
+      }
+    }
+    // 3) Sweep any stale incomplete reassembly buffers (>3s old)
+    const now = Date.now();
+    for (const [k, v] of p2pReassembly.entries()) {
+      if (now - v.ts > 3000) p2pReassembly.delete(k);
+    }
+  }, 1000);
+}
+
+async function startP2pParentForChild(childId) {
+  if (typeof RTCPeerConnection !== 'function') return;
+  closeP2pChild(childId);
+  const pc = new RTCPeerConnection({ iceServers: [] });
+  const dc = pc.createDataChannel('idis-fmp4', { ordered: true });
+  dc.binaryType = 'arraybuffer';
+  const childEntry = { pc, dc, pendingCandidates: [], awaitingIdr: true, disconnectTimer: null };
+  p2pChildren.set(childId, childEntry);
+  ensureP2pTimer();
+
+  pc.onicecandidate = (ev) => {
+    if (ev.candidate && p2pChildren.get(childId)?.pc === pc) {
+      sendWsJson({ type: 'p2p_signal', to: childId, signal: { candidate: ev.candidate } });
+    }
+  };
+  pc.onconnectionstatechange = () => {
+    if (p2pChildren.get(childId)?.pc !== pc) return;
+    if (pc.connectionState === 'connected') {
+      if (childEntry.disconnectTimer) {
+        clearTimeout(childEntry.disconnectTimer);
+        childEntry.disconnectTimer = null;
+      }
+      return;
+    }
+    if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
+      closeP2pChild(childId);
+    } else if (pc.connectionState === 'disconnected' && !childEntry.disconnectTimer) {
+      childEntry.disconnectTimer = setTimeout(() => {
+        childEntry.disconnectTimer = null;
+        if (p2pChildren.get(childId)?.pc === pc && pc.connectionState !== 'connected') {
+          closeP2pChild(childId);
+        }
+      }, 3000);
+    }
+  };
+  dc.onopen = () => {
+    if (p2pChildren.get(childId)?.pc !== pc) return;
+    updateP2pBadge();
+    seedP2pChild(childEntry);
+  };
+  dc.onclose = () => { if (p2pChildren.get(childId)?.pc === pc) closeP2pChild(childId); };
+  dc.onerror = () => { if (p2pChildren.get(childId)?.pc === pc) closeP2pChild(childId); };
+
+  try {
+    const offer = await pc.createOffer();
+    if (p2pChildren.get(childId)?.pc !== pc) return;
+    await pc.setLocalDescription(offer);
+    if (p2pChildren.get(childId)?.pc !== pc) return;
+    sendWsJson({ type: 'p2p_signal', to: childId, signal: { sdp: pc.localDescription } });
+  } catch (_) {
+    if (p2pChildren.get(childId)?.pc === pc) closeP2pChild(childId);
+  }
+}
+
+function prepareP2pChildForParent(parentId) {
+  if (typeof RTCPeerConnection !== 'function') return;
+  closeP2pParent(null);
+  p2pParentId = parentId;
+  const pc = new RTCPeerConnection({ iceServers: [] });
+  pc._pendingCandidates = [];
+  pc._connectDeadline = setTimeout(() => {
+    if (p2pParentPc === pc && !p2pActive) {
+      closeP2pParent('connect_timeout');
+    }
+  }, 6000);
+  p2pParentPc = pc;
+  ensureP2pTimer();
+
+  pc.onicecandidate = (ev) => {
+    if (ev.candidate && p2pParentId === parentId) {
+      sendWsJson({ type: 'p2p_signal', to: parentId, signal: { candidate: ev.candidate } });
+    }
+  };
+  pc.onconnectionstatechange = () => {
+    if (p2pParentPc !== pc) return;
+    if (pc.connectionState === 'connected') {
+      if (pc._disconnectGrace) {
+        clearTimeout(pc._disconnectGrace);
+        pc._disconnectGrace = null;
+      }
+      return;
+    }
+    if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
+      closeP2pParent('pc_' + pc.connectionState);
+    } else if (pc.connectionState === 'disconnected' && !pc._disconnectGrace) {
+      pc._disconnectGrace = setTimeout(() => {
+        pc._disconnectGrace = null;
+        if (p2pParentPc === pc && pc.connectionState !== 'connected') {
+          closeP2pParent('pc_disconnected');
+        }
+      }, 3000);
+    }
+  };
+  pc.ondatachannel = (ev) => {
+    if (p2pParentPc !== pc) return;
+    const dc = ev.channel;
+    dc.binaryType = 'arraybuffer';
+    p2pParentDc = dc;
+    dc.onopen = () => {
+      p2pLastRecvAt = Date.now();
+    };
+    dc.onmessage = (mev) => {
+      if (p2pParentDc !== dc) return;
+      onP2pDataMessage(mev.data, parentId);
+    };
+    dc.onclose = () => {
+      if (p2pParentDc === dc) closeP2pParent('dc_closed');
+    };
+    dc.onerror = () => {
+      if (p2pParentDc === dc) closeP2pParent('dc_error');
+    };
+  };
+}
+
+async function handleP2pSignal(fromId, signal) {
+  if (!signal) return;
+  if (fromId === p2pParentId && p2pParentPc) {
+    const pc = p2pParentPc;
+    try {
+      if (signal.sdp) {
+        await pc.setRemoteDescription(new RTCSessionDescription(signal.sdp));
+        if (p2pParentPc !== pc) return;
+        if (Array.isArray(pc._pendingCandidates) && pc._pendingCandidates.length) {
+          const queued = pc._pendingCandidates.splice(0);
+          for (const cand of queued) {
+            if (p2pParentPc !== pc) return;
+            await pc.addIceCandidate(new RTCIceCandidate(cand));
+          }
+        }
+        if (p2pParentPc !== pc) return;
+        if (signal.sdp.type === 'offer') {
+          const answer = await pc.createAnswer();
+          if (p2pParentPc !== pc) return;
+          await pc.setLocalDescription(answer);
+          if (p2pParentPc !== pc) return;
+          sendWsJson({ type: 'p2p_signal', to: fromId, signal: { sdp: pc.localDescription } });
+        }
+      } else if (signal.candidate) {
+        if (!pc.remoteDescription) {
+          if (!Array.isArray(pc._pendingCandidates)) pc._pendingCandidates = [];
+          pc._pendingCandidates.push(signal.candidate);
+        } else {
+          await pc.addIceCandidate(new RTCIceCandidate(signal.candidate));
+        }
+      }
+    } catch (_) {
+      if (p2pParentPc === pc) closeP2pParent('signal_error');
+    }
+    return;
+  }
+  const child = p2pChildren.get(fromId);
+  if (child && child.pc) {
+    const childPc = child.pc;
+    try {
+      if (signal.sdp) {
+        await childPc.setRemoteDescription(new RTCSessionDescription(signal.sdp));
+        if (p2pChildren.get(fromId)?.pc !== childPc) return;
+        if (Array.isArray(child.pendingCandidates) && child.pendingCandidates.length) {
+          const queued = child.pendingCandidates.splice(0);
+          for (const cand of queued) {
+            if (p2pChildren.get(fromId)?.pc !== childPc) return;
+            await childPc.addIceCandidate(new RTCIceCandidate(cand));
+          }
+        }
+      } else if (signal.candidate) {
+        if (!childPc.remoteDescription) {
+          child.pendingCandidates.push(signal.candidate);
+        } else {
+          await childPc.addIceCandidate(new RTCIceCandidate(signal.candidate));
+        }
+      }
+    } catch (_) {
+      if (p2pChildren.get(fromId)?.pc === childPc) closeP2pChild(fromId);
+    }
+  }
+}
+
+function onP2pDataMessage(buf, parentId) {
+  const bytes = new Uint8Array(buf);
+  if (bytes.byteLength === 0) return;
+  p2pLastRecvAt = Date.now();
+  lastServerActivityAt = Date.now();
+  if (bytes[0] === 4) return; // 1-byte keepalive ping
+  if (bytes.byteLength < 9) return;
+  const msgType = bytes[0];
+  const seq = ((bytes[1] << 24) | (bytes[2] << 16) | (bytes[3] << 8) | bytes[4]) >>> 0;
+  const chunkIdx = (bytes[5] << 8) | bytes[6];
+  const chunkCount = (bytes[7] << 8) | bytes[8];
+  if (chunkCount === 0 || chunkIdx >= chunkCount || chunkCount > 256) return;
+  const chunkData = bytes.subarray(9);
+
+  let fullPayload = null;
+  if (chunkCount === 1) {
+    fullPayload = chunkData.slice();
+  } else {
+    const key = `${msgType}:${seq}`;
+    let entry = p2pReassembly.get(key);
+    if (!entry) {
+      if (p2pReassembly.size >= 8) {
+        const oldestKey = p2pReassembly.keys().next().value;
+        p2pReassembly.delete(oldestKey);
+      }
+      entry = { total: chunkCount, got: 0, parts: new Array(chunkCount), ts: Date.now() };
+      p2pReassembly.set(key, entry);
+    }
+    if (!entry.parts[chunkIdx]) {
+      entry.parts[chunkIdx] = chunkData.slice();
+      entry.got++;
+    }
+    if (entry.got === entry.total) {
+      p2pReassembly.delete(key);
+      let totalBytes = 0;
+      for (const p of entry.parts) totalBytes += p.byteLength;
+      fullPayload = new Uint8Array(totalBytes);
+      let off = 0;
+      for (const p of entry.parts) {
+        fullPayload.set(p, off);
+        off += p.byteLength;
+      }
+    }
+  }
+  if (!fullPayload) return;
+
+  if (msgType === 3) {
+    try {
+      const text = new TextDecoder().decode(fullPayload);
+      handleStreamMeta(JSON.parse(text), text, true);
+    } catch (_) {}
+  } else if (msgType === 6) {
+    // Static preview IDR from parent: only feed if viewer has not received any live frames yet
+    // (never flip p2pActive early or regress MSE tfdt while direct WS is already streaming).
+    if (!lastMediaPayload) {
+      handleStreamBinary(2, fullPayload, true);
+    }
+  } else if (msgType === 1 || msgType === 2 || msgType === 5) {
+    if (msgType === 2 && !p2pActive && p2pParentId === parentId) {
+      p2pActive = true;
+      if (p2pParentPc && p2pParentPc._connectDeadline) {
+        clearTimeout(p2pParentPc._connectDeadline);
+        p2pParentPc._connectDeadline = null;
+      }
+      updateP2pBadge();
+      sendWsJson({ type: 'p2p_active', parent_id: parentId });
+    }
+    // Map P2P wire msgType 5 (P-frame) -> internal stream binary kind 3.
+    handleStreamBinary(msgType === 5 ? 3 : msgType, fullPayload, true);
+  }
+}
+
+function handleStreamMeta(meta, rawJson, fromP2p) {
+  if (!fromP2p && p2pActive) return;
+  if (meta.type === 'init') {
+    const video = document.getElementById('screenVideo');
+    if (video && !p2pHostLocked) video.style.opacity = '1';
+    const metaText = `${meta.width}×${meta.height} @ ${meta.fps}fps (${meta.codec})`;
+    document.getElementById('streamMeta').textContent = metaText;
+    const fsMeta = document.getElementById('fsStreamMeta');
+    if (fsMeta) fsMeta.textContent = metaText;
+    if (meta.source) setStreamSourceBadge(meta.source, meta.independent);
+    if (!p2pHostLocked) setStreamStatus('实时画面中', 'ok');
+    lastStreamMetaJson = rawJson;
+    relayToP2pChildren(3, new TextEncoder().encode(rawJson));
+    const dimsKey = `${meta.width}x${meta.height}`;
+    const epochChanged = typeof meta.epoch === 'number' && currentEpoch !== null && meta.epoch !== currentEpoch;
+    const shouldReset = activeStreamNeedsFreshMs
+      || !mediaSource
+      || currentDims !== dimsKey
+      || currentCodec !== meta.codec
+      || epochChanged
+      || (!fromP2p && !!meta.reset && !p2pActive);
+    if (typeof meta.epoch === 'number') {
+      currentEpoch = meta.epoch;
+    }
+    if (shouldReset) {
+      activeStreamNeedsFreshMs = false;
+      mseAwaitingIdr = true;
+      currentDims = dimsKey;
+      resetMediaSource(meta.codec);
+    }
+  } else if (meta.type === 'source') {
+    if (meta.source) setStreamSourceBadge(meta.source, meta.independent);
+    relayToP2pChildren(3, new TextEncoder().encode(rawJson));
+  }
+}
+
+function handleStreamBinary(kind, payload, fromP2p) {
+  // Drop overlapping WS direct frames once P2P relay is confirmed active (prevents duplicate
+  // segments being appended into SourceBuffer during WS -> P2P handoff).
+  if (!fromP2p && p2pActive) return;
+  if (kind === 1) {
+    lastInitPayload = payload;
+    relayToP2pChildren(1, payload);
+    if (!sourceBuffer) {
+      pendingInit = payload;
+    } else {
+      // Keep init segment strictly ordered; never drop init segments during backlog trimming.
+      sbQueue.push({ kind: 1, payload });
+      pumpQueue();
+    }
+  } else if (kind === 2 || kind === 3) {
+    const isIdr = kind === 2;
+    if (!isIdr && mseAwaitingIdr) {
+      requestStreamIdr();
+      return;
+    }
+    if (isIdr) {
+      mseAwaitingIdr = false;
+      lastMediaPayload = payload;
+      relayToP2pChildren(2, payload);
+    } else {
+      relayToP2pChildren(5, payload);
+    }
+    // Only drop older media frames, NEVER drop queued init segments (kind === 1).
+    // When trimming IPPP backlog, drop all stale media and gate on next IDR to protect DPB.
+    const mediaCount = sbQueue.reduce((n, item) => n + (item.kind !== 1 ? 1 : 0), 0);
+    if (mediaCount > 6) {
+      sbQueue = sbQueue.filter(item => item.kind === 1);
+      if (!isIdr) {
+        mseAwaitingIdr = true;
+        requestStreamIdr();
+        return;
+      }
+    }
+    sbQueue.push({ kind, payload });
+    pumpQueue();
+  }
+  void fromP2p;
+}
+
+function startStream() {
+  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+  if (wsWatchdogTimer) { clearInterval(wsWatchdogTimer); wsWatchdogTimer = null; }
+  teardownP2p();
+
+  const MS = window.MediaSource || window.ManagedMediaSource;
+  if (!MS) {
+    setStreamStatus('当前浏览器不支持 MSE/fMP4 视频流，请使用新版 Chrome / Safari / Edge 浏览器', 'err');
+    return;
+  }
+
+  setStreamStatus('连接扩展屏流中...', 'warn');
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  let gotFrame = false;
+  activeStreamNeedsFreshMs = true;
+  const myGen = ++streamGen;
+  const myWs = new WebSocket(`${proto}//${location.host}/ws/stream`);
+  ws = myWs;
+  myWs.binaryType = 'arraybuffer';
+
+  myWs.onopen = () => {
+    if (ws !== myWs) return;
+    reconnectAttempt = 0;
+    lastServerActivityAt = Date.now();
+    setStreamStatus('已连接，等待画面...', 'info');
+    debugTrace('ws_open', { host: location.host });
+    // Announce WebRTC P2P capability so server can build a shallow LAN relay tree for >=2 viewers.
+    const relayPrio = getP2pRelayPriority();
+    sendWsJson({
+      type: 'p2p_hello',
+      supported: typeof RTCPeerConnection === 'function',
+      can_relay: relayPrio > 0,
+      relay_priority: relayPrio,
+    });
+    if (wsWatchdogTimer) clearInterval(wsWatchdogTimer);
+    wsWatchdogTimer = setInterval(() => {
+      if (ws !== myWs || document.hidden) return;
+      if (myWs.readyState === WebSocket.OPEN && Date.now() - lastServerActivityAt > 45000) {
+        debugTrace('ws_watchdog_timeout', { silent_ms: Date.now() - lastServerActivityAt });
+        reconnectStream();
+      }
+    }, 5000);
+    if (debugStatsTimer) clearInterval(debugStatsTimer);
+    if (authStatus.debug_trace_active ?? authStatus.debug_enabled) {
+      debugStatsTimer = setInterval(() => {
+        const video = document.getElementById('screenVideo');
+        if (!video) return;
+        const bufEnd = video.buffered.length ? video.buffered.end(video.buffered.length - 1) : 0;
+        debugTrace('viewer_stats', {
+          video_w: video.videoWidth,
+          video_h: video.videoHeight,
+          ready_state: video.readyState,
+          paused: video.paused,
+          current_time: Number(video.currentTime.toFixed(2)),
+          buffered_end: Number(bufEnd.toFixed(2)),
+          queue_len: sbQueue.length,
+          fullscreen: isPageFullscreen(),
+          p2p_active: p2pActive,
+          p2p_children: p2pChildren.size,
+        });
+      }, 5000);
+    }
+  };
+
+  myWs.onmessage = (ev) => {
+    if (ws !== myWs) return;
+    lastServerActivityAt = Date.now();
+    if (typeof ev.data === 'string') {
+      try {
+        const meta = JSON.parse(ev.data);
+        if (meta.type === 'hb') {
+          return;
+        }
+        if (meta.type === 'p2p_welcome') {
+          myViewerId = meta.viewer_id;
+          p2pHubEnabled = !!meta.enabled;
+          return;
+        }
+        if (meta.type === 'p2p_add_child') {
+          startP2pParentForChild(meta.child_id);
+          return;
+        }
+        if (meta.type === 'p2p_remove_child') {
+          closeP2pChild(meta.child_id);
+          return;
+        }
+        if (meta.type === 'p2p_assign_parent') {
+          prepareP2pChildForParent(meta.parent_id);
+          return;
+        }
+        if (meta.type === 'p2p_parent_lost') {
+          closeP2pParent(null);
+          return;
+        }
+        if (meta.type === 'p2p_reset') {
+          closeP2pParent(null);
+          for (const cid of Array.from(p2pChildren.keys())) closeP2pChild(cid);
+          return;
+        }
+        if (meta.type === 'p2p_signal') {
+          handleP2pSignal(meta.from, meta.signal);
+          return;
+        }
+        if (meta.type === 'host_lock') {
+          p2pHostLocked = !!meta.locked;
+          mseAwaitingIdr = true;
+          const video = document.getElementById('screenVideo');
+          if (meta.locked) {
+            lastMediaPayload = null;
+            if (video) video.style.opacity = '0';
+            setStreamStatus('主机已锁屏，投屏已暂停（解锁后自动恢复）', 'warn');
+          } else {
+            if (video) video.style.opacity = '1';
+            setStreamStatus('主机已解锁，正在恢复画面...', 'ok');
+          }
+          return;
+        }
+        gotFrame = true;
+        handleStreamMeta(meta, ev.data, false);
+      } catch (_) {}
+      return;
+    }
+    gotFrame = true;
+    const bytes = new Uint8Array(ev.data);
+    if (bytes.length < 2) return;
+    handleStreamBinary(bytes[0], bytes.subarray(1), false);
+  };
+
+  myWs.onclose = async (ev) => {
+    if (ws !== myWs || streamGen !== myGen) return;
+    ws = null;
+    teardownP2p();
+    if (debugStatsTimer) { clearInterval(debugStatsTimer); debugStatsTimer = null; }
+    if (wsWatchdogTimer) { clearInterval(wsWatchdogTimer); wsWatchdogTimer = null; }
+    if (mseRecoverTimer) { clearTimeout(mseRecoverTimer); mseRecoverTimer = null; }
+    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+    if (tabHidePauseTimer) { clearTimeout(tabHidePauseTimer); tabHidePauseTimer = null; }
+    if (ev && ev.code === 4002) {
+      manualReconnectRequired = true;
+      const video = document.getElementById('screenVideo');
+      if (video) video.style.opacity = '0';
+      setStreamStatus('主机已锁屏，已自动断开投屏（解锁后点击「重连画面」）', 'warn');
+      return;
+    }
+    if (ev && ev.code === 4001) {
+      // Check whether the disconnect was due to auth/approval revocation or an explicit admin kick.
+      // Never auto-reconnect an explicitly kicked viewer whose auth is still valid (BUG-C2-1).
+      const r = await api('/api/auth/status');
+      if (streamGen !== myGen) return;
+      if (r.ok && (!r.data.viewer_logged_in || (r.data.web_require_approval && r.data.viewer_approved === false))) {
+        manualReconnectRequired = false;
+        checkAuth();
+        return;
+      }
+      manualReconnectRequired = true;
+      if (r.ok && r.data.max_web_viewers === 0) {
+        setStreamStatus(
+          '主机当前未开放网页观看（观看上限为 0），请在管理后台开启或调大网页观看人数上限后点击「重连画面」',
+          'warn'
+        );
+        return;
+      }
+      setStreamStatus('已被管理员断开，点击「重连画面」重试', 'warn');
+      return;
+    }
+    if (currentTab === 'view' && authStatus.viewer_logged_in) {
+      if (!gotFrame) {
+        const r = await api('/api/auth/status');
+        if (streamGen !== myGen) return;
+        if (r.ok && !r.data.viewer_logged_in) {
+          checkAuth();
+          return;
+        }
+        if (r.ok && r.data.web_require_approval && r.data.viewer_approved === false) {
+          checkAuth();
+          return;
+        }
+        if (r.ok && r.data.host_lock_disconnect_blocked) {
+          manualReconnectRequired = true;
+          setStreamStatus('主机已锁屏，已自动断开投屏（解锁后点击「重连画面」）', 'warn');
+          return;
+        }
+        if (r.ok && r.data.max_web_viewers === 0) {
+          manualReconnectRequired = true;
+          setStreamStatus(
+            '主机当前未开放网页观看（观看上限为 0），请在管理后台开启或调大网页观看人数上限后点击「重连画面」',
+            'warn'
+          );
+          return;
+        }
+        if (r.ok && r.data.max_web_viewers > 0 && r.data.active_web_viewers >= r.data.max_web_viewers) {
+          setStreamStatus(
+            `网页观众人数已满 (${r.data.active_web_viewers}/${r.data.max_web_viewers})，请稍后重试或在管理后台调大观看人数上限`,
+            'warn'
+          );
+          if (!document.hidden && !manualReconnectRequired) {
+            if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+            reconnectTimer = setTimeout(() => {
+              reconnectTimer = null;
+              if (!document.hidden && !manualReconnectRequired) checkAuth();
+            }, 5000);
+          }
+          return;
+        }
+      }
+      if (streamGen !== myGen) return;
+      scheduleReconnect('连接已断开');
+    }
+  };
+}
+
+function stopStream(preserveMseCounter = false) {
+  streamGen++;
+  teardownP2p();
+  setStreamSourceBadge('', null);
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+  if (tabHidePauseTimer) { clearTimeout(tabHidePauseTimer); tabHidePauseTimer = null; }
+  tabVisibilitySentHidden = false;
+  if (debugStatsTimer) { clearInterval(debugStatsTimer); debugStatsTimer = null; }
+  if (wsWatchdogTimer) { clearInterval(wsWatchdogTimer); wsWatchdogTimer = null; }
+  if (mseRecoverTimer) { clearTimeout(mseRecoverTimer); mseRecoverTimer = null; }
+  if (!preserveMseCounter) {
+    mseErrorCount = 0;
+    mseErrorWindowStart = 0;
+  }
+  if (ws) {
+    const oldWs = ws;
+    ws = null;
+    oldWs.onopen = null;
+    oldWs.onmessage = null;
+    oldWs.onclose = null;
+    oldWs.onerror = null;
+    try { oldWs.close(); } catch (_) {}
+  }
+  sbQueue = [];
+  lastInitPayload = null;
+  pendingInit = null;
+  sourceBuffer = null;
+  mediaSource = null;
+  currentCodec = null;
+  currentDims = '';
+  currentEpoch = null;
+  const video = document.getElementById('screenVideo');
+  if (video) {
+    if (video._msUrl) {
+      try { URL.revokeObjectURL(video._msUrl); } catch (_) {}
+      video._msUrl = null;
+    }
+    video.src = '';
+    video.style.opacity = '1';
+  }
+  resetViewZoom();
+}
+
+function reconnectStream(preserveMseCounter = false) {
+  manualReconnectRequired = false;
+  reconnectAttempt = 0;
+  stopStream(preserveMseCounter);
+  checkAuth();
+}
+
+function toggleFit() {
+  document.getElementById('viewerStage').classList.toggle('fill');
+  resetViewZoom();
+}
+
+// ==================== READ-ONLY VIEWER PAN & ZOOM ====================
+const VIEW_MIN_SCALE = 1;
+const VIEW_MAX_SCALE = 5;
+let viewScale = 1;
+let viewTx = 0;
+let viewTy = 0;
+let mouseDragging = false;
+let mouseDragMoved = false;
+let mouseStartX = 0;
+let mouseStartY = 0;
+let mouseOrigTx = 0;
+let mouseOrigTy = 0;
+let touchMode = 'none'; // 'none' | 'pan' | 'pinch'
+let touchPrevX = 0;
+let touchPrevY = 0;
+let pinchPrevDist = 0;
+let pinchPrevMidX = 0;
+let pinchPrevMidY = 0;
+
+function getRenderedVideoSize(stage, video) {
+  const sw = stage.clientWidth || 1;
+  const sh = stage.clientHeight || 1;
+  const vw = video ? (video.videoWidth || 0) : 0;
+  const vh = video ? (video.videoHeight || 0) : 0;
+  if (!vw || !vh) {
+    return { w: video ? (video.clientWidth || sw) : sw, h: video ? (video.clientHeight || sh) : sh };
+  }
+  const boxW = video.clientWidth || sw;
+  const boxH = video.clientHeight || sh;
+  const videoRatio = vw / vh;
+  const boxRatio = boxW / boxH;
+  const isCover = stage.classList.contains('fill');
+  if (isCover ? (videoRatio > boxRatio) : (videoRatio < boxRatio)) {
+    return { w: boxH * videoRatio, h: boxH };
+  }
+  return { w: boxW, h: boxW / videoRatio };
+}
+
+function clampViewTransform() {
+  if (viewScale <= VIEW_MIN_SCALE + 0.001) {
+    viewScale = 1;
+    viewTx = 0;
+    viewTy = 0;
+    return;
+  }
+  const stage = document.getElementById('viewerStage');
+  const video = document.getElementById('screenVideo');
+  if (!stage || !video) return;
+  const sw = stage.clientWidth || 1;
+  const sh = stage.clientHeight || 1;
+  const rendered = getRenderedVideoSize(stage, video);
+  const maxX = Math.max(0, (rendered.w * viewScale - sw) / 2);
+  const maxY = Math.max(0, (rendered.h * viewScale - sh) / 2);
+  viewTx = Math.max(-maxX, Math.min(maxX, viewTx));
+  viewTy = Math.max(-maxY, Math.min(maxY, viewTy));
+}
+
+function applyViewTransform() {
+  clampViewTransform();
+  const stage = document.getElementById('viewerStage');
+  const video = document.getElementById('screenVideo');
+  if (video) {
+    video.style.transform = viewScale <= 1.001
+      ? ''
+      : `translate3d(${viewTx.toFixed(2)}px, ${viewTy.toFixed(2)}px, 0) scale(${viewScale.toFixed(4)})`;
+  }
+  if (stage) {
+    stage.classList.toggle('zoomed', viewScale > 1.001);
+    if (viewScale <= 1.001) stage.classList.remove('dragging');
+  }
+  const pct = `${Math.round(viewScale * 100)}%`;
+  for (const id of ['btnZoomReset', 'fsBtnZoomReset']) {
+    const el = document.getElementById(id);
+    if (el) el.textContent = pct;
+  }
+}
+
+function resetViewZoom() {
+  viewScale = 1;
+  viewTx = 0;
+  viewTy = 0;
+  mouseDragging = false;
+  touchMode = 'none';
+  applyViewTransform();
+}
+
+function zoomViewAt(nextScale, clientX, clientY) {
+  const stage = document.getElementById('viewerStage');
+  const clamped = Math.max(VIEW_MIN_SCALE, Math.min(VIEW_MAX_SCALE, nextScale));
+  if (stage && clientX != null && clientY != null && viewScale > 0) {
+    const rect = stage.getBoundingClientRect();
+    const px = clientX - (rect.left + rect.width / 2);
+    const py = clientY - (rect.top + rect.height / 2);
+    const ratio = clamped / viewScale;
+    viewTx = px - (px - viewTx) * ratio;
+    viewTy = py - (py - viewTy) * ratio;
+  }
+  viewScale = clamped;
+  applyViewTransform();
+}
+
+function stepViewZoom(delta) {
+  const stage = document.getElementById('viewerStage');
+  if (!stage) return;
+  const rect = stage.getBoundingClientRect();
+  zoomViewAt(viewScale + delta, rect.left + rect.width / 2, rect.top + rect.height / 2);
+}
+
+function initViewerPanZoom() {
+  const stage = document.getElementById('viewerStage');
+  const video = document.getElementById('screenVideo');
+  if (!stage || stage._panZoomBound) return;
+  stage._panZoomBound = true;
+
+  if (video) {
+    video.addEventListener('loadedmetadata', () => applyViewTransform());
+    video.addEventListener('resize', () => applyViewTransform());
+  }
+
+  // Mouse wheel & trackpad pinch zoom (centered on cursor)
+  stage.addEventListener('wheel', (e) => {
+    if (e.target && e.target.closest('#fsHud')) return;
+    e.preventDefault();
+    wakeFsHud();
+    let dy = e.deltaY;
+    if (e.deltaMode === 1) dy *= 32;
+    else if (e.deltaMode === 2) dy *= 240;
+    const sensitivity = e.ctrlKey ? 0.012 : 0.0022;
+    const factor = Math.exp(-dy * sensitivity);
+    zoomViewAt(viewScale * factor, e.clientX, e.clientY);
+  }, { passive: false });
+
+  // Prevent Safari native page pinch-zoom on viewer stage
+  const blockGesture = (e) => {
+    if (e.target && e.target.closest('#fsHud')) return;
+    e.preventDefault();
+  };
+  stage.addEventListener('gesturestart', blockGesture, { passive: false });
+  stage.addEventListener('gesturechange', blockGesture, { passive: false });
+
+  // Mouse click-and-drag pan when zoomed
+  stage.addEventListener('mousedown', (e) => {
+    if (e.button !== 0 || (e.target && e.target.closest('#fsHud'))) return;
+    if (viewScale <= 1.001) return;
+    e.preventDefault();
+    mouseDragging = true;
+    mouseDragMoved = false;
+    mouseStartX = e.clientX;
+    mouseStartY = e.clientY;
+    mouseOrigTx = viewTx;
+    mouseOrigTy = viewTy;
+    stage.classList.add('dragging');
+  });
+
+  window.addEventListener('mousemove', (e) => {
+    if (!mouseDragging) return;
+    const dx = e.clientX - mouseStartX;
+    const dy = e.clientY - mouseStartY;
+    if (Math.hypot(dx, dy) > 3) mouseDragMoved = true;
+    viewTx = mouseOrigTx + dx;
+    viewTy = mouseOrigTy + dy;
+    applyViewTransform();
+  });
+
+  const endMouseDrag = () => {
+    if (!mouseDragging) return;
+    mouseDragging = false;
+    stage.classList.remove('dragging');
+  };
+  window.addEventListener('mouseup', endMouseDrag);
+  window.addEventListener('blur', endMouseDrag);
+
+  stage.addEventListener('click', (e) => {
+    if (e.target && e.target.closest('#fsHud')) return;
+    if (mouseDragMoved) {
+      mouseDragMoved = false;
+      return;
+    }
+    wakeFsHud();
+  });
+
+  // Double-click: reset zoom if zoomed in, otherwise toggle fullscreen
+  stage.addEventListener('dblclick', (e) => {
+    if (e.target && e.target.closest('#fsHud')) return;
+    if (viewScale > 1.001) {
+      resetViewZoom();
+    } else {
+      togglePageFullscreen();
+    }
+  });
+
+  // Touch: 2-finger pinch-to-zoom + pan, and 1-finger drag when zoomed
+  stage.addEventListener('touchstart', (e) => {
+    if (e.target && e.target.closest('#fsHud')) return;
+    wakeFsHud();
+    if (e.touches.length === 2) {
+      e.preventDefault();
+      const t0 = e.touches[0], t1 = e.touches[1];
+      touchMode = 'pinch';
+      pinchPrevDist = Math.max(1, Math.hypot(t1.clientX - t0.clientX, t1.clientY - t0.clientY));
+      pinchPrevMidX = (t0.clientX + t1.clientX) / 2;
+      pinchPrevMidY = (t0.clientY + t1.clientY) / 2;
+    } else if (e.touches.length === 1 && viewScale > 1.001) {
+      e.preventDefault();
+      touchMode = 'pan';
+      touchPrevX = e.touches[0].clientX;
+      touchPrevY = e.touches[0].clientY;
+    } else {
+      touchMode = 'none';
+    }
+  }, { passive: false });
+
+  stage.addEventListener('touchmove', (e) => {
+    if (e.target && e.target.closest('#fsHud')) return;
+    if (e.touches.length === 2) {
+      e.preventDefault();
+      const t0 = e.touches[0], t1 = e.touches[1];
+      const dist = Math.max(1, Math.hypot(t1.clientX - t0.clientX, t1.clientY - t0.clientY));
+      const midX = (t0.clientX + t1.clientX) / 2;
+      const midY = (t0.clientY + t1.clientY) / 2;
+      if (touchMode !== 'pinch') {
+        touchMode = 'pinch';
+        pinchPrevDist = dist;
+        pinchPrevMidX = midX;
+        pinchPrevMidY = midY;
+        return;
+      }
+      viewTx += (midX - pinchPrevMidX);
+      viewTy += (midY - pinchPrevMidY);
+      zoomViewAt(viewScale * (dist / pinchPrevDist), midX, midY);
+      pinchPrevDist = dist;
+      pinchPrevMidX = midX;
+      pinchPrevMidY = midY;
+    } else if (e.touches.length === 1 && touchMode === 'pan' && viewScale > 1.001) {
+      e.preventDefault();
+      const x = e.touches[0].clientX;
+      const y = e.touches[0].clientY;
+      viewTx += (x - touchPrevX);
+      viewTy += (y - touchPrevY);
+      touchPrevX = x;
+      touchPrevY = y;
+      applyViewTransform();
+    }
+  }, { passive: false });
+
+  const onTouchEndOrCancel = (e) => {
+    if (e.touches.length === 2) {
+      const t0 = e.touches[0], t1 = e.touches[1];
+      touchMode = 'pinch';
+      pinchPrevDist = Math.max(1, Math.hypot(t1.clientX - t0.clientX, t1.clientY - t0.clientY));
+      pinchPrevMidX = (t0.clientX + t1.clientX) / 2;
+      pinchPrevMidY = (t0.clientY + t1.clientY) / 2;
+    } else if (e.touches.length === 1 && viewScale > 1.001) {
+      // Smooth handoff from 2-finger pinch to 1-finger drag without jump
+      touchMode = 'pan';
+      touchPrevX = e.touches[0].clientX;
+      touchPrevY = e.touches[0].clientY;
+    } else {
+      touchMode = 'none';
+    }
+  };
+  stage.addEventListener('touchend', onTouchEndOrCancel);
+  stage.addEventListener('touchcancel', onTouchEndOrCancel);
+  window.addEventListener('resize', () => applyViewTransform());
+}
+initViewerPanZoom();
+
+function isPageFullscreen() {
+  return document.body.classList.contains('page-fullscreen')
+    || !!(document.fullscreenElement || document.webkitFullscreenElement);
+}
+
+function wakeFsHud() {
+  if (!document.body.classList.contains('page-fullscreen')) return;
+  const hud = document.getElementById('fsHud');
+  if (!hud) return;
+  hud.classList.remove('idle');
+  if (fsHudTimer) clearTimeout(fsHudTimer);
+  fsHudTimer = setTimeout(() => {
+    if (document.body.classList.contains('page-fullscreen')) {
+      hud.classList.add('idle');
+    }
+  }, 2500);
+}
+
+function updateFullscreenButton() {
+  const btn = document.getElementById('btnFullscreen');
+  if (btn) btn.textContent = isPageFullscreen() ? '退出全屏 (Esc)' : '网页全屏 (F)';
+}
+
+function enterPageFullscreen() {
+  debugTrace('fullscreen_enter', {});
+  document.body.classList.add('page-fullscreen');
+  updateFullscreenButton();
+  wakeFsHud();
+  setTimeout(applyViewTransform, 60);
+  const root = document.documentElement;
+  if (root.requestFullscreen) {
+    root.requestFullscreen().catch(() => {});
+  } else if (root.webkitRequestFullscreen) {
+    try { root.webkitRequestFullscreen(); } catch (_) {}
+  }
+}
+
+function exitPageFullscreen() {
+  document.body.classList.remove('page-fullscreen');
+  if (fsHudTimer) { clearTimeout(fsHudTimer); fsHudTimer = null; }
+  const hud = document.getElementById('fsHud');
+  if (hud) hud.classList.remove('idle');
+  updateFullscreenButton();
+  setTimeout(applyViewTransform, 60);
+  if (document.fullscreenElement && document.exitFullscreen) {
+    document.exitFullscreen().catch(() => {});
+  } else if (document.webkitFullscreenElement && document.webkitExitFullscreen) {
+    try { document.webkitExitFullscreen(); } catch (_) {}
+  }
+}
+
+function togglePageFullscreen() {
+  if (isPageFullscreen()) {
+    exitPageFullscreen();
+  } else {
+    enterPageFullscreen();
+  }
+}
+
+function onNativeFullscreenChange() {
+  const nativeFs = !!(document.fullscreenElement || document.webkitFullscreenElement);
+  if (!nativeFs && document.body.classList.contains('page-fullscreen')) {
+    document.body.classList.remove('page-fullscreen');
+    if (fsHudTimer) { clearTimeout(fsHudTimer); fsHudTimer = null; }
+    const hud = document.getElementById('fsHud');
+    if (hud) hud.classList.remove('idle');
+  } else if (nativeFs && currentTab === 'view' && authStatus.viewer_logged_in) {
+    document.body.classList.add('page-fullscreen');
+    wakeFsHud();
+  }
+  updateFullscreenButton();
+  setTimeout(applyViewTransform, 60);
+}
+
+document.addEventListener('fullscreenchange', onNativeFullscreenChange);
+document.addEventListener('webkitfullscreenchange', onNativeFullscreenChange);
+document.addEventListener('keydown', (e) => {
+  if (currentTab !== 'view' || !authStatus.viewer_logged_in) return;
+  const stageEl = document.getElementById('secViewStage');
+  if (stageEl && stageEl.classList.contains('hidden')) return;
+  const tag = (e.target && e.target.tagName || '').toLowerCase();
+  if (tag === 'input' || tag === 'textarea' || tag === 'select') return;
+  if (e.key === 'Escape' && isPageFullscreen()) {
+    exitPageFullscreen();
+  } else if ((e.key === 'f' || e.key === 'F') && !e.ctrlKey && !e.metaKey && !e.altKey) {
+    e.preventDefault();
+    togglePageFullscreen();
+  } else if ((e.key === '+' || e.key === '=') && !e.ctrlKey && !e.metaKey && !e.altKey) {
+    e.preventDefault();
+    stepViewZoom(0.25);
+  } else if ((e.key === '-' || e.key === '_') && !e.ctrlKey && !e.metaKey && !e.altKey) {
+    e.preventDefault();
+    stepViewZoom(-0.25);
+  } else if (e.key === '0' && !e.ctrlKey && !e.metaKey && !e.altKey) {
+    e.preventDefault();
+    resetViewZoom();
+  }
+});
+
+function onViewerForegroundOrOnline() {
+  if (document.hidden || currentTab !== 'view') return;
+  if (manualReconnectRequired) return;
+  if (!authStatus.viewer_logged_in) {
+    checkAuth();
+    return;
+  }
+  const stale = !ws || ws.readyState !== WebSocket.OPEN || (Date.now() - lastServerActivityAt > 20000);
+  if (stale) {
+    reconnectAttempt = 0;
+    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      reconnectStream();
+    } else {
+      checkAuth();
+    }
+    return;
+  }
+  const video = document.getElementById('screenVideo');
+  if (video) {
+    trimAndChaseLive(video);
+    if (video.paused) {
+      video.play().catch(() => {});
+    }
+  }
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (ws && ws.readyState === WebSocket.OPEN && typeof RTCPeerConnection === 'function') {
+    const relayPrio = getP2pRelayPriority();
+    sendWsJson({ type: 'p2p_caps', can_relay: relayPrio > 0, relay_priority: relayPrio });
+  }
+  if (document.hidden) {
+    if (tabHidePauseTimer) clearTimeout(tabHidePauseTimer);
+    tabHidePauseTimer = setTimeout(() => {
+      tabHidePauseTimer = null;
+      // Pause server push for background tabs (unless actively relaying to P2P children).
+      if (document.hidden && ws && ws.readyState === WebSocket.OPEN && p2pChildren.size === 0) {
+        tabVisibilitySentHidden = true;
+        sendWsJson({ type: 'viewer_visibility', visible: false });
+      }
+    }, 3000);
+  } else {
+    if (tabHidePauseTimer) {
+      clearTimeout(tabHidePauseTimer);
+      tabHidePauseTimer = null;
+    }
+    if (tabVisibilitySentHidden) {
+      tabVisibilitySentHidden = false;
+      mseAwaitingIdr = true;
+      sendWsJson({ type: 'viewer_visibility', visible: true });
+      requestStreamIdr();
+    }
+    onViewerForegroundOrOnline();
+  }
+});
+window.addEventListener('online', onViewerForegroundOrOnline);
+window.addEventListener('pageshow', onViewerForegroundOrOnline);
+
+checkAuth();
+</script>
+</body>
+</html>

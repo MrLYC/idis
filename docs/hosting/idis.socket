@@ -1,0 +1,28 @@
+# Linux systemd --user Socket Activation 单元模板（默认仅托管本机管理端口 127.0.0.1:8787）
+#
+# 安装方法：
+#   mkdir -p ~/.config/systemd/user
+#   cp docs/hosting/idis.socket docs/hosting/idis.service ~/.config/systemd/user/
+#   # 按需修改 idis.service 中的 ExecStart 路径与 DISPLAY/XAUTHORITY
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now idis.socket
+#
+# 说明：
+# - 平时仅由 systemd 在内核监听本机管理端口（0 进程 / 0 内存 / 0 CPU 唤醒，不阻止深睡眠）。
+# - 访问 http://127.0.0.1:8787/ 后自动拉起 idis.service；网页观看端口与 Wi-Fi 端口按需动态启停并自动空闲关闭。
+# - 全局空闲 --idle-exit-secs 秒后进程自动退出并归还端口。
+
+[Unit]
+Description=idis Socket Activation (Web Admin Console)
+
+[Socket]
+FileDescriptorName=web
+ListenStream=127.0.0.1:8787
+# 可选：如需预托管传统 Wi-Fi 端口，请改用独立 .socket 单元或在下方按序取消注释（并移除 FileDescriptorName）
+# ListenStream=0.0.0.0:56845
+# ListenStream=0.0.0.0:56846
+ReusePort=true
+NoDelay=true
+
+[Install]
+WantedBy=sockets.target

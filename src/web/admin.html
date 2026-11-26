@@ -1,0 +1,3567 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>idis 控制端</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --panel: #161b22;
+    --panel-alt: #1c2128;
+    --border: #30363d;
+    --text: #e6edf3;
+    --muted: #8b949e;
+    --accent: #2f81f7;
+    --ok: #3fb950;
+    --warn: #d29922;
+    --danger: #f85149;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg); color: var(--text); font-size: 14px; line-height: 1.5;
+  }
+  header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 12px 20px; background: var(--panel); border-bottom: 1px solid var(--border);
+    position: sticky; top: 0; z-index: 10;
+  }
+  .brand { font-weight: 700; font-size: 16px; display: flex; align-items: center; gap: 8px; }
+  .tabs { display: flex; gap: 8px; }
+  .tab {
+    background: transparent; color: var(--muted); border: 1px solid var(--border);
+    padding: 6px 14px; border-radius: 6px; cursor: pointer; font-size: 13px;
+  }
+  .tab.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+  main { max-width: 1180px; margin: 18px auto; padding: 0 16px 48px; }
+  body.viewer-mode main { max-width: 1440px; margin: 12px auto; }
+  .card {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    padding: 16px 18px; margin-bottom: 14px;
+  }
+  .card h2 {
+    margin: 0 0 12px; font-size: 15px; display: flex; align-items: center;
+    justify-content: space-between; flex-wrap: wrap; gap: 8px;
+  }
+  details.card > summary {
+    list-style: none; cursor: pointer; display: flex; align-items: center;
+    justify-content: space-between; flex-wrap: wrap; gap: 8px; font-size: 15px; font-weight: 700;
+  }
+  details.card > summary::-webkit-details-marker { display: none; }
+  details.card > summary .summary-title::before {
+    content: '▸'; display: inline-block; width: 16px; color: var(--muted); transition: transform .15s;
+  }
+  details.card[open] > summary .summary-title::before { transform: rotate(90deg); }
+  details.card[open] > summary { margin-bottom: 12px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; }
+  .stat { background: var(--panel-alt); border: 1px solid var(--border); border-radius: 8px; padding: 12px; min-width: 0; }
+  #hostStats .stat { min-height: 78px; display: flex; flex-direction: column; justify-content: space-between; }
+  .stat .label { color: var(--muted); font-size: 12px; }
+  .stat .val {
+    font-size: 13px; font-weight: 600; margin-top: 6px; line-height: 1.45;
+    font-variant-numeric: tabular-nums; word-break: break-word;
+  }
+  .metric-lines { display: flex; flex-direction: column; gap: 2px; font-variant-numeric: tabular-nums; }
+  .metric-line { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  .table-wrap { width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  .table-wrap table { min-width: 560px; }
+  .sub-panel {
+    background: var(--panel-alt); border: 1px solid var(--border); border-radius: 8px;
+    padding: 10px 12px; margin-top: 10px;
+  }
+  .seg-group {
+    display: inline-flex; border: 1px solid var(--border); border-radius: 6px; overflow: hidden;
+  }
+  .seg-group button {
+    border: none; border-right: 1px solid var(--border); border-radius: 0;
+    padding: 6px 10px; font-size: 12px; background: var(--bg); color: var(--muted);
+  }
+  .seg-group button:last-child { border-right: none; }
+  .seg-group button.active { background: var(--accent); color: #fff; font-weight: 600; }
+  .seg-group button.active-ok { background: #238636; color: #fff; font-weight: 600; }
+  input[type=text], input[type=password], input[type=number], select {
+    background: var(--bg); color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 7px 10px; font-size: 13px; min-width: 110px;
+  }
+  button {
+    background: var(--panel-alt); color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 7px 12px; font-size: 13px; cursor: pointer;
+    transition: border-color .15s, background .15s, transform .08s, box-shadow .15s;
+  }
+  button:hover:not(:disabled) { border-color: #6e7681; }
+  button:active:not(:disabled) { transform: translateY(1px); }
+  button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-visible {
+    outline: 2px solid var(--accent); outline-offset: 2px;
+  }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.primary.pulse { box-shadow: 0 0 0 3px rgba(47,129,247,.38); }
+  button.ok { background: #238636; border-color: #2ea043; color: #fff; }
+  button.danger { background: #da3633; border-color: #f85149; color: #fff; }
+  button.warn { background: #9e6a03; border-color: var(--warn); color: #fff; }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); font-variant-numeric: tabular-nums; }
+  th { color: var(--muted); font-weight: 500; white-space: nowrap; }
+  .badge {
+    display: inline-block; padding: 2px 7px; border-radius: 12px; font-size: 11px; font-weight: 600;
+  }
+  .badge.ok { background: rgba(63,185,80,.18); color: var(--ok); }
+  .badge.warn { background: rgba(210,153,34,.2); color: var(--warn); }
+  .badge.err { background: rgba(248,81,73,.2); color: var(--danger); }
+  .badge.info { background: rgba(47,129,247,.2); color: #79c0ff; }
+  .pending-box { border-color: var(--warn); background: rgba(210,153,34,.07); }
+  .log-box {
+    background: #010409; border: 1px solid var(--border); border-radius: 6px;
+    padding: 10px; max-height: 260px; overflow-y: auto; font-family: ui-monospace, SFMono-Regular, monospace;
+    font-size: 12px; white-space: pre-wrap; word-break: break-all;
+  }
+  .hidden { display: none !important; }
+  .login-wrap { max-width: 420px; margin: 60px auto; }
+  .msg { margin-top: 8px; font-size: 13px; }
+  .msg:empty { display: none; }
+  .msg.err { color: var(--danger); }
+  .msg.ok { color: var(--ok); }
+  .toast-stack {
+    position: fixed; right: 16px; bottom: 16px; z-index: 10050;
+    display: flex; flex-direction: column; gap: 8px; max-width: min(380px, calc(100vw - 32px));
+    pointer-events: none;
+  }
+  .toast {
+    background: rgba(22, 27, 34, 0.96); color: var(--text);
+    border: 1px solid var(--border); border-left: 3px solid var(--accent);
+    border-radius: 8px; padding: 9px 13px; font-size: 13px;
+    box-shadow: 0 6px 20px rgba(0,0,0,.45); backdrop-filter: blur(8px);
+    animation: toastIn .18s ease-out;
+  }
+  .toast.ok { border-left-color: var(--ok); }
+  .toast.warn { border-left-color: var(--warn); }
+  .toast.err { border-left-color: var(--danger); }
+  @keyframes toastIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+  .viewer-stage {
+    position: relative; background: #000; border-radius: 10px; overflow: hidden;
+    border: 1px solid var(--border); min-height: 420px; display: flex; align-items: center; justify-content: center;
+    touch-action: none; user-select: none; -webkit-user-select: none;
+  }
+  .viewer-stage.zoomed { cursor: grab; }
+  .viewer-stage.dragging { cursor: grabbing; }
+  .viewer-stage video {
+    width: 100%; max-height: 82vh; background: #000; display: block; object-fit: contain;
+    transform-origin: center center; will-change: transform; pointer-events: none;
+  }
+  .viewer-stage.fill video { object-fit: cover; }
+  .stage-overlay {
+    position: absolute; inset: 0; z-index: 20;
+    display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px;
+    padding: 24px; text-align: center; background: rgba(13, 17, 23, 0.76); backdrop-filter: blur(6px);
+  }
+  .stage-overlay .ov-title { font-size: 16px; font-weight: 600; color: var(--text); max-width: 460px; }
+  .stage-overlay .ov-sub { font-size: 12px; color: var(--muted); max-width: 460px; }
+  .zoom-group { display: inline-flex; align-items: center; gap: 4px; }
+  .zoom-group button { padding: 6px 9px; min-width: 32px; }
+  .viewer-toolbar {
+    display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between;
+    gap: 10px; margin-bottom: 10px;
+  }
+  .conn-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(310px, 1fr)); gap: 14px; }
+  .conn-card {
+    background: var(--panel-alt); border: 1px solid var(--border); border-radius: 8px; padding: 14px;
+    display: flex; gap: 14px; align-items: flex-start; justify-content: space-between;
+  }
+  .conn-meta { flex: 1; min-width: 0; }
+  .conn-meta .label { color: var(--muted); font-size: 12px; margin-bottom: 6px; }
+  .conn-ep {
+    display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin: 6px 0;
+  }
+  .conn-ep code { word-break: break-all; font-size: 13px; padding: 4px 8px; }
+  .qr-col {
+    display: flex; flex-direction: column; align-items: center; gap: 6px; flex: 0 0 156px;
+  }
+  .qr-box {
+    width: 152px; height: 152px; flex: 0 0 152px; background: #fff; border-radius: 8px;
+    padding: 6px; display: flex; align-items: center; justify-content: center;
+    box-shadow: 0 2px 10px rgba(0,0,0,.35);
+  }
+  .qr-box.empty {
+    background: var(--bg); border: 1px dashed var(--border); box-shadow: none;
+    flex-direction: column; gap: 8px; text-align: center; color: var(--muted); font-size: 12px; padding: 12px;
+  }
+  .qr-box svg { width: 100%; height: 100%; display: block; }
+  .qr-caption { font-size: 11px; color: var(--muted); text-align: center; }
+  a.btn-link {
+    display: inline-block; background: var(--panel-alt); color: var(--text);
+    border: 1px solid var(--border); border-radius: 6px; padding: 6px 10px;
+    font-size: 13px; text-decoration: none;
+  }
+  a.btn-link:hover { border-color: #6e7681; }
+  .fs-hud {
+    display: none; position: fixed; top: 14px; right: 16px; z-index: 10001;
+    max-width: calc(100vw - 32px);
+    background: rgba(13, 17, 23, 0.82); backdrop-filter: blur(8px);
+    border: 1px solid rgba(255,255,255,0.16); border-radius: 10px;
+    padding: 8px 10px; gap: 8px; align-items: center; flex-wrap: wrap;
+    transition: opacity 0.25s ease;
+  }
+  body.page-fullscreen { overflow: hidden; background: #000; }
+  body.page-fullscreen header { display: none !important; }
+  body.page-fullscreen main { max-width: none; margin: 0; padding: 0; }
+  body.page-fullscreen #secViewStage .card {
+    border: none; border-radius: 0; padding: 0; margin: 0; background: #000;
+  }
+  body.page-fullscreen .viewer-toolbar { display: none !important; }
+  body.page-fullscreen .viewer-stage {
+    position: fixed; inset: 0; width: 100vw; height: 100vh; height: 100dvh;
+    min-height: 0; border: none; border-radius: 0; z-index: 9999; background: #000;
+  }
+  body.page-fullscreen .viewer-stage video {
+    width: 100%; height: 100%; max-height: none;
+  }
+  body.page-fullscreen .fs-hud { display: flex; }
+  body.page-fullscreen .fs-hud.idle { opacity: 0; pointer-events: none; }
+  code { background: var(--panel-alt); padding: 2px 6px; border-radius: 4px; font-size: 12px; }
+  .sku-form { display: flex; flex-direction: column; gap: 11px; }
+  .sku-row { display: flex; align-items: flex-start; gap: 10px; flex-wrap: wrap; }
+  .sku-label {
+    flex: 0 0 118px; color: var(--muted); font-size: 12px; padding-top: 7px; font-weight: 500;
+  }
+  .sku-body { flex: 1; min-width: 220px; display: flex; flex-direction: column; gap: 6px; }
+  .sku-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+  .sku-chip {
+    background: var(--panel-alt); color: var(--text); border: 1px solid var(--border);
+    border-radius: 7px; padding: 6px 11px; font-size: 12px; cursor: pointer;
+    transition: border-color .14s, background .14s, color .14s;
+  }
+  .sku-chip:hover:not(:disabled) { border-color: #6e7681; background: #262c36; }
+  .sku-chip.selected {
+    background: rgba(88, 166, 255, 0.16); border-color: var(--accent); color: #b8dcff; font-weight: 600;
+  }
+  .sku-chip.selected-ok {
+    background: rgba(46, 160, 67, 0.18); border-color: var(--ok); color: #7ee787; font-weight: 600;
+  }
+  .sku-chip:disabled { opacity: 0.45; cursor: not-allowed; }
+  .sku-custom { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding-top: 2px; }
+  .sku-actions {
+    display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between;
+    gap: 10px; margin-top: 4px; padding-top: 12px; border-top: 1px solid var(--border);
+  }
+  .sku-preview { color: var(--muted); font-size: 12px; }
+  .conn-section-hd {
+    font-size: 13px; margin: 14px 0 8px; display: flex; justify-content: space-between;
+    align-items: center; flex-wrap: wrap; gap: 8px; color: var(--text);
+  }
+  @media (max-width: 720px) {
+    header { padding: 10px 12px; }
+    main { margin: 10px auto; padding: 0 10px 32px; }
+    .card { padding: 12px 14px; }
+    .conn-grid { grid-template-columns: 1fr; }
+    .conn-card { flex-direction: column; }
+    .qr-col { align-self: center; }
+    .sku-label { flex: 1 1 100%; padding-top: 0; }
+    .viewer-stage { min-height: 260px; }
+    .viewer-stage video { max-height: 70vh; }
+    .fs-hud { left: 10px; right: 10px; top: 10px; max-width: calc(100vw - 20px); justify-content: center; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">
+    <span>idis</span>
+    <span class="badge info" id="hdrVersion">Web 控制端</span>
+    <span class="badge warn hidden" id="hdrDebugBadge" title="DEBUG 日志级别已开启">DEBUG 日志</span>
+  </div>
+  <div class="tabs">
+    <button class="tab active" id="tabAdmin">管理后台</button>
+    <a class="tab" id="tabView" href="/view" style="text-decoration:none;display:inline-flex;align-items:center">扩展屏观看</a>
+  </div>
+</header>
+
+<main>
+  <!-- ==================== ADMIN LOGIN ==================== -->
+  <section id="secAdminLogin" class="login-wrap hidden">
+    <div class="card">
+      <h2>管理员登录</h2>
+      <p style="color:var(--muted);margin-top:0">请输入启动参数 <code>--web-admin-token</code> 指定的口令（或启动日志中自动生成的随机管理员口令）。</p>
+      <div class="row">
+        <input id="adminTokenInput" type="password" placeholder="管理员口令" style="flex:1" onkeydown="if(event.key==='Enter')adminLogin()">
+        <button class="primary" onclick="adminLogin()">登录</button>
+      </div>
+      <div id="adminLoginMsg" class="msg"></div>
+    </div>
+  </section>
+
+  <!-- ==================== ADMIN DASHBOARD ==================== -->
+  <section id="secAdminDash" class="hidden">
+    <div class="card hidden" id="configCorruptBanner" style="border-color:var(--danger);background:rgba(248,81,73,.1)">
+      <div class="row" style="justify-content:space-between;align-items:center">
+        <div>
+          <strong style="color:var(--danger)">配置文件解析失败（只读保护模式）</strong>
+          <div style="color:var(--muted);font-size:12px;margin-top:2px">启动时磁盘 <code>idis.yaml</code> 存在语法错误，已停止自动写入以免覆盖原有数据。请展开配置文件卡片修复原始文件后保存，或修复磁盘文件后点击重载。</div>
+        </div>
+        <button class="warn" onclick="openConfigCard()">前往修复</button>
+      </div>
+    </div>
+
+    <div class="card hidden" id="accessibilityWarnBanner" style="border-color:var(--warn);background:rgba(210,153,34,.1)">
+      <div class="row" style="justify-content:space-between;align-items:center">
+        <div>
+          <strong style="color:var(--warn)">尚未授予系统辅助功能权限</strong>
+          <div style="color:var(--muted);font-size:12px;margin-top:2px">远程键鼠输入已开启，但系统未授予辅助功能权限，触摸与键盘事件将被系统忽略。请前往「系统设置 → 隐私与安全性 → 辅助功能」勾选终端或 <code>idis</code>。</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card pending-box hidden" id="pendingCard">
+      <h2><span>待审批连接</span><span class="badge warn" id="pendingCount">0</span></h2>
+      <div id="pendingList"></div>
+    </div>
+
+    <div class="card">
+      <h2>
+        <span>主机状态</span>
+        <div class="row">
+          <button id="btnToggleDebug" onclick="toggleRuntimeDebug()">调试日志: 关</button>
+          <button onclick="downloadDebugBundle()">导出诊断包</button>
+          <button onclick="refreshAdmin()">立即刷新</button>
+          <button id="btnAdminLogout" onclick="adminLogout()">退出登录</button>
+        </div>
+      </h2>
+      <div class="grid" id="hostStats"></div>
+    </div>
+
+    <div class="card">
+      <h2>
+        <span>接入端口与连接二维码</span>
+        <span style="color:var(--muted);font-size:12px" id="lanIpsSummary">检测中...</span>
+      </h2>
+      <div class="row" style="justify-content:space-between;flex-wrap:wrap;gap:8px;padding:8px 12px;margin-bottom:10px;border:1px solid var(--border);border-radius:10px;background:rgba(15,23,42,0.45)">
+        <div class="row" style="gap:6px;flex-wrap:wrap">
+          <span style="font-size:12px;color:var(--text);font-weight:600">端口空闲自动关闭</span>
+          <input id="portIdleCloseInput" type="number" min="0" max="86400" style="width:76px;min-width:74px" title="网页扩展屏与 iPad Wi-Fi 端口无连接超时秒数，0 表示不自动关闭" onkeydown="if(event.key==='Enter')savePortIdleClose()">
+          <span style="color:var(--muted);font-size:12px">秒</span>
+          <button class="primary" style="padding:4px 10px;font-size:12px" onclick="savePortIdleClose()">保存</button>
+          <button style="padding:4px 8px;font-size:12px" onclick="savePortIdleClose(0)">关闭</button>
+          <button style="padding:4px 8px;font-size:12px" onclick="savePortIdleClose(300)">5 分钟</button>
+          <button style="padding:4px 8px;font-size:12px" onclick="savePortIdleClose(900)">15 分钟</button>
+          <button style="padding:4px 8px;font-size:12px" onclick="savePortIdleClose(1800)">30 分钟</button>
+        </div>
+        <span style="color:var(--muted);font-size:12px">无活跃连接超时后自动关闭网页与 iPad Wi-Fi 监听端口（0 = 不自动关闭）</span>
+      </div>
+      <div class="conn-grid">
+        <div class="conn-card" id="viewerConnCard">
+          <div class="conn-meta">
+            <div class="row" style="justify-content:space-between;margin-bottom:6px">
+              <div class="label" style="margin:0">网页观看口令</div>
+              <span id="viewTokenBadge" class="badge err">未配置</span>
+            </div>
+            <div class="row" style="margin:8px 0">
+              <input id="newViewToken" type="text" placeholder="自定义观看口令，至少 4 位" style="min-width:160px;flex:1" onkeydown="if(event.key==='Enter')setViewToken()">
+              <button class="primary" onclick="setViewToken()">保存口令</button>
+              <button class="ok" onclick="rotateViewToken()">随机生成</button>
+              <button class="danger hidden" id="btnDisableViewToken" onclick="confirmDanger(this, '确认关闭观看？', disableViewToken)">关闭观看</button>
+            </div>
+            <div id="viewTokenMsg" class="msg" style="margin-top:4px"></div>
+            <div id="viewerLinksBox" style="margin-top:8px"></div>
+          </div>
+          <div id="viewerQrSlot" class="qr-col"></div>
+        </div>
+        <div class="conn-card" id="wifiConnCard"></div>
+      </div>
+      <div id="copyMsg" class="msg"></div>
+    </div>
+
+    <div class="card">
+      <h2>
+        <span class="row">
+          <span>活跃连接</span>
+          <span id="extScreensBadge" class="badge info">扩展屏 0/2</span>
+          <span id="webViewersBadge" class="badge warn">网页观众 0/0</span>
+          <span id="p2pSummaryBadge" class="badge info">P2P 已就绪</span>
+        </span>
+      </h2>
+      <div class="conn-section-hd" style="margin-top:4px">
+        <span>远程设备</span>
+        <button class="danger" onclick="confirmDanger(this, '确认断开全部设备？', () => disconnectSession('*'))">断开全部设备</button>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>设备</th><th>通道</th><th>地址 / 指纹</th><th>分辨率 / HiDPI</th><th>状态</th><th>在途/丢帧</th><th>空闲</th><th>操作</th></tr>
+          </thead>
+          <tbody id="sessionsBody"></tbody>
+        </table>
+      </div>
+      <div class="conn-section-hd">
+        <span>在线网页观众</span>
+        <button class="danger" onclick="confirmDanger(this, '确认踢出全部网页观众？', () => kickViewer(null))">断开全部网页观众</button>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Viewer ID</th><th>来源地址</th><th>传输模式</th><th>已连接</th><th>操作</th></tr></thead>
+          <tbody id="viewersBody"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>
+        <span>配置预设</span>
+        <span id="activePresetBadge" class="badge info">未选择</span>
+      </h2>
+      <div id="presetsGrid" class="grid" style="margin-bottom:12px"></div>
+      <div class="row">
+        <input id="presetNameInput" type="text" maxlength="64" placeholder="输入新预设名称，例如：会议投屏" style="flex:1;min-width:180px" onkeydown="if(event.key==='Enter')saveCurrentAsPreset()">
+        <button class="primary" onclick="saveCurrentAsPreset()">另存当前配置为预设</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>
+        <span>安全与策略</span>
+        <span id="hostLockBadge" class="badge warn hidden">主机已锁屏</span>
+      </h2>
+      <div class="grid">
+        <div class="stat">
+          <div class="label">权限与运行模式</div>
+          <div class="row" style="margin-top:10px">
+            <span>远程键鼠输入：</span>
+            <span id="inputBadge" class="badge ok">仅显示</span>
+            <button id="toggleInputBtn" onclick="toggleAllowInput()">切换</button>
+          </div>
+          <div id="inputDiagHint" class="hidden" style="color:var(--warn);font-size:12px;margin-top:4px"></div>
+          <div class="row" style="margin-top:10px">
+            <span>低电量模式：</span>
+            <span id="lowPowerBadge" class="badge info">关闭</span>
+            <button id="toggleLowPowerBtn" onclick="toggleLowPower()">切换</button>
+          </div>
+          <div style="color:var(--muted);font-size:12px;margin-top:6px">开启后仅允许已受信设备自动连接，关闭网页观看与 P2P，切换 4M/15fps 省电规格并降低后台轮询</div>
+          <div class="row" style="margin-top:10px">
+            <span>扩展屏上限：</span>
+            <input id="maxExtInput" type="number" min="0" max="32" style="width:74px;min-width:74px" onkeydown="if(event.key==='Enter')saveMaxExtendedScreens()">
+            <button onclick="saveMaxExtendedScreens()">保存</button>
+            <span style="color:var(--muted);font-size:12px">0 表示不限</span>
+          </div>
+        </div>
+        <div class="stat" id="lockPolicyStat">
+          <div class="label">锁屏后策略</div>
+          <div id="lockPolicyUnsupportedHint" class="hidden" style="color:var(--muted);font-size:12px;margin-top:8px">当前操作系统暂不支持自动检测系统锁屏状态，锁屏后策略不会自动触发。</div>
+          <div id="lockPolicyControls">
+          <div class="row" style="margin-top:10px">
+            <span>iPad：</span>
+            <select id="lockActionIpadSel" onchange="saveLockActions()" style="min-width:175px">
+              <option value="pause">暂停投屏，解锁恢复</option>
+              <option value="disconnect">断开连接并释放虚拟屏</option>
+              <option value="keep">保持不变</option>
+            </select>
+          </div>
+          <div class="row" style="margin-top:8px">
+            <span>网页端：</span>
+            <select id="lockActionWebSel" onchange="saveLockActions()" style="min-width:175px">
+              <option value="pause">暂停推流，解锁恢复</option>
+              <option value="disconnect">断开观众并释放独立屏</option>
+              <option value="keep">保持不变</option>
+            </select>
+          </div>
+          <div class="row" id="lockDelayWrap" style="margin-top:8px">
+            <span>延迟执行：</span>
+            <input id="lockDelayInput" type="number" min="0" max="3600" style="width:68px;min-width:68px" title="锁屏后延迟多少秒执行，0 为立即" onkeydown="if(event.key==='Enter')saveLockDelay()">
+            <span style="color:var(--muted);font-size:12px">秒</span>
+            <button onclick="saveLockDelay()">保存</button>
+          </div>
+          </div>
+        </div>
+        <div class="stat">
+          <div class="label">活跃轮询策略</div>
+          <div class="row" style="margin-top:8px">
+            <button onclick="applyPollingPreset('normal')">标准预设</button>
+            <button onclick="applyPollingPreset('eco')">省电预设</button>
+            <button onclick="resetPollingSettings()">重置默认</button>
+          </div>
+          <div class="row" style="margin-top:8px">
+            <span style="min-width:92px">主循环检查：</span>
+            <input id="pollMainLoopInput" type="number" min="100" max="5000" style="width:76px;min-width:74px" onkeydown="if(event.key==='Enter')savePollingSettings()">
+            <span style="color:var(--muted);font-size:12px">ms</span>
+          </div>
+          <div class="row" style="margin-top:6px">
+            <span style="min-width:92px">远程光标采样：</span>
+            <input id="pollCursorInput" type="number" min="8" max="200" style="width:76px;min-width:74px" onkeydown="if(event.key==='Enter')savePollingSettings()">
+            <span style="color:var(--muted);font-size:12px">ms</span>
+          </div>
+          <div class="row" style="margin-top:6px">
+            <span style="min-width:92px">USB 重试：</span>
+            <input id="pollUsbRetryInput" type="number" min="250" max="30000" style="width:76px;min-width:74px" onkeydown="if(event.key==='Enter')savePollingSettings()">
+            <span style="color:var(--muted);font-size:12px">ms</span>
+          </div>
+          <div class="row" style="margin-top:6px">
+            <span style="min-width:92px">网页后台刷新：</span>
+            <input id="pollAdminInput" type="number" min="500" max="30000" style="width:76px;min-width:74px" onkeydown="if(event.key==='Enter')savePollingSettings()">
+            <span style="color:var(--muted);font-size:12px">ms</span>
+            <button class="primary" onclick="savePollingSettings()">保存</button>
+          </div>
+          <div style="color:var(--muted);font-size:12px;margin-top:6px">仅在有活跃连接或打开后台时生效；零连接待机自动进入零唤醒深睡。</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>
+        <span>iPad 扩展屏</span>
+        <span class="row">
+          <span class="badge warn hidden" id="videoDirtyBadge">待应用</span>
+          <span class="badge info" id="videoSummaryBadge">-</span>
+        </span>
+      </h2>
+      <div class="sku-form">
+        <div class="sku-row">
+          <div class="sku-label">画质预设</div>
+          <div class="sku-body">
+            <div class="sku-chips" id="ipadQualityChips"></div>
+            <div class="sku-custom hidden" id="ipadQualityCustom">
+              <label style="font-size:12px;color:var(--muted)">FPS：</label>
+              <input id="ipadCustomFps" type="number" min="5" max="120" style="width:74px;min-width:70px" oninput="onIpadCustomQualityInput()">
+              <label style="font-size:12px;color:var(--muted)">码率 Mbps：</label>
+              <input id="ipadCustomBitrate" type="number" min="2" max="60" style="width:74px;min-width:70px" oninput="onIpadCustomQualityInput()">
+            </div>
+          </div>
+        </div>
+
+        <div class="sku-row">
+          <div class="sku-label" id="ipadResLabel">分辨率</div>
+          <div class="sku-body">
+            <div class="sku-chips" id="ipadResChips"></div>
+            <div class="sku-custom hidden" id="ipadResCustom">
+              <input id="ipadCustomW" type="number" min="320" max="3840" step="2" placeholder="宽" style="width:86px;min-width:80px" oninput="onIpadCustomResInput()">
+              <span>×</span>
+              <input id="ipadCustomH" type="number" min="240" max="2160" step="2" placeholder="高" style="width:86px;min-width:80px" oninput="onIpadCustomResInput()">
+            </div>
+          </div>
+        </div>
+
+        <div class="sku-row">
+          <div class="sku-label">Retina HiDPI</div>
+          <div class="sku-body">
+            <div class="sku-chips" id="ipadHidpiChips"></div>
+          </div>
+        </div>
+
+        <div class="sku-row">
+          <div class="sku-label">推流长边上限</div>
+          <div class="sku-body">
+            <div class="sku-chips" id="ipadEdgeChips"></div>
+            <div class="sku-custom hidden" id="ipadEdgeCustom">
+              <input id="ipadCustomEdge" type="number" min="640" max="3840" step="2" placeholder="640~3840" style="width:110px;min-width:100px" oninput="onIpadCustomEdgeInput()">
+              <span style="font-size:12px;color:var(--muted)">px</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="sku-row">
+          <div class="sku-label">低延迟在途帧</div>
+          <div class="sku-body">
+            <div class="sku-chips" id="ipadMifChips"></div>
+            <div class="sku-custom hidden" id="ipadMifCustom">
+              <input id="ipadCustomMif" type="number" min="0" max="12" placeholder="0~12" style="width:80px;min-width:74px" oninput="onIpadCustomMifInput()">
+              <span style="font-size:12px;color:var(--muted)">帧，0 为关闭背压</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="sku-row">
+          <div class="sku-label">弱网自适应</div>
+          <div class="sku-body">
+            <div class="sku-chips" id="ipadAbrChips"></div>
+          </div>
+        </div>
+
+        <div class="sku-row">
+          <div class="sku-label">客户端鼠标</div>
+          <div class="sku-body">
+            <div class="sku-chips" id="ipadCursorChips"></div>
+          </div>
+        </div>
+
+        <div class="sku-row">
+          <div class="sku-label">失焦降帧省电</div>
+          <div class="sku-body">
+            <div class="sku-chips" id="ipadFocusFpsChips"></div>
+          </div>
+        </div>
+
+        <div class="sku-actions">
+          <span class="sku-preview" id="ipadDraftPreview">-</span>
+          <span class="row">
+            <button class="primary" id="btnApplyVideo" onclick="applyIpadSkuSettings()">应用设置</button>
+            <button class="hidden" id="btnDiscardVideo" onclick="discardIpadSkuEdits()">放弃修改</button>
+            <button class="warn" onclick="resetVideoSettings()">重置默认</button>
+          </span>
+        </div>
+      </div>
+      <div id="videoMsg" class="msg"></div>
+    </div>
+
+    <div class="card">
+      <h2>
+        <span>网页扩展屏</span>
+        <span class="row">
+          <span class="badge warn hidden" id="webDirtyBadge">待应用</span>
+          <span class="badge info" id="webScreenModeBadge">-</span>
+        </span>
+      </h2>
+      <div class="sku-form">
+        <div class="sku-row">
+          <div class="sku-label">屏幕来源</div>
+          <div class="sku-body">
+            <div class="sku-chips" id="webModeChips"></div>
+            <div id="webScreenModeHint" style="color:var(--muted);font-size:12px"></div>
+          </div>
+        </div>
+
+        <div class="sku-row">
+          <div class="sku-label">观众准入审批</div>
+          <div class="sku-body">
+            <div class="sku-chips" id="webApprovalChips"></div>
+          </div>
+        </div>
+
+        <div class="sku-row">
+          <div class="sku-label">观看人数上限</div>
+          <div class="sku-body">
+            <div class="sku-chips" id="webViewerLimitChips"></div>
+            <div class="sku-custom hidden" id="webViewerLimitCustom">
+              <input id="webCustomViewerLimit" type="number" min="0" max="128" placeholder="人数" style="width:84px;min-width:78px" oninput="onWebCustomViewerLimitInput()">
+              <span style="font-size:12px;color:var(--muted)">人，0 为禁止观看</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="sku-row">
+          <div class="sku-label">画质预设</div>
+          <div class="sku-body">
+            <div class="sku-chips" id="webQualityChips"></div>
+            <div class="sku-custom hidden" id="webQualityCustom">
+              <label style="font-size:12px;color:var(--muted)">FPS：</label>
+              <input id="webCustomFps" type="number" min="5" max="120" style="width:74px;min-width:70px" oninput="onWebCustomQualityInput()">
+              <label style="font-size:12px;color:var(--muted)">码率 Mbps：</label>
+              <input id="webCustomBitrate" type="number" min="2" max="60" style="width:74px;min-width:70px" oninput="onWebCustomQualityInput()">
+            </div>
+          </div>
+        </div>
+
+        <div class="sku-row">
+          <div class="sku-label">分辨率</div>
+          <div class="sku-body">
+            <div class="sku-chips" id="webResChips"></div>
+            <div class="sku-custom hidden" id="webResCustom">
+              <input id="webCustomW" type="number" min="320" max="3840" step="2" placeholder="宽" style="width:86px;min-width:80px" oninput="onWebCustomResInput()">
+              <span>×</span>
+              <input id="webCustomH" type="number" min="240" max="2160" step="2" placeholder="高" style="width:86px;min-width:80px" oninput="onWebCustomResInput()">
+            </div>
+          </div>
+        </div>
+
+        <div class="sku-row">
+          <div class="sku-label">Retina HiDPI</div>
+          <div class="sku-body">
+            <div class="sku-chips" id="webHidpiChips"></div>
+          </div>
+        </div>
+
+        <div class="sku-row">
+          <div class="sku-label">推流长边上限</div>
+          <div class="sku-body">
+            <div class="sku-chips" id="webEdgeChips"></div>
+            <div class="sku-custom hidden" id="webEdgeCustom">
+              <input id="webCustomEdge" type="number" min="640" max="3840" step="2" placeholder="640~3840" style="width:110px;min-width:100px" oninput="onWebCustomEdgeInput()">
+              <span style="font-size:12px;color:var(--muted)">px</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="sku-row">
+          <div class="sku-label">局域网 P2P 加速</div>
+          <div class="sku-body">
+            <div class="sku-chips" id="webP2pChips"></div>
+          </div>
+        </div>
+
+        <div class="sku-actions">
+          <span class="sku-preview" id="webDraftPreview">-</span>
+          <span class="row">
+            <button class="primary" id="btnApplyWeb" onclick="applyWebSkuSettings()">应用设置</button>
+            <button class="hidden" id="btnDiscardWeb" onclick="discardWebSkuEdits()">放弃修改</button>
+            <button class="warn" onclick="resetWebSkuSettings()">重置默认</button>
+          </span>
+        </div>
+      </div>
+      <div id="webScreenModeMsg" class="msg"></div>
+    </div>
+
+    <div class="card" id="virtualDisplayWindowCard">
+      <div class="row" style="justify-content:space-between;margin-bottom:10px">
+        <h3 style="margin:0">虚拟屏与窗口归位 <span id="vdCountBadge" class="badge info">0 块虚拟屏</span></h3>
+        <span class="row">
+          <button onclick="refreshDesktopWindows(true)">刷新窗口</button>
+          <button class="primary" onclick="applyWindowRulesNow()">立即执行规则</button>
+        </span>
+      </div>
+      <div id="windowRoutingUnsupportedHint" class="hidden" style="color:var(--warn);font-size:12px;margin-bottom:10px"></div>
+
+      <div style="border-top:1px solid var(--border);padding-top:10px;margin-bottom:12px">
+        <div class="row" style="justify-content:space-between;margin-bottom:8px">
+          <strong style="font-size:13px">临时虚拟屏</strong>
+          <span style="color:var(--muted);font-size:12px">当次有效，零编码开销，退出自动销毁</span>
+        </div>
+        <div class="row" style="margin-bottom:8px;flex-wrap:wrap">
+          <input id="newVdName" type="text" placeholder="名称，如 隐藏屏" style="width:180px">
+          <select id="newVdSize" style="background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:6px 10px;font-size:13px">
+            <option value="1280x720">1280×720</option>
+            <option value="1024x768">1024×768</option>
+            <option value="1440x900">1440×900</option>
+            <option value="1920x1080">1920×1080</option>
+          </select>
+          <button class="ok" id="btnCreateVd" onclick="createVirtualDisplay()">新建虚拟屏</button>
+        </div>
+        <div id="vdListBox" style="font-size:12px;color:var(--muted)">暂无临时虚拟屏</div>
+        <div id="vdActionMsg" class="msg"></div>
+      </div>
+
+      <div style="border-top:1px solid var(--border);padding-top:10px;margin-bottom:12px">
+        <div class="row" style="justify-content:space-between;margin-bottom:8px">
+          <strong style="font-size:13px">自动归位规则 <span id="windowRuleCountBadge" class="badge info">0</span></strong>
+          <span style="color:var(--muted);font-size:12px">持久化到 idis.yaml，支持按应用与悬浮窗过滤</span>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>状态</th><th>匹配条件</th><th>目标屏幕</th><th>落位</th><th>操作</th></tr></thead>
+            <tbody id="windowRulesBody"></tbody>
+          </table>
+        </div>
+        <div id="windowRuleMsg" class="msg"></div>
+      </div>
+
+      <div style="border-top:1px solid var(--border);padding-top:10px">
+        <div class="row" style="justify-content:space-between;margin-bottom:8px;flex-wrap:wrap">
+          <strong style="font-size:13px">当前桌面窗口 <span id="desktopWinCountBadge" class="badge info">0</span></strong>
+          <span class="row">
+            <input id="windowFilterText" type="text" placeholder="筛选应用或标题，如悬浮控件" style="width:190px" oninput="renderDesktopWindowsTable()">
+            <label style="display:inline-flex;align-items:center;gap:5px;font-size:12px;color:var(--muted);cursor:pointer">
+              <input id="windowFloatingOnlyFilter" type="checkbox" onchange="renderDesktopWindowsTable()">
+              <span>仅悬浮窗</span>
+            </label>
+          </span>
+        </div>
+        <div class="table-wrap" style="max-height:260px;overflow:auto">
+          <table>
+            <thead><tr><th>应用 / 窗口</th><th>当前屏幕</th><th>目标屏幕</th><th>落位</th><th>操作</th></tr></thead>
+            <tbody id="desktopWindowsBody"></tbody>
+          </table>
+        </div>
+        <div id="desktopWinMsg" class="msg"></div>
+      </div>
+    </div>
+
+    <details class="card" open>
+      <summary>
+        <span class="summary-title">当前动态配置启动命令</span>
+        <span class="row" onclick="event.stopPropagation()">
+          <label style="display:inline-flex;align-items:center;gap:5px;font-weight:400;font-size:12px;color:var(--muted);cursor:pointer">
+            <input id="cliIncludeToken" type="checkbox" checked onchange="renderCliCommand()">
+            <span>包含观看口令</span>
+          </label>
+          <label style="display:inline-flex;align-items:center;gap:5px;font-weight:400;font-size:12px;color:var(--muted);cursor:pointer">
+            <input id="cliShowAll" type="checkbox" onchange="renderCliCommand()">
+            <span>展开默认值</span>
+          </label>
+          <label style="display:inline-flex;align-items:center;gap:5px;font-weight:400;font-size:12px;color:var(--muted);cursor:pointer">
+            <input id="cliMultiline" type="checkbox" onchange="renderCliCommand()">
+            <span>多行格式</span>
+          </label>
+          <button class="primary" onclick="copyCliCommand()">复制启动命令</button>
+        </span>
+      </summary>
+      <pre class="log-box" id="cliCmdBox" style="max-height:160px;margin:0;user-select:all">加载中...</pre>
+      <div id="cliCmdHint" style="color:var(--muted);font-size:12px;margin-top:6px"></div>
+      <div id="cliCmdMsg" class="msg"></div>
+    </details>
+
+    <details class="card" id="configCard" ontoggle="if(this.open && !configLoadedOnce)loadConfigYaml(false)">
+      <summary>
+        <span class="summary-title">配置文件 <span id="configDirtyBadge" class="badge warn hidden">未保存</span></span>
+        <span style="color:var(--muted);font-size:12px;font-weight:400" id="configFilePath">~/.config/idis.yaml</span>
+      </summary>
+      <div class="row" style="justify-content:space-between;margin-bottom:8px">
+        <span style="color:var(--muted);font-size:12px">统一存储全局连接偏好、画质配置及受信设备记录</span>
+        <span class="row">
+          <button class="primary" id="btnSaveConfigYaml" onclick="saveConfigYaml()">保存并应用</button>
+          <button onclick="syncConfigYamlFromHost(this)">同步当前配置</button>
+          <button onclick="reloadConfigYamlFromDisk(this)">从磁盘重载</button>
+          <button onclick="downloadConfigYaml()">导出 YAML</button>
+          <button onclick="triggerImportConfigYaml()">导入 YAML</button>
+          <button class="warn" onclick="confirmDanger(this, '确认重置偏好？', resetConfigYaml)">重置偏好</button>
+          <input id="configImportInput" type="file" accept=".yaml,.yml,text/yaml,text/plain" class="hidden" onchange="handleImportConfigYaml(event)">
+        </span>
+      </div>
+      <textarea id="configYamlEditor" spellcheck="false" style="width:100%;min-height:280px;background:#010409;color:var(--text);border:1px solid var(--border);border-radius:6px;padding:10px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;line-height:1.5;resize:vertical" oninput="onConfigYamlInput()" onkeydown="handleYamlTab(event)" placeholder="展开后自动加载 ~/.config/idis.yaml"></textarea>
+      <div id="configYamlMsg" class="msg"></div>
+    </details>
+
+    <details class="card">
+      <summary>
+        <span class="summary-title">受信设备 <span id="trustedCountBadge" class="badge info">0</span></span>
+        <span style="color:var(--muted);font-size:12px;font-weight:400" id="trustFilePath"></span>
+      </summary>
+      <div class="row" style="margin-bottom:12px">
+        <input id="addFingerprint" type="text" placeholder="设备指纹，如 fp:a1b2c3d4e5f60718293a4b5c">
+        <input id="addName" type="text" placeholder="备注名称，如 My iPad">
+        <button class="ok" onclick="addTrusted()">添加受信设备</button>
+      </div>
+      <div id="trustMsg" class="msg"></div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>设备指纹</th><th>名称</th><th>型号</th><th>独立偏好</th><th>操作</th></tr></thead>
+          <tbody id="trustedBody"></tbody>
+        </table>
+      </div>
+    </details>
+
+    <details class="card">
+      <summary>
+        <span class="summary-title">近期日志 <span id="logCountBadge" class="badge info">0</span></span>
+        <span style="color:var(--muted);font-size:12px;font-weight:400">点击展开查看实时运行日志</span>
+      </summary>
+      <div class="log-box" id="logBox"></div>
+    </details>
+  </section>
+</main>
+<div class="toast-stack" id="toastStack" aria-live="polite"></div>
+
+<script>
+let currentTab = 'admin';
+let authStatus = { admin_logged_in: false, viewer_logged_in: false, viewer_enabled: false };
+let adminPollTimer = null;
+let adminPollMs = 2000;
+let adminRefreshSeq = 0;
+let lastAllowInput = false;
+let lastLowPower = false;
+let lastWebIndependent = false;
+let lastP2pRelayEnabled = true;
+let supportsWebIndependent = false;
+let lastConnSig = '';
+let lastConnData = null;
+let lastAdminState = null;
+let qrIncludeViewToken = true;
+let videoFormDirty = false;
+let webFormDirty = false;
+let configDirty = false;
+let configLoadedOnce = false;
+let lastConfigPath = '';
+let lastTrustedSig = '';
+let lastHostStatsSig = '';
+let lastPendingSig = '';
+let lastSessionsSig = '';
+let lastViewersSig = '';
+let lastIpadSkuSig = '';
+let lastWebSkuSig = '';
+let lastPresetsSig = '';
+let ipadDraft = null;
+let ipadServerBaseline = null;
+let webDraft = null;
+let webServerBaseline = null;
+let lastNativeDims = { w: 1024, h: 768, connected: false };
+let lastSupportsHidpi = true;
+let lastSupportsLiveAbr = true;
+let lastWebScreenMode = 'follow_ipad';
+let lastLogText = '';
+function debugTrace(event, data = {}) {
+  if (!authStatus || !(authStatus.debug_trace_active ?? authStatus.debug_enabled)) return;
+  try {
+    fetch('/api/debug/event', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ event, data }),
+      keepalive: true,
+    }).catch(() => {});
+  } catch (_) {}
+}
+
+function esc(s) {
+  return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+async function api(url, opts = {}) {
+  try {
+    const res = await fetch(url, {
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json', ...(opts.headers || {}) },
+      ...opts,
+    });
+    const data = await res.json().catch(() => ({}));
+    return { ok: res.ok, status: res.status, networkError: false, data };
+  } catch (e) {
+    return { ok: false, status: 0, networkError: true, data: { error: '无法连接服务器' } };
+  }
+}
+
+async function checkAuth() {
+  const r = await api('/api/auth/status');
+  if (r.networkError) return;
+  if (r.ok) {
+    authStatus = r.data;
+    if (typeof authStatus.web_independent_screen === 'boolean') {
+      lastWebIndependent = authStatus.web_independent_screen;
+    }
+    if (typeof authStatus.supports_independent_web_screen === 'boolean') {
+      supportsWebIndependent = authStatus.supports_independent_web_screen;
+    }
+  }
+  const dbgBadge = document.getElementById('hdrDebugBadge');
+  if (dbgBadge) {
+    dbgBadge.classList.toggle('hidden', !(authStatus.debug_logging_enabled ?? authStatus.debug_enabled));
+    if (authStatus.debug_log_path) dbgBadge.title = '调试日志：' + authStatus.debug_log_path;
+  }
+  renderView();
+}
+function showToast(text, kind = 'info') {
+  const stack = document.getElementById('toastStack');
+  if (!stack || !text) return;
+  const el = document.createElement('div');
+  el.className = 'toast ' + kind;
+  el.textContent = text;
+  stack.appendChild(el);
+  while (stack.children.length > 3) stack.removeChild(stack.firstChild);
+  setTimeout(() => {
+    el.style.transition = 'opacity .2s';
+    el.style.opacity = '0';
+    setTimeout(() => { if (el.parentNode) el.parentNode.removeChild(el); }, 220);
+  }, 2600);
+}
+
+function confirmDanger(btn, confirmLabel, fn) {
+  if (!btn) { fn(); return; }
+  const restoreClass = () => {
+    btn.classList.remove('warn', 'danger');
+    if (btn.dataset.origCls) btn.classList.add(btn.dataset.origCls);
+  };
+  if (btn.dataset.armed === '1') {
+    if (btn._armTimer) { clearTimeout(btn._armTimer); btn._armTimer = null; }
+    btn.dataset.armed = '0';
+    btn.textContent = btn.dataset.origLabel || btn.textContent;
+    restoreClass();
+    fn();
+    return;
+  }
+  btn.dataset.origLabel = btn.textContent;
+  btn.dataset.origCls = btn.classList.contains('warn') ? 'warn' : (btn.classList.contains('danger') ? 'danger' : '');
+  btn.dataset.armed = '1';
+  btn.textContent = confirmLabel;
+  btn.classList.remove('danger');
+  btn.classList.add('warn');
+  btn._armTimer = setTimeout(() => {
+    btn.dataset.armed = '0';
+    btn.textContent = btn.dataset.origLabel || btn.textContent;
+    restoreClass();
+    btn._armTimer = null;
+  }, 3000);
+}
+
+
+function renderView() {
+  document.getElementById('secAdminLogin').classList.add('hidden');
+  document.getElementById('secAdminDash').classList.add('hidden');
+  if (adminPollTimer) { clearInterval(adminPollTimer); adminPollTimer = null; }
+  if (authStatus.admin_logged_in) {
+    document.getElementById('secAdminDash').classList.remove('hidden');
+    const logoutBtn = document.getElementById('btnAdminLogout');
+    if (logoutBtn) logoutBtn.classList.toggle('hidden', authStatus.admin_auth_required === false);
+    refreshAdmin();
+    adminPollMs = lastLowPower ? 5000 : 2000;
+    adminPollTimer = setInterval(refreshAdmin, adminPollMs);
+  } else {
+    document.getElementById('secAdminLogin').classList.remove('hidden');
+  }
+}
+async function adminLogin() {
+  const token = document.getElementById('adminTokenInput').value;
+  const msg = document.getElementById('adminLoginMsg');
+  const r = await api('/api/admin/login', { method: 'POST', body: JSON.stringify({ token }) });
+  if (r.ok) {
+    document.getElementById('adminTokenInput').value = '';
+    msg.textContent = '';
+    await checkAuth();
+  } else {
+    msg.className = 'msg err';
+    msg.textContent = r.data.error || '登录失败';
+  }
+}
+
+async function adminLogout() {
+  await api('/api/admin/logout', { method: 'POST', body: '{}' });
+  await checkAuth();
+}
+
+
+function copyText(text) {
+  const done = () => showToast('已复制到剪贴板', 'ok');
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(done).catch(() => fallbackCopy(text, done));
+  } else {
+    fallbackCopy(text, done);
+  }
+}
+
+function fallbackCopy(text, done) {
+  const ta = document.createElement('textarea');
+  ta.value = text;
+  ta.readOnly = true;
+  ta.style.position = 'fixed';
+  ta.style.opacity = '0';
+  document.body.appendChild(ta);
+  ta.focus();
+  ta.setSelectionRange(0, text.length);
+  try {
+    if (document.execCommand('copy')) done();
+  } catch (_) {}
+  document.body.removeChild(ta);
+}
+
+function toggleQrViewToken() {
+  qrIncludeViewToken = !qrIncludeViewToken;
+  lastConnSig = '';
+  if (lastConnData) {
+    renderConnectionGuide(
+      lastConnData,
+      lastAdminState && lastAdminState.settings ? lastAdminState.settings.max_web_viewers : undefined
+    );
+  }
+}
+
+function fmtIdleCountdown(secs) {
+  if (secs === null || secs === undefined) return '';
+  const n = Math.max(0, Math.floor(Number(secs)));
+  if (n >= 60) {
+    const m = Math.floor(n / 60);
+    const s = n % 60;
+    return s > 0 ? `${m}分${s}秒` : `${m}分钟`;
+  }
+  return `${n}秒`;
+}
+
+function renderConnectionGuide(conn, maxWebViewers, lowPower = lastLowPower) {
+  if (!conn) return;
+  lastConnData = conn;
+  const webViewDisabled = (maxWebViewers === 0);
+  const effLowPower = !!lowPower;
+  const viewerListening = !!conn.web_viewer_listening;
+  const sig = JSON.stringify([
+    conn.lan_ips, conn.wifi_enabled, conn.wifi_endpoints, conn.wifi_data_port,
+    conn.web_bind, conn.web_localhost_only, conn.web_viewer_bind, conn.web_viewer_port,
+    viewerListening, conn.web_viewer_urls, conn.web_viewer_token_urls,
+    conn.port_idle_close_secs, conn.wifi_idle_remaining_secs, conn.web_viewer_idle_remaining_secs,
+    qrIncludeViewToken, webViewDisabled, effLowPower
+  ]);
+  if (sig === lastConnSig) return;
+  lastConnSig = sig;
+
+  const ipSummary = document.getElementById('lanIpsSummary');
+  ipSummary.textContent = conn.lan_ips && conn.lan_ips.length
+    ? ('本机局域网 IP：' + conn.lan_ips.join(' / '))
+    : '未检测到局域网 IPv4（仅本机/USB）';
+
+  // Card 1: Web Viewer /view?token=xxx links + Viewer QR code (never displays Admin URL)
+  const viewerUrls = conn.web_viewer_urls || [];
+  const tokenUrls = conn.web_viewer_token_urls || [];
+  const hasTokenUrls = viewerListening && tokenUrls.length > 0;
+  const useTokenQr = hasTokenUrls && qrIncludeViewToken && !!conn.web_viewer_token_qr_svg;
+  const activeQrSvg = useTokenQr ? conn.web_viewer_token_qr_svg : conn.web_viewer_qr_svg;
+  const linksBox = document.getElementById('viewerLinksBox');
+  const qrSlot = document.getElementById('viewerQrSlot');
+  if (linksBox) {
+    const viewerIdleBadge = (viewerListening && conn.web_viewer_idle_remaining_secs !== null && conn.web_viewer_idle_remaining_secs !== undefined)
+      ? `<span class="badge info" title="当前无网页观众，超过设定空闲时间将自动关闭端口">空闲 ${esc(fmtIdleCountdown(conn.web_viewer_idle_remaining_secs))} 后关闭</span>`
+      : '';
+    const portBanner = viewerListening
+      ? `<div class="row" style="margin-bottom:8px;font-size:12px;gap:6px;flex-wrap:wrap">
+           <span class="badge ok">扩展屏端口已开启</span>
+           <code style="font-size:12px">${esc(conn.web_viewer_bind || ('0.0.0.0:' + (conn.web_viewer_port || '')))}</code>
+           ${viewerIdleBadge}
+           <button class="danger" style="padding:3px 9px;font-size:12px" onclick="closeWebViewerPort()">关闭端口</button>
+           <span style="color:var(--muted)">与管理端 <code>${esc(conn.web_bind || '127.0.0.1:8787')}</code> 端口隔离</span>
+         </div>`
+      : `<div class="row" style="margin-bottom:8px;font-size:12px;gap:6px;flex-wrap:wrap">
+           <span class="badge warn">扩展屏端口已关闭</span>
+           <span style="color:var(--muted)">管理端仅监听 <code>${esc(conn.web_bind || '127.0.0.1:8787')}</code>；开启网页观看并配置口令后将自动开启 <code>0.0.0.0</code> 随机端口</span>
+         </div>`;
+    const webCapWarn = webViewDisabled
+      ? (effLowPower
+        ? `<div style="background:rgba(245,158,11,0.12);border:1px solid rgba(245,158,11,0.35);border-radius:8px;padding:8px 10px;margin-bottom:8px;font-size:12px;color:var(--warn)">
+             当前处于低电量模式，网页观看已自动暂停，独立观看端口已关闭（退出低电量模式后将自动恢复）。
+           </div>`
+        : `<div style="background:rgba(245,158,11,0.12);border:1px solid rgba(245,158,11,0.35);border-radius:8px;padding:8px 10px;margin-bottom:8px;font-size:12px;color:var(--warn);display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap">
+             <span>当前网页观看上限为 0（已关闭网页扩展屏及随机端口）。</span>
+             <button class="ok" style="padding:4px 10px;font-size:12px" onclick="enableWebViewingQuick()">一键允许观看（上限设为 1）</button>
+           </div>`)
+      : '';
+    if (hasTokenUrls) {
+      linksBox.innerHTML = `
+        ${portBanner}
+        ${webCapWarn}
+        <div class="label" style="margin-bottom:4px">直达观看链接（扫码或打开即免密观看）：</div>
+        ${tokenUrls.map(u => `
+          <div class="conn-ep">
+            <code>${esc(u)}</code>
+            <button class="ok" data-copy="${esc(u)}" onclick="copyText(this.dataset.copy)">复制链接</button>
+            <a class="btn-link" href="${esc(u)}" target="_blank" rel="noopener">打开</a>
+          </div>
+        `).join('')}
+      `;
+    } else if (viewerListening && viewerUrls.length > 0) {
+      linksBox.innerHTML = `
+        ${portBanner}
+        ${webCapWarn}
+        <div style="color:var(--muted);font-size:12px;margin-bottom:6px">
+          尚未配置观看口令。请在上方输入自定义口令或点击「随机生成」，自动生成 <code>/view?token=xxx</code> 直达链接与观看二维码。
+        </div>
+        ${viewerUrls.map(u => `
+          <div class="conn-ep">
+            <code style="color:var(--muted)">${esc(u)}</code>
+            <button data-copy="${esc(u)}" onclick="copyText(this.dataset.copy)">复制</button>
+          </div>
+        `).join('')}
+      `;
+    } else {
+      linksBox.innerHTML = `
+        ${portBanner}
+        ${webCapWarn}
+        <div style="color:var(--muted);font-size:12px;margin-bottom:6px">
+          ${webViewDisabled
+            ? '开启网页扩展屏并配置观看口令后，将自动在 <code>0.0.0.0</code> 上开启随机端口并生成局域网直达链接与二维码。'
+            : '尚未配置观看口令。请在上方输入自定义口令或点击「随机生成」，自动开启 <code>0.0.0.0</code> 随机观看端口并生成 <code>/view?token=xxx</code> 链接与二维码。'}
+        </div>
+      `;
+    }
+  }
+  if (qrSlot) {
+    if (hasTokenUrls && activeQrSvg) {
+      qrSlot.innerHTML = `
+        <div class="qr-box" title="${useTokenQr ? '扫码免输口令直接观看扩展屏' : '扫码打开网页观看端（需手动输入口令）'}">${activeQrSvg}</div>
+        <div class="qr-caption">${useTokenQr ? '扫码直达观看（免输口令）' : '扫码打开 /view（需输口令）'}</div>
+        <button style="font-size:11px;padding:4px 8px" onclick="toggleQrViewToken()">${useTokenQr ? '隐藏二维码口令' : '恢复免密二维码'}</button>
+      `;
+    } else if (webViewDisabled && effLowPower) {
+      qrSlot.innerHTML = `
+        <div class="qr-box empty">
+          <span>低电量模式已暂停<br>独立观看端口已关闭</span>
+        </div>
+      `;
+    } else {
+      qrSlot.innerHTML = `
+        <div class="qr-box empty">
+          <span>配置观看口令后<br>开启随机端口并生成二维码</span>
+          <button class="ok" style="font-size:12px;padding:5px 10px" onclick="rotateViewToken()">一键生成</button>
+        </div>
+      `;
+    }
+  }
+
+  // Card 2: iPad Wi-Fi manual IP:port + QR + dynamic port switch
+  const wifiCard = document.getElementById('wifiConnCard');
+  if (wifiCard) {
+    if (conn.wifi_enabled) {
+      const eps = conn.wifi_endpoints || [];
+      const wifiIdleBadge = (conn.wifi_idle_remaining_secs !== null && conn.wifi_idle_remaining_secs !== undefined)
+        ? `<span class="badge info" title="当前无 Wi-Fi iPad 连接，超过设定空闲时间将自动关闭端口">空闲 ${esc(fmtIdleCountdown(conn.wifi_idle_remaining_secs))} 后关闭</span>`
+        : '';
+      wifiCard.innerHTML = `
+        <div class="conn-meta">
+          <div class="row" style="justify-content:space-between;margin-bottom:6px;flex-wrap:wrap;gap:6px">
+            <div class="row" style="gap:6px">
+              <div class="label" style="margin:0">iPad Wi-Fi 接入端口</div>
+              <span class="badge ok">端口已开启</span>
+              ${wifiIdleBadge}
+            </div>
+            <button class="danger" style="padding:3px 9px;font-size:12px" onclick="toggleWifiPort(false)">关闭端口</button>
+          </div>
+          ${eps.map(ep => `
+            <div class="conn-ep">
+              <code>${esc(ep)}</code>
+              <button data-copy="${esc(ep)}" onclick="copyText(this.dataset.copy)">复制</button>
+            </div>
+          `).join('')}
+          <div style="color:var(--muted);font-size:12px;margin-top:6px">
+            在兼容客户端中选择 Bonjour 主机，或手动填入上方 <code>IP:端口</code>（数据端口 <code>${conn.wifi_data_port || '-'}</code> 握手后自动下发）。
+          </div>
+        </div>
+        ${conn.wifi_qr_svg ? `<div class="qr-col"><div class="qr-box" title="iPad Wi-Fi 连接地址二维码">${conn.wifi_qr_svg}</div><div class="qr-caption">iPad Wi-Fi 连接码</div></div>` : ''}
+      `;
+    } else {
+      wifiCard.innerHTML = `
+        <div class="conn-meta">
+          <div class="row" style="justify-content:space-between;margin-bottom:6px;flex-wrap:wrap;gap:6px">
+            <div class="row" style="gap:6px">
+              <div class="label" style="margin:0">iPad Wi-Fi 接入端口</div>
+              <span class="badge warn">端口已关闭</span>
+            </div>
+            <button class="ok" style="padding:4px 10px;font-size:12px" onclick="toggleWifiPort(true)">开启 Wi-Fi 端口</button>
+          </div>
+          <div style="color:var(--muted);font-size:12px">
+            当前仅使用 USB 数据线连接，局域网 Wi-Fi 端口未监听。点击「开启 Wi-Fi 端口」即可动态开启并生成二维码（超时空闲将自动关闭）。
+          </div>
+        </div>
+      `;
+    }
+  }
+}
+
+async function refreshAdmin() {
+  const mySeq = ++adminRefreshSeq;
+  const r = await api('/api/admin/state');
+  if (mySeq !== adminRefreshSeq) return;
+  if (r.status === 401) {
+    authStatus.admin_logged_in = false;
+    renderView();
+    return;
+  }
+  if (!r.ok) return;
+  const d = r.data;
+  lastAdminState = d;
+  document.getElementById('hdrVersion').textContent = 'v' + d.host.version;
+
+  const maxExtTxt = d.settings.max_extended_screens === 0 ? '不限' : d.settings.max_extended_screens;
+  const maxWebTxt = d.settings.max_web_viewers === 0 ? '禁止' : d.settings.max_web_viewers;
+  const hostStatsSig = JSON.stringify([
+    d.host.host_name, d.host.os, d.host.arch, d.host.usb, d.host.wifi, d.host.mode,
+    d.host.idle_exit_secs,
+    d.settings.active_extended_screens, maxExtTxt, d.settings.active_web_viewers, maxWebTxt,
+  ]);
+  if (hostStatsSig !== lastHostStatsSig) {
+    lastHostStatsSig = hostStatsSig;
+    document.getElementById('hostStats').innerHTML = [
+      ['主机', `<div class="metric-lines"><div class="metric-line">${esc(d.host.host_name)}</div><div class="metric-line" style="color:var(--muted);font-weight:500;font-size:12px">${esc(d.host.os)} / ${esc(d.host.arch)}</div></div>`],
+      ['传输通道', `<div class="metric-lines"><div class="metric-line">${d.host.usb ? 'USB 已启' : 'USB 关闭'} · ${d.host.wifi ? 'Wi-Fi 已启' : 'Wi-Fi 关闭'}</div><div class="metric-line" style="color:var(--muted);font-weight:500;font-size:12px">模式 ${esc(d.host.mode)}</div></div>`],
+      ['连接概况', `<div class="metric-lines"><div class="metric-line">扩展屏 ${d.settings.active_extended_screens} / ${maxExtTxt}</div><div class="metric-line" style="color:var(--muted);font-weight:500;font-size:12px">网页观众 ${d.settings.active_web_viewers} / ${maxWebTxt}</div></div>`],
+      ['运行时长', `<div class="metric-lines"><div class="metric-line" data-uptime-val>${d.host.uptime_secs}s</div><div class="metric-line" style="color:var(--muted);font-weight:500;font-size:12px">空闲退出 ${d.host.idle_exit_secs ? d.host.idle_exit_secs + 's' : '关闭'}</div></div>`],
+    ].map(([k,v]) => `<div class="stat"><div class="label">${k}</div><div class="val">${v}</div></div>`).join('');
+  } else {
+    const upEl = document.querySelector('#hostStats [data-uptime-val]');
+    if (upEl) upEl.textContent = `${d.host.uptime_secs}s`;
+  }
+
+  lastLowPower = !!d.settings.low_power;
+  renderConnectionGuide(d.connection, d.settings.max_web_viewers, lastLowPower);
+
+  // Pending approvals (signature-diffed to preserve hover/click focus; ticking wait counters patched in-place)
+  const pCard = document.getElementById('pendingCard');
+  if (d.pending_approvals.length > 0) {
+    pCard.classList.remove('hidden');
+    document.getElementById('pendingCount').textContent = d.pending_approvals.length;
+    const pList = document.getElementById('pendingList');
+    const pendingSig = JSON.stringify(d.pending_approvals.map(p => [p.id, p.name, p.model, p.is_usb, p.is_web, p.addr, p.fingerprint]));
+    if (pendingSig !== lastPendingSig) {
+      lastPendingSig = pendingSig;
+      pList.innerHTML = d.pending_approvals.map(p => `
+        <div class="stat" style="margin-bottom:8px">
+          <div class="row" style="justify-content:space-between">
+            <div>
+              <strong>${esc(p.name)}</strong> (${esc(p.model)})
+              <span class="badge ${p.is_web ? 'ok' : 'info'}">${p.is_web ? '网页观看' : (p.is_usb ? 'USB' : 'Wi-Fi')}</span>
+              <div style="color:var(--muted);font-size:12px;margin-top:4px">
+                IP: <code>${esc(p.addr)}</code> · 指纹: <code>${esc(p.fingerprint || '-')}</code> · 等待 <span data-pending-wait="${p.id}">${p.waiting_secs}s</span>
+              </div>
+            </div>
+            <div class="row">
+              <button class="ok btn-decide-pending" data-id="${p.id}" data-decision="allow_and_trust">允许并信任</button>
+              <button class="warn btn-decide-pending" data-id="${p.id}" data-decision="allow_once">仅本次允许</button>
+              <button class="danger btn-decide-pending" data-id="${p.id}" data-decision="deny">拒绝</button>
+            </div>
+          </div>
+        </div>
+      `).join('');
+      pList.querySelectorAll('.btn-decide-pending').forEach(btn => {
+        btn.addEventListener('click', () => decidePending(Number(btn.dataset.id), btn.dataset.decision));
+      });
+    } else {
+      for (const p of d.pending_approvals) {
+        const wEl = pList.querySelector(`[data-pending-wait="${p.id}"]`);
+        if (wEl) wEl.textContent = `${p.waiting_secs}s`;
+      }
+    }
+  } else {
+    lastPendingSig = '';
+    pCard.classList.add('hidden');
+  }
+
+  // Active sessions (signature-diffed so 2s polling never clobbers armed buttons or focus)
+  const pendingByAddr = new Map();
+  for (const p of d.pending_approvals || []) {
+    if (p.is_web) continue;
+    // Keep the newest iPad slot for each address; never let a Web slot or stale slot shadow an iPad session.
+    pendingByAddr.set(p.addr, p);
+  }
+  const sb = document.getElementById('sessionsBody');
+  const sessionsSig = JSON.stringify((d.sessions || []).map(s => {
+    const p = !s.authorized ? pendingByAddr.get(s.key) : null;
+    return [s.id, s.key, s.name, s.model, s.transport, s.fingerprint, s.authorized, s.awaiting_confirm, s.streaming,
+      s.logical_width, s.logical_height, s.width, s.height, s.hidpi, s.is_pixel_exact,
+      s.in_flight, s.max_in_flight, s.dropped_frames, s.auto_max_in_flight,
+      s.abr && s.abr.enabled, s.abr && s.abr.tier, s.abr && s.abr.scale_pct, s.abr && s.abr.target_bitrate_mbps, s.abr && s.abr.rtt_ms, s.abr && s.abr.unfocused_fps_halved, s.abr && s.abr.target_fps,
+      p && p.id, p && p.fingerprint];
+  }));
+  if (sessionsSig !== lastSessionsSig && !sb.querySelector('[data-armed="1"]')) {
+    lastSessionsSig = sessionsSig;
+    sb.innerHTML = d.sessions.length ? d.sessions.map(s => {
+      const p = !s.authorized ? pendingByAddr.get(s.key) : null;
+      const dispName = s.name || (p ? p.name : '等待客户端握手');
+      const dispModel = s.model || (p ? p.model : '');
+      const statusBadge = s.streaming
+        ? '<span class="badge ok">推流中</span>'
+        : (s.authorized
+            ? '<span class="badge info">已认证</span>'
+            : (s.awaiting_confirm || p
+                ? '<span class="badge warn">待审批</span>'
+                : '<span class="badge warn">等待握手</span>'));
+      const actionBtns = p
+        ? `<div class="row">
+             <button class="ok btn-decide-pending" data-id="${p.id}" data-decision="allow_and_trust">允许并信任</button>
+             <button class="danger btn-decide-pending" data-id="${p.id}" data-decision="deny">拒绝</button>
+           </div>`
+        : `<button class="danger btn-disconnect-session" data-key="${esc(s.key)}">断开</button>`;
+      return `
+      <tr>
+        <td><strong>${esc(dispName)}</strong><div style="color:var(--muted);font-size:11px">${esc(dispModel)}</div></td>
+        <td><span class="badge info">${esc(s.transport.toUpperCase())}</span></td>
+        <td><code>${esc(s.key)}</code><div style="color:var(--muted);font-size:11px">${esc(s.fingerprint || (p && p.fingerprint) || '-')}</div></td>
+        <td>
+          ${s.logical_width ? `${s.logical_width}×${s.logical_height}` : (s.width ? `${s.width}×${s.height}` : '-')}
+          ${s.logical_width ? `<span class="badge ${s.hidpi >= 2 ? 'ok' : 'info'}" style="margin-left:4px">${s.hidpi >= 2 ? '2x HiDPI' : '1x'}</span>` : ''}
+          ${s.is_pixel_exact ? '<span class="badge ok" style="margin-left:4px">1:1 对齐</span>' : (s.width && s.logical_width ? '<span class="badge warn" style="margin-left:4px">非整数缩放</span>' : '')}
+          ${s.abr && s.abr.enabled && s.abr.tier > 0 ? `<span class="badge warn" style="margin-left:4px">ABR ${s.abr.scale_pct}%·${s.abr.target_bitrate_mbps}M</span>` : ''}
+          ${s.abr && s.abr.unfocused_fps_halved ? `<span class="badge info" style="margin-left:4px">失焦降帧 ${s.abr.target_fps}fps</span>` : ''}
+          ${(s.width && s.logical_width && (s.width !== s.logical_width || s.height !== s.logical_height)) ? `<div style="color:var(--muted);font-size:11px">推流 ${s.width}×${s.height}${s.abr && s.abr.rtt_ms != null ? ` · RTT ${s.abr.rtt_ms}ms` : ''}</div>` : (s.abr && s.abr.rtt_ms != null ? `<div style="color:var(--muted);font-size:11px">RTT ${s.abr.rtt_ms}ms</div>` : '')}
+        </td>
+        <td>${statusBadge}</td>
+        <td>${s.in_flight}/${s.max_in_flight || '∞'} · 丢 ${s.dropped_frames}${s.auto_max_in_flight ? ' <span class="badge ok">自动</span>' : ''}</td>
+        <td data-sess-idle="${s.id}">${s.idle_secs}s</td>
+        <td>${actionBtns}</td>
+      </tr>
+    `;
+    }).join('') : '<tr><td colspan="8" style="color:var(--muted)">暂无活跃远程设备</td></tr>';
+    sb.querySelectorAll('.btn-disconnect-session').forEach(btn => {
+      btn.addEventListener('click', () => disconnectSession(btn.dataset.key));
+    });
+    sb.querySelectorAll('.btn-decide-pending').forEach(btn => {
+      btn.addEventListener('click', () => decidePending(Number(btn.dataset.id), btn.dataset.decision));
+    });
+  } else {
+    for (const s of d.sessions || []) {
+      const iEl = sb.querySelector(`[data-sess-idle="${s.id}"]`);
+      if (iEl) iEl.textContent = `${s.idle_secs}s`;
+    }
+  }
+
+  // Update connection summary badges
+  const extBadge = document.getElementById('extScreensBadge');
+  if (extBadge) {
+    extBadge.textContent = `扩展屏 ${d.settings.active_extended_screens}/${d.settings.max_extended_screens || '∞'}`;
+  }
+  const webVBadge = document.getElementById('webViewersBadge');
+  if (webVBadge) {
+    const mw = d.settings.max_web_viewers;
+    webVBadge.className = 'badge ' + (mw === 0 ? 'warn' : 'info');
+    webVBadge.textContent = mw === 0 ? '网页观看：禁止 (0)' : `网页观众 ${d.settings.active_web_viewers}/${mw}`;
+  }
+
+  lastSupportsHidpi = d.host.supports_hidpi !== false;
+  lastSupportsLiveAbr = !d.host.capabilities || d.host.capabilities.live_abr_quality !== false;
+  supportsWebIndependent = !!d.host.supports_independent_web_screen;
+  lastWebScreenMode = d.settings.web_screen_mode || (d.settings.web_independent_screen ? 'independent' : 'follow_ipad');
+  lastWebIndependent = lastWebScreenMode === 'independent';
+  lastP2pRelayEnabled = d.settings.p2p_relay_enabled !== false;
+
+  // Detect connected iPad native resolution for dynamic integer-scale SKU options
+  const activeSess = (d.sessions || []).find(s => s.native_width >= 320 && s.native_height >= 240);
+  if (activeSess) {
+    lastNativeDims = {
+      w: Math.max(activeSess.native_width, activeSess.native_height) & ~1,
+      h: Math.min(activeSess.native_width, activeSess.native_height) & ~1,
+      connected: true,
+    };
+  } else {
+    lastNativeDims = { w: 1024, h: 768, connected: false };
+  }
+
+  // Basic security & runtime settings
+  lastAllowInput = !!d.settings.allow_input;
+  const ib = document.getElementById('inputBadge');
+  if (ib) {
+    ib.className = 'badge ' + (lastAllowInput ? 'warn' : 'ok');
+    ib.textContent = lastAllowInput ? '已允许输入' : '仅显示';
+  }
+  const idh = document.getElementById('inputDiagHint');
+  if (idh) {
+    const ist = d.settings.input_stats || {};
+    const caps = (d.host && d.host.capabilities) || {};
+    let msg = '';
+    if (lastAllowInput && caps.accessibility_permission_required && !caps.accessibility_granted) {
+      msg = '缺少系统辅助功能权限：远程键鼠输入会被系统拦截（升级版本或改用 launchd 后，请在「隐私与安全性 → 辅助功能」中移除并重新勾选 idis）';
+    } else if (!lastAllowInput && (ist.dropped_view_only || 0) > 0) {
+      msg = `已收到 ${ist.dropped_view_only} 条远程键鼠事件，但当前为「仅显示」模式，点击上方「切换」即可启用控制`;
+    } else if ((ist.dropped_no_permission || 0) > 0) {
+      msg = `已有 ${ist.dropped_no_permission} 条远程输入因缺少辅助功能权限被忽略`;
+    } else if ((ist.decode_errors || 0) > 0) {
+      msg = `有 ${ist.decode_errors} 条未知/解码失败的远程输入包，可开启调试日志排查`;
+    }
+    idh.textContent = msg;
+    idh.classList.toggle('hidden', !msg);
+  }
+  const nextLowPower = !!d.settings.low_power;
+  lastLowPower = nextLowPower;
+  const pol = d.polling || (d.settings && d.settings.polling) || null;
+  const targetAdminPollMs = (pol && pol.admin_poll_ms >= 500) ? pol.admin_poll_ms : (lastLowPower ? 5000 : 2000);
+  if (targetAdminPollMs !== adminPollMs) {
+    adminPollMs = targetAdminPollMs;
+    if (adminPollTimer) {
+      clearInterval(adminPollTimer);
+      adminPollTimer = setInterval(refreshAdmin, adminPollMs);
+    }
+  }
+  if (pol) {
+    const syncPollInput = (id, val) => {
+      const el = document.getElementById(id);
+      if (el && document.activeElement !== el && val !== undefined) el.value = val;
+    };
+    syncPollInput('pollMainLoopInput', pol.main_loop_ms);
+    syncPollInput('pollCursorInput', pol.cursor_poll_ms);
+    syncPollInput('pollUsbRetryInput', pol.usb_retry_ms);
+    syncPollInput('pollAdminInput', pol.admin_poll_ms);
+  }
+  const lpb = document.getElementById('lowPowerBadge');
+  if (lpb) {
+    lpb.className = 'badge ' + (lastLowPower ? 'ok' : 'info');
+    lpb.textContent = lastLowPower ? '已开启' : '关闭';
+  }
+  const maxExtInp = document.getElementById('maxExtInput');
+  if (maxExtInp && document.activeElement !== maxExtInp) {
+    maxExtInp.value = d.settings.max_extended_screens;
+  }
+  const lockIpadSel = document.getElementById('lockActionIpadSel');
+  if (lockIpadSel && d.settings.lock_action_ipad && document.activeElement !== lockIpadSel) {
+    lockIpadSel.value = d.settings.lock_action_ipad;
+  }
+  const lockWebSel = document.getElementById('lockActionWebSel');
+  if (lockWebSel && d.settings.lock_action_web && document.activeElement !== lockWebSel) {
+    lockWebSel.value = d.settings.lock_action_web;
+  }
+  const lockDelayInp = document.getElementById('lockDelayInput');
+  if (lockDelayInp && d.settings.lock_delay_secs !== undefined && document.activeElement !== lockDelayInp) {
+    lockDelayInp.value = d.settings.lock_delay_secs;
+  }
+  const portIdleInp = document.getElementById('portIdleCloseInput');
+  if (portIdleInp && d.settings.port_idle_close_secs !== undefined && document.activeElement !== portIdleInp) {
+    portIdleInp.value = d.settings.port_idle_close_secs;
+  }
+  const lockDelayWrap = document.getElementById('lockDelayWrap');
+  if (lockDelayWrap) {
+    const bothKeep = d.settings.lock_action_ipad === 'keep' && d.settings.lock_action_web === 'keep';
+    lockDelayWrap.classList.toggle('hidden', bothKeep);
+  }
+  const lockSupported = !d.host.capabilities || d.host.capabilities.screen_lock_detection !== false;
+  const lockControls = document.getElementById('lockPolicyControls');
+  const lockHint = document.getElementById('lockPolicyUnsupportedHint');
+  if (lockControls) lockControls.classList.toggle('hidden', !lockSupported);
+  if (lockHint) lockHint.classList.toggle('hidden', lockSupported);
+
+  const lockBadge = document.getElementById('hostLockBadge');
+  if (lockBadge) {
+    lockBadge.classList.toggle('hidden', !d.settings.host_screen_locked);
+    lockBadge.textContent = d.settings.host_lock_enforced ? '主机已锁屏（策略已生效）' : '主机已锁屏（延迟计时中）';
+  }
+
+  const vb = document.getElementById('viewTokenBadge');
+  if (vb) {
+    vb.className = 'badge ' + (d.settings.view_token_enabled ? 'ok' : 'err');
+    vb.textContent = d.settings.view_token_enabled ? ('已开启 · ' + (d.settings.view_token || '')) : '未配置';
+  }
+  const btnDisableVt = document.getElementById('btnDisableViewToken');
+  if (btnDisableVt) btnDisableVt.classList.toggle('hidden', !d.settings.view_token_enabled);
+
+  // Sync Web mode summary badge & hint
+  const wmb = document.getElementById('webScreenModeBadge');
+  const wHint = document.getElementById('webScreenModeHint');
+  if (wmb && d.video) {
+    const v = d.video;
+    const vwTxt = d.settings.max_web_viewers === 0 ? '禁止观看(0)' : `上限${d.settings.max_web_viewers}人`;
+    const mTxt = lastWebScreenMode === 'main' ? '主屏幕' : (lastWebScreenMode === 'independent' ? '独立屏' : '跟随iPad');
+    const apTxt = d.settings.web_require_approval ? ' · 需审批' : '';
+    wmb.className = 'badge ' + (d.settings.max_web_viewers === 0 ? 'warn' : (lastWebScreenMode !== 'follow_ipad' ? 'ok' : 'info'));
+    wmb.textContent = `${mTxt} · ${vwTxt}${apTxt} · ${v.web_width}×${v.web_height} · ${v.web_fps}fps · ${v.web_bitrate_mbps}M · ${v.web_hidpi}x`;
+  }
+  if (wHint) {
+    const wsInfo = d.web_screen || {};
+    let statusTxt = '当前无网页观众（打开 /view 时按所选屏幕来源生效）。';
+    if (wsInfo.active && wsInfo.source === 'main') {
+      statusTxt = `当前网页正在观看电脑主屏幕（${wsInfo.width}×${wsInfo.height}，支持全平台，与 iPad 互不干扰）。`;
+    } else if (wsInfo.active && wsInfo.source === 'standalone') {
+      statusTxt = `当前网页正在独立虚拟屏推流（${wsInfo.width}×${wsInfo.height}，与 iPad 互不干扰）。`;
+    } else if (wsInfo.active && wsInfo.source === 'ipad') {
+      statusTxt = `当前网页正在跟随 iPad 屏幕（${wsInfo.width}×${wsInfo.height}）。`;
+    } else if (lastWebScreenMode === 'main') {
+      statusTxt = '已配置观看电脑主屏幕（有观众进入 /view 时实时采集主机主屏，不占用虚拟扩展屏配额）。';
+    } else if (!supportsWebIndependent) {
+      statusTxt = '当前平台支持「跟随 iPad」与「电脑主屏幕」；独立虚拟扩展屏仅 macOS Extend 模式支持。';
+    }
+    if (d.settings.max_web_viewers === 0) {
+      statusTxt += ' 当前网页观看人数上限为 0（禁止观看），请在下方调整观看上限后点击应用。';
+    }
+    wHint.textContent = statusTxt;
+  }
+
+  // Sync iPad & Web SKU forms when not dirty (signature-diffed to avoid 2s DOM churn)
+  if (d.video) {
+    const v = d.video;
+    const resText = (v.width && v.height) ? `${v.width}×${v.height}` : '自动';
+    const edgeTag = v.max_pixel_edge ? ` · 推流≤${v.max_pixel_edge}px` : '';
+    const mifTag = d.settings.auto_max_in_flight !== false ? ' · 在途自动' : ` · 在途${d.settings.max_in_flight}`;
+    const abrTag = (v.adaptive_quality && lastSupportsLiveAbr) ? ' · ABR' : '';
+    const curTag = d.settings.client_cursor ? ' · 客户端鼠标' : '';
+    const focusTag = v.half_fps_when_unfocused ? ' · 失焦降帧' : '';
+    document.getElementById('videoSummaryBadge').textContent = `${resText} · ${v.fps}fps · ${v.bitrate_mbps}Mbps · ${v.hidpi}x${edgeTag}${mifTag}${abrTag}${curTag}${focusTag}`;
+    if (!videoFormDirty) {
+      syncIpadDraftFromServer(d);
+      const ipadSig = JSON.stringify([ipadDraft, lastNativeDims, lastSupportsHidpi, lastSupportsLiveAbr]);
+      if (ipadSig !== lastIpadSkuSig) {
+        lastIpadSkuSig = ipadSig;
+        renderIpadSkuForm();
+      }
+    }
+    if (!webFormDirty) {
+      syncWebDraftFromServer(d);
+      const webSig = JSON.stringify([webDraft, supportsWebIndependent, lastSupportsHidpi]);
+      if (webSig !== lastWebSkuSig) {
+        lastWebSkuSig = webSig;
+        renderWebSkuForm();
+      }
+    }
+  }
+
+  // Viewers & LAN P2P relay summary
+  renderVirtualDisplaysAndRules(d);
+  const p2pInfo = d.web_p2p || {};
+  const p2pBadge = document.getElementById('p2pSummaryBadge');
+  if (p2pBadge) {
+    const muxTotal = (p2pInfo.mux_hits || 0) + (p2pInfo.mux_misses || 0);
+    const hitTxt = muxTotal > 0 ? ` · 共享封装省 ${Math.round(((p2pInfo.mux_hits || 0) * 100) / muxTotal)}% 重复封装` : '';
+    if (!lastP2pRelayEnabled) {
+      p2pBadge.className = 'badge warn';
+      p2pBadge.textContent = `P2P 已关闭 · 纯 WS 零拷贝${hitTxt}`;
+    } else if (p2pInfo.p2p_viewers > 0) {
+      p2pBadge.className = 'badge ok';
+      p2pBadge.textContent = `P2P 加速中 · 主机直推 ${p2pInfo.direct_viewers}/${p2pInfo.total_viewers} 路 · 省 ${p2pInfo.bandwidth_saved_pct}% 上行`;
+    } else if ((p2pInfo.total_viewers || 0) >= 2 && p2pInfo.inactive_reason) {
+      p2pBadge.className = 'badge warn';
+      p2pBadge.textContent = `P2P 未激活（${p2pInfo.inactive_reason}）${hitTxt}`;
+    } else {
+      p2pBadge.className = 'badge info';
+      p2pBadge.textContent = `P2P 已就绪 · ≥2 人自动接力${hitTxt}`;
+    }
+  }
+  const vbody = document.getElementById('viewersBody');
+  const viewersSig = JSON.stringify((d.web_viewers || []).map(v => [
+    v.id, v.peer, v.fingerprint, v.label, v.p2p_active, v.p2p_parent_id, v.p2p_children,
+    v.p2p_supported, v.p2p_can_relay, v.p2p_fallback_reason,
+  ]));
+  if (viewersSig !== lastViewersSig && !vbody.querySelector('[data-armed="1"]')) {
+    lastViewersSig = viewersSig;
+    vbody.innerHTML = d.web_viewers.length ? d.web_viewers.map(v => {
+      let p2pTag = '<span class="badge info">WS 直连</span>';
+      if (v.p2p_active && v.p2p_children > 0) {
+        p2pTag = `<span class="badge ok">P2P 接力 (← #${v.p2p_parent_id} · 中继 ${v.p2p_children} 人)</span>`;
+      } else if (v.p2p_active) {
+        p2pTag = `<span class="badge ok">P2P 加速 (← #${v.p2p_parent_id})</span>`;
+      } else if (v.p2p_children > 0) {
+        p2pTag = `<span class="badge info">直连根 · 中继 ${v.p2p_children} 人</span>`;
+      } else if (v.p2p_parent_id) {
+        p2pTag = `<span class="badge warn">P2P 握手中 (→ #${v.p2p_parent_id})</span>`;
+      } else if (v.p2p_fallback_reason) {
+        p2pTag = `<span class="badge warn">WS 直连 (${esc(v.p2p_fallback_reason)})</span>`;
+      } else if (v.p2p_supported === false) {
+        p2pTag = '<span class="badge">WS 直连 (无 WebRTC)</span>';
+      } else if (v.p2p_can_relay === false) {
+        p2pTag = '<span class="badge info">WS 直连 (后台/仅接收)</span>';
+      }
+      return `
+      <tr>
+        <td>#${v.id}</td>
+        <td><code>${esc(v.peer)}</code>${v.label || v.fingerprint ? `<div style="color:var(--muted);font-size:11px">${esc(v.label || '')}${v.fingerprint ? ` · <code>${esc(v.fingerprint)}</code>` : ''}</div>` : ''}</td>
+        <td>${p2pTag}</td>
+        <td data-viewer-conn="${v.id}">${v.connected_secs}s</td>
+        <td><button class="danger btn-kick-viewer" data-id="${v.id}">踢出</button></td>
+      </tr>
+    `;
+    }).join('') : '<tr><td colspan="5" style="color:var(--muted)">暂无在线网页观众</td></tr>';
+    vbody.querySelectorAll('.btn-kick-viewer').forEach(btn => {
+      btn.addEventListener('click', () => kickViewer(Number(btn.dataset.id)));
+    });
+  } else {
+    for (const v of d.web_viewers || []) {
+      const cEl = vbody.querySelector(`[data-viewer-conn="${v.id}"]`);
+      if (cEl) cEl.textContent = `${v.connected_secs}s`;
+    }
+  }
+
+  // Configuration presets (signature-diffed with armed-button guard)
+  const activePresetBadge = document.getElementById('activePresetBadge');
+  if (activePresetBadge) {
+    activePresetBadge.textContent = d.active_preset ? `当前：${d.active_preset}` : '自定义';
+    activePresetBadge.className = 'badge ' + (d.active_preset ? 'ok' : 'info');
+  }
+  const pGrid = document.getElementById('presetsGrid');
+  if (pGrid) {
+    const customList = d.presets || [];
+    const customNames = new Set(customList.map(p => p.name));
+    const mergedPresets = [
+      ...customList.map(p => ({ ...p, _custom: true })),
+      ...(d.builtin_presets || []).filter(p => !customNames.has(p.name)).map(p => ({ ...p, _custom: false })),
+    ];
+    const presetsSig = JSON.stringify([d.active_preset || '', mergedPresets]);
+    if (presetsSig !== lastPresetsSig && !pGrid.querySelector('[data-armed="1"]')) {
+      lastPresetsSig = presetsSig;
+      pGrid.innerHTML = mergedPresets.map(p => {
+        const isActive = d.active_preset === p.name;
+        const ipadTxt = `${p.ipad.fps}fps / ${p.ipad.bitrate_mbps}M · ${p.ipad.hidpi}x`;
+        const webTxt = p.max_web_viewers === 0 ? '网页禁止' : `网页${p.max_web_viewers}人`;
+        const pollTxt = `轮询 ${p.polling.main_loop_ms}/${p.polling.cursor_poll_ms}/${p.polling.usb_retry_ms}/${p.polling.admin_poll_ms}ms`;
+        const tags = [
+          p._custom ? '<span class="badge info">自定义</span>' : '<span class="badge">内置</span>',
+          p.low_power ? '<span class="badge ok">低电量</span>' : '',
+          p.allow_input ? '<span class="badge warn">允许输入</span>' : '',
+          isActive ? '<span class="badge ok">已生效</span>' : '',
+        ].filter(Boolean).join(' ');
+        return `
+          <div class="stat" style="display:flex;flex-direction:column;justify-content:space-between;gap:8px;${isActive ? 'border-color:var(--ok)' : ''}">
+            <div>
+              <div class="row" style="justify-content:space-between;gap:6px">
+                <strong>${esc(p.name)}</strong>
+                <span class="row" style="gap:4px">${tags}</span>
+              </div>
+              <div style="color:var(--muted);font-size:12px;margin-top:6px;line-height:1.5">
+                iPad ${esc(ipadTxt)} · ${esc(webTxt)}<br>${esc(pollTxt)}
+              </div>
+            </div>
+            <div class="row" style="justify-content:flex-end;gap:6px">
+              <button class="${isActive ? 'ok' : 'primary'} btn-apply-preset" data-name="${esc(p.name)}">应用</button>
+              ${p._custom ? `<button class="btn-update-preset" data-name="${esc(p.name)}">覆盖更新</button>` : ''}
+              ${p._custom ? `<button class="danger btn-delete-preset" data-name="${esc(p.name)}">删除</button>` : ''}
+            </div>
+          </div>
+        `;
+      }).join('');
+      pGrid.querySelectorAll('.btn-apply-preset').forEach(btn => {
+        btn.addEventListener('click', () => applyConfigPreset(btn.dataset.name));
+      });
+      pGrid.querySelectorAll('.btn-update-preset').forEach(btn => {
+        btn.addEventListener('click', () => savePresetByName(btn.dataset.name, true));
+      });
+      pGrid.querySelectorAll('.btn-delete-preset').forEach(btn => {
+        btn.addEventListener('click', () => {
+          confirmDanger(btn, '确认删除？', () => deleteConfigPreset(btn.dataset.name));
+        });
+      });
+    }
+  }
+
+  // Trusted devices (use data-* + DOM listener instead of inline onclick to eliminate XSS & quote syntax bugs)
+  const corruptBanner = document.getElementById('configCorruptBanner');
+  if (corruptBanner) corruptBanner.classList.toggle('hidden', !d.host.config_corrupt);
+  const accBanner = document.getElementById('accessibilityWarnBanner');
+  if (accBanner) {
+    const caps = d.host.capabilities || {};
+    const needAcc = !!caps.accessibility_permission_required && !caps.accessibility_granted && !!d.settings.allow_input;
+    accBanner.classList.toggle('hidden', !needAcc);
+  }
+  const dbgLogOn = !!(d.host.debug_logging_enabled ?? d.host.debug_enabled);
+  const dbgTraceOn = !!(d.host.debug_trace_active ?? dbgLogOn);
+  authStatus.debug_logging_enabled = dbgLogOn;
+  authStatus.debug_trace_active = dbgTraceOn;
+  authStatus.debug_enabled = dbgTraceOn;
+  const hdrDbgBadge = document.getElementById('hdrDebugBadge');
+  if (hdrDbgBadge) hdrDbgBadge.classList.toggle('hidden', !dbgLogOn);
+  const dbgBtn = document.getElementById('btnToggleDebug');
+  if (dbgBtn) {
+    dbgBtn.textContent = dbgLogOn ? '调试日志: 开' : '调试日志: 关';
+    dbgBtn.className = dbgLogOn ? 'ok' : '';
+  }
+  const cfgPathTxt = d.host.config_path || d.host.trusted_store || '仅内存';
+  document.getElementById('trustFilePath').textContent = cfgPathTxt;
+  const cfgPathEl = document.getElementById('configFilePath');
+  if (cfgPathEl) cfgPathEl.textContent = cfgPathTxt;
+  lastConfigPath = d.host.config_path || '';
+  const cfgCard = document.getElementById('configCard');
+  if (cfgCard && cfgCard.open && !configLoadedOnce) {
+    loadConfigYaml(false);
+  }
+  const tCount = document.getElementById('trustedCountBadge');
+  if (tCount) tCount.textContent = String(d.trusted_devices.length);
+  const tb = document.getElementById('trustedBody');
+  const formatDevPrefs = (t) => {
+    const parts = [];
+    if (t.width != null && t.height != null) parts.push(t.width > 0 ? `${t.width}×${t.height}` : '自动分辨率');
+    if (t.fps != null) parts.push(`${t.fps}fps`);
+    if (t.bitrate_mbps != null) parts.push(`${t.bitrate_mbps}M`);
+    if (t.hidpi != null) parts.push(`${t.hidpi}x`);
+    if (t.max_pixel_edge != null) parts.push(t.max_pixel_edge > 0 ? `上限${t.max_pixel_edge}px` : '自动像素');
+    if (t.adaptive_quality != null) parts.push(t.adaptive_quality ? 'ABR开' : 'ABR关');
+    return parts.join(' · ');
+  };
+  const trustedSig = JSON.stringify(d.trusted_devices.map(t => [
+    t.fingerprint, t.name, t.model, t.width, t.height, t.fps, t.bitrate_mbps, t.hidpi, t.max_pixel_edge, t.adaptive_quality,
+  ]));
+  if (trustedSig !== lastTrustedSig && !tb.querySelector('[data-armed="1"]')) {
+    lastTrustedSig = trustedSig;
+    tb.innerHTML = d.trusted_devices.length ? d.trusted_devices.map(t => {
+      const prefTxt = formatDevPrefs(t);
+      const prefCell = prefTxt
+        ? `<span class="badge warn" title="连接时会优先套用该设备的独立偏好">${esc(prefTxt)}</span>`
+        : '<span style="color:var(--muted);font-size:12px">跟随全局</span>';
+      const clearBtn = prefTxt
+        ? `<button class="btn-clear-dev-prefs" data-fp="${esc(t.fingerprint)}">清除偏好</button> `
+        : '';
+      return `
+      <tr>
+        <td><code>${esc(t.fingerprint)}</code></td>
+        <td>${esc(t.name)}</td>
+        <td>${esc(t.model)}</td>
+        <td>${prefCell}</td>
+        <td>${clearBtn}<button class="danger btn-revoke-trusted" data-fp="${esc(t.fingerprint)}">撤销</button></td>
+      </tr>
+    `;
+    }).join('') : '<tr><td colspan="5" style="color:var(--muted)">暂无受信设备</td></tr>';
+    tb.querySelectorAll('.btn-clear-dev-prefs').forEach(btn => {
+      btn.addEventListener('click', () => clearTrustedPrefs(btn.dataset.fp || null));
+    });
+    tb.querySelectorAll('.btn-revoke-trusted').forEach(btn => {
+      btn.addEventListener('click', () => {
+        confirmDanger(btn, '确认撤销？', () => revokeTrusted(btn.dataset.fp || null));
+      });
+    });
+  }
+
+  renderCliCommand();
+
+  // Logs (diff-checked so 2s polling never clears text selection; preserves scroll position)
+  const lCount = document.getElementById('logCountBadge');
+  if (lCount) lCount.textContent = String(d.logs.length);
+  const lb = document.getElementById('logBox');
+  const nextLogText = d.logs.map(l => {
+    const ts = l.ts ? new Date(l.ts * 1000).toTimeString().slice(0, 8) + ' ' : '';
+    const tgt = l.target ? ` ${l.target}` : '';
+    return `${ts}[${l.level}]${tgt} ${l.message}`;
+  }).join('\n');
+  if (nextLogText !== lastLogText) {
+    lastLogText = nextLogText;
+    const nearBottom = (lb.scrollHeight - lb.scrollTop - lb.clientHeight) < 32;
+    lb.textContent = nextLogText;
+    if (nearBottom) {
+      lb.scrollTop = lb.scrollHeight;
+    }
+  }
+}
+
+function shellQuote(s) {
+  const str = String(s ?? '');
+  if (/^[A-Za-z0-9_./:@=+-]+$/.test(str)) return str;
+  return "'" + str.replace(/'/g, "'\\''") + "'";
+}
+
+function buildCliCommand(d) {
+  const c = d.cli_config || {};
+  const v = d.video || {};
+  const s = d.settings || {};
+  const includeToken = !!document.getElementById('cliIncludeToken')?.checked;
+  const showAll = !!document.getElementById('cliShowAll')?.checked;
+  const multiline = !!document.getElementById('cliMultiline')?.checked;
+  const parts = ['idis'];
+  const pushFlag = (flag, val) => {
+    if (val === undefined) parts.push(flag);
+    else parts.push(`${flag} ${shellQuote(val)}`);
+  };
+
+  if (c.mode && (showAll || c.mode !== 'extend')) pushFlag('--mode', c.mode);
+  if (c.wifi) pushFlag('--wifi');
+  if (c.no_usb) pushFlag('--no-usb');
+  if (c.wifi && c.no_bonjour) pushFlag('--no-bonjour');
+  if (c.wifi && c.bind_addr && (showAll || c.bind_addr !== '0.0.0.0')) pushFlag('--bind-addr', c.bind_addr);
+  if (c.wifi && c.telemetry_port) pushFlag('--telemetry-port', c.telemetry_port);
+  if (c.wifi && c.data_port) pushFlag('--data-port', c.data_port);
+  if (c.host_name) pushFlag('--host-name', c.host_name);
+  if (c.display_id) pushFlag('--display-id', c.display_id);
+
+  // Live video & resolution settings
+  if (v.width > 0 && v.height > 0) {
+    pushFlag('--width', v.width);
+    pushFlag('--height', v.height);
+  }
+  if (v.fps && (showAll || v.fps !== 30)) pushFlag('--fps', v.fps);
+  if (v.bitrate_mbps && (showAll || v.bitrate_mbps !== 16)) pushFlag('--bitrate-mbps', v.bitrate_mbps);
+  if (v.hidpi >= 2 || (showAll && v.hidpi)) pushFlag('--hidpi', v.hidpi >= 2 ? 2 : 1);
+  if (v.integer_scale) pushFlag('--integer-scale');
+  if (v.max_pixel_edge > 0) pushFlag('--max-pixel-edge', v.max_pixel_edge);
+  if (v.adaptive_quality === false) {
+    pushFlag('--no-adaptive-quality');
+  } else if (v.abr_sensitivity && (showAll || v.abr_sensitivity !== 'balanced')) {
+    pushFlag('--abr-sensitivity', v.abr_sensitivity);
+  }
+  if (v.half_fps_when_unfocused) pushFlag('--half-fps-unfocused');
+
+  // Live runtime policies
+  if (s.allow_input) pushFlag('--allow-input');
+  if (s.client_cursor || c.client_cursor) pushFlag('--client-cursor');
+  if (s.max_extended_screens !== undefined && (showAll || s.max_extended_screens !== 2)) {
+    pushFlag('--max-extended-screens', s.max_extended_screens);
+  }
+  if (s.max_web_viewers !== undefined && (showAll || s.max_web_viewers !== 0)) {
+    pushFlag('--max-web-viewers', s.max_web_viewers);
+  }
+  if (s.auto_max_in_flight === false) {
+    pushFlag('--max-in-flight', s.max_in_flight);
+  } else if (showAll) {
+    pushFlag('--max-in-flight', 'auto');
+  }
+  if (s.lock_action_ipad && s.lock_action_web) {
+    if (s.lock_action_ipad === s.lock_action_web) {
+      if (showAll || s.lock_action_ipad !== 'pause') {
+        pushFlag('--on-lock', s.lock_action_ipad);
+      }
+    } else {
+      pushFlag('--on-lock-ipad', s.lock_action_ipad);
+      pushFlag('--on-lock-web', s.lock_action_web);
+    }
+  }
+  const anyLockAction = (s.lock_action_ipad && s.lock_action_ipad !== 'keep') || (s.lock_action_web && s.lock_action_web !== 'keep');
+  if (anyLockAction && s.lock_delay_secs !== undefined && (showAll || s.lock_delay_secs !== 10)) {
+    pushFlag('--on-lock-delay-secs', s.lock_delay_secs);
+  }
+  if (c.ping_timeout_secs !== undefined && (showAll || c.ping_timeout_secs !== 20)) {
+    pushFlag('--ping-timeout-secs', c.ping_timeout_secs);
+  }
+  if (c.idle_exit_secs !== undefined && (showAll || c.idle_exit_secs !== 300)) {
+    pushFlag('--idle-exit-secs', c.idle_exit_secs);
+  }
+  const portIdleSecs = s.port_idle_close_secs !== undefined ? s.port_idle_close_secs : c.port_idle_close_secs;
+  if (portIdleSecs !== undefined && (showAll || portIdleSecs !== 300)) {
+    pushFlag('--port-idle-close-secs', portIdleSecs);
+  }
+  if (c.require_usb_confirm) pushFlag('--require-usb-confirm');
+  if (s.low_power || c.low_power) pushFlag('--low-power');
+  if (c.auto_accept) pushFlag('--auto-accept');
+  if (c.no_confirm) pushFlag('--no-confirm');
+  for (const ip of (c.allow_ips || [])) pushFlag('--allow-ip', ip);
+  for (const fp of (c.allow_fingerprints || [])) pushFlag('--allow-fingerprint', fp);
+
+  // Web console & viewer settings
+  pushFlag('--web');
+  if (c.web_bind && (showAll || c.web_bind !== '127.0.0.1:8787')) {
+    pushFlag('--web-bind', c.web_bind);
+  }
+  if (includeToken && s.view_token_enabled && s.view_token) {
+    pushFlag('--web-view-token', s.view_token);
+  }
+  if (s.web_screen_mode === 'main') {
+    pushFlag('--web-screen-mode', 'main');
+  } else if (s.web_screen_mode === 'independent' || s.web_independent_screen) {
+    pushFlag('--web-independent-screen');
+  }
+  if (s.web_require_approval) pushFlag('--web-require-approval');
+  if (c.web_width && (showAll || c.web_width !== 1280)) pushFlag('--web-width', c.web_width);
+  if (c.web_height && (showAll || c.web_height !== 720)) pushFlag('--web-height', c.web_height);
+  if (c.web_fps && (showAll || c.web_fps !== 30)) pushFlag('--web-fps', c.web_fps);
+  if (c.web_bitrate_mbps && (showAll || c.web_bitrate_mbps !== 16)) pushFlag('--web-bitrate-mbps', c.web_bitrate_mbps);
+  if (c.web_hidpi >= 2 || (showAll && c.web_hidpi)) pushFlag('--web-hidpi', c.web_hidpi >= 2 ? 2 : 1);
+  if (c.web_max_pixel_edge > 0) pushFlag('--web-max-pixel-edge', c.web_max_pixel_edge);
+
+  if (c.use_system_proxy) pushFlag('--use-system-proxy');
+  if (c.all_intra) pushFlag('--all-intra');
+  if (c.qr) pushFlag('--qr');
+  if (c.debug) pushFlag('--debug');
+
+  return multiline ? parts.join(' \\\n  ') : parts.join(' ');
+}
+
+function renderCliCommand() {
+  if (!lastAdminState) return;
+  const box = document.getElementById('cliCmdBox');
+  const hint = document.getElementById('cliCmdHint');
+  if (!box) return;
+  const cmd = buildCliCommand(lastAdminState);
+  if (box.textContent !== cmd) box.textContent = cmd;
+  if (hint) {
+    const notes = ['根据当前页面已生效的动态配置实时生成（已省略默认值，可勾选「展开默认值」查看完整参数）。'];
+    if (lastAdminState.cli_config && lastAdminState.cli_config.has_explicit_admin_token) {
+      notes.push('注：当前使用了自定义 --web-admin-token，出于安全未自动输出明文。');
+    }
+    hint.textContent = notes.join(' ');
+  }
+}
+
+function copyCliCommand() {
+  const box = document.getElementById('cliCmdBox');
+  if (!box || !box.textContent) return;
+  const text = box.textContent;
+  const done = () => showToast('已复制启动命令到剪贴板', 'ok');
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(done).catch(() => fallbackCopy(text, done));
+  } else {
+    fallbackCopy(text, done);
+  }
+}
+
+async function disconnectSession(key) {
+  const r = await api('/api/admin/sessions/disconnect', { method: 'POST', body: JSON.stringify({ key }) });
+  if (!r.ok) { showToast((r.data && r.data.error) || '断开会话失败', 'err'); return; }
+  showToast('已断开设备连接', 'ok');
+  refreshAdmin();
+}
+
+async function kickViewer(id) {
+  const r = await api('/api/admin/viewers/disconnect', { method: 'POST', body: JSON.stringify({ id }) });
+  if (!r.ok) { showToast((r.data && r.data.error) || '断开观众失败', 'err'); return; }
+  showToast('已断开该网页观众', 'ok');
+  refreshAdmin();
+}
+
+async function decidePending(id, decision) {
+  const r = await api('/api/admin/pending/decide', { method: 'POST', body: JSON.stringify({ id, decision }) });
+  if (!r.ok || !r.data || r.data.ok === false) {
+    showToast((r.data && r.data.error) || '审批请求已过期或对方已断开', 'warn');
+    refreshAdmin();
+    return;
+  }
+  showToast(decision === 'deny' ? '已拒绝连接请求' : '已放行连接请求', 'ok');
+  refreshAdmin();
+}
+
+async function toggleAllowInput() {
+  const next = !lastAllowInput;
+  const r = await api('/api/admin/settings', { method: 'POST', body: JSON.stringify({ allow_input: next }) });
+  if (!r.ok) { showToast((r.data && r.data.error) || '切换键鼠控制失败', 'err'); return; }
+  showToast(next ? '已允许远程键鼠输入' : '已切换为仅显示模式', 'ok');
+  refreshAdmin();
+}
+
+async function toggleLowPower() {
+  const next = !lastLowPower;
+  const r = await api('/api/admin/settings', { method: 'POST', body: JSON.stringify({ low_power: next }) });
+  if (r.ok) {
+    showToast(next ? '已开启低电量模式：仅受信设备直连 · 4M/15fps · 关闭网页观看' : '已关闭低电量模式', 'ok');
+    refreshAdmin();
+  } else {
+    showToast((r.data && r.data.error) || '切换低电量模式失败', 'err');
+  }
+}
+
+async function toggleP2pRelay() {
+  const next = !lastP2pRelayEnabled;
+  const r = await api('/api/admin/settings', { method: 'POST', body: JSON.stringify({ p2p_relay_enabled: next }) });
+  if (!r.ok) { showToast((r.data && r.data.error) || '切换 P2P 状态失败', 'err'); return; }
+  if (r.data && r.data.low_power && next && !r.data.p2p_relay_enabled) {
+    showToast('已保存 P2P 开启偏好（当前低电量模式生效，退出后自动恢复）', 'warn');
+  } else {
+    showToast(next ? '已开启局域网 P2P 加速' : '已关闭局域网 P2P 加速', 'ok');
+  }
+  refreshAdmin();
+}
+
+async function enableWebViewingQuick() {
+  const r = await api('/api/admin/settings', { method: 'POST', body: JSON.stringify({ max_web_viewers: 1 }) });
+  if (!r.ok) { showToast((r.data && r.data.error) || '开启网页观看失败', 'err'); return; }
+  if (r.data && r.data.low_power && r.data.max_web_viewers === 0) {
+    showToast('已保存网页观看上限为 1（当前低电量模式已暂停网页观看，退出后自动恢复）', 'warn');
+  } else {
+    showToast('已允许网页观看（观看上限设为 1）', 'ok');
+  }
+  lastConnSig = '';
+  refreshAdmin();
+}
+
+async function closeWebViewerPort() {
+  const r = await api('/api/admin/settings', { method: 'POST', body: JSON.stringify({ max_web_viewers: 0 }) });
+  if (!r.ok) { showToast((r.data && r.data.error) || '关闭网页扩展屏端口失败', 'err'); return; }
+  showToast('已关闭网页扩展屏端口并断开全部网页观众', 'ok');
+  lastConnSig = '';
+  refreshAdmin();
+}
+
+async function toggleWifiPort(enable) {
+  const r = await api('/api/admin/settings', { method: 'POST', body: JSON.stringify({ wifi_enabled: !!enable }) });
+  if (!r.ok) { showToast((r.data && r.data.error) || (enable ? '开启 iPad Wi-Fi 端口失败' : '关闭 iPad Wi-Fi 端口失败'), 'err'); return; }
+  showToast(enable ? '已开启 iPad Wi-Fi 接入端口' : '已关闭 iPad Wi-Fi 接入端口', 'ok');
+  lastConnSig = '';
+  refreshAdmin();
+}
+
+async function savePortIdleClose(presetSecs) {
+  const inp = document.getElementById('portIdleCloseInput');
+  const secs = presetSecs !== undefined ? Number(presetSecs) : parseInt(inp ? inp.value : '', 10);
+  if (isNaN(secs) || secs < 0 || secs > 86400) {
+    showToast('请输入 0 ~ 86400 之间的秒数', 'err');
+    return;
+  }
+  if (inp) inp.value = secs;
+  const r = await api('/api/admin/settings', { method: 'POST', body: JSON.stringify({ port_idle_close_secs: secs }) });
+  if (!r.ok) { showToast((r.data && r.data.error) || '保存端口空闲自动关闭失败', 'err'); return; }
+  showToast(secs === 0 ? '已关闭端口空闲自动关闭' : `端口空闲自动关闭已设为 ${fmtIdleCountdown(secs)}`, 'ok');
+  lastConnSig = '';
+  refreshAdmin();
+}
+
+async function saveMaxExtendedScreens() {
+  const val = parseInt(document.getElementById('maxExtInput').value, 10);
+  if (isNaN(val) || val < 0) return;
+  const r = await api('/api/admin/settings', { method: 'POST', body: JSON.stringify({ max_extended_screens: val }) });
+  if (!r.ok) { showToast((r.data && r.data.error) || '更新扩展屏上限失败', 'err'); return; }
+  showToast(`扩展屏上限已更新为 ${val === 0 ? '不限' : val}`, 'ok');
+  refreshAdmin();
+}
+
+async function saveLockActions() {
+  const ipadSel = document.getElementById('lockActionIpadSel');
+  const webSel = document.getElementById('lockActionWebSel');
+  if (!ipadSel || !webSel) return;
+  const r = await api('/api/admin/settings', {
+    method: 'POST',
+    body: JSON.stringify({ lock_action_ipad: ipadSel.value, lock_action_web: webSel.value }),
+  });
+  if (!r.ok) { showToast((r.data && r.data.error) || '更新锁屏策略失败', 'err'); return; }
+  showToast('锁屏后策略已更新', 'ok');
+  refreshAdmin();
+}
+
+async function saveLockDelay() {
+  const inp = document.getElementById('lockDelayInput');
+  if (!inp) return;
+  const secs = parseInt(inp.value, 10);
+  if (isNaN(secs) || secs < 0) return;
+  const r = await api('/api/admin/settings', { method: 'POST', body: JSON.stringify({ lock_delay_secs: secs }) });
+  if (!r.ok) { showToast((r.data && r.data.error) || '更新延迟失败', 'err'); return; }
+  showToast(`锁屏延迟已更新为 ${secs} 秒`, 'ok');
+  refreshAdmin();
+}
+
+async function savePollingSettings() {
+  const mainLoop = parseInt(document.getElementById('pollMainLoopInput')?.value, 10);
+  const cursorPoll = parseInt(document.getElementById('pollCursorInput')?.value, 10);
+  const usbRetry = parseInt(document.getElementById('pollUsbRetryInput')?.value, 10);
+  const adminPoll = parseInt(document.getElementById('pollAdminInput')?.value, 10);
+  if ([mainLoop, cursorPoll, usbRetry, adminPoll].some(v => isNaN(v) || v <= 0)) {
+    showToast('请输入有效的毫秒数值', 'err');
+    return;
+  }
+  const r = await api('/api/admin/settings', {
+    method: 'POST',
+    body: JSON.stringify({
+      main_loop_ms: mainLoop,
+      cursor_poll_ms: cursorPoll,
+      usb_retry_ms: usbRetry,
+      admin_poll_ms: adminPoll,
+    }),
+  });
+  if (!r.ok) { showToast((r.data && r.data.error) || '保存轮询策略失败', 'err'); return; }
+  showToast('活跃轮询策略已保存并生效', 'ok');
+  refreshAdmin();
+}
+
+async function applyPollingPreset(kind) {
+  const body = kind === 'eco'
+    ? { main_loop_ms: 500, cursor_poll_ms: 50, usb_retry_ms: 3000, admin_poll_ms: 5000 }
+    : { main_loop_ms: 250, cursor_poll_ms: 8, usb_retry_ms: 1000, admin_poll_ms: 2000 };
+  const r = await api('/api/admin/settings', { method: 'POST', body: JSON.stringify(body) });
+  if (!r.ok) { showToast((r.data && r.data.error) || '应用轮询预设失败', 'err'); return; }
+  showToast(kind === 'eco' ? '已切换至省电轮询预设' : '已切换至标准轮询预设', 'ok');
+  refreshAdmin();
+}
+
+async function resetPollingSettings() {
+  const r = await api('/api/admin/settings', { method: 'POST', body: JSON.stringify({ reset_polling: true }) });
+  if (!r.ok) { showToast((r.data && r.data.error) || '重置轮询策略失败', 'err'); return; }
+  showToast('活跃轮询策略已重置为默认', 'ok');
+  refreshAdmin();
+}
+
+async function applyConfigPreset(name) {
+  if (!name) return;
+  const r = await api('/api/admin/presets/apply', { method: 'POST', body: JSON.stringify({ name }) });
+  if (!r.ok) { showToast((r.data && r.data.error) || '切换预设失败', 'err'); return; }
+  setVideoDirty(false);
+  setWebDirty(false);
+  if (!configDirty) configLoadedOnce = false;
+  showToast(`已切换至预设「${name}」`, 'ok');
+  refreshAdmin();
+}
+
+async function saveCurrentAsPreset() {
+  const inp = document.getElementById('presetNameInput');
+  const name = (inp && inp.value || '').trim();
+  if (!name) { showToast('请先输入预设名称', 'warn'); return; }
+  const ok = await savePresetByName(name, false);
+  if (ok && inp) inp.value = '';
+}
+
+async function savePresetByName(name, isUpdate) {
+  if (!name) return false;
+  const r = await api('/api/admin/presets/save', { method: 'POST', body: JSON.stringify({ name }) });
+  if (!r.ok) { showToast((r.data && r.data.error) || '保存预设失败', 'err'); return false; }
+  if (!configDirty) configLoadedOnce = false;
+  showToast(isUpdate ? `已用当前配置覆盖更新「${name}」` : `已保存预设「${name}」`, 'ok');
+  refreshAdmin();
+  return true;
+}
+
+async function deleteConfigPreset(name) {
+  if (!name) return;
+  const r = await api('/api/admin/presets/delete', { method: 'POST', body: JSON.stringify({ name }) });
+  if (!r.ok) { showToast((r.data && r.data.error) || '删除预设失败', 'err'); return; }
+  if (!configDirty) configLoadedOnce = false;
+  showToast(`已删除预设「${name}」`, 'ok');
+  refreshAdmin();
+}
+
+// ==================== SKU INTERACTIVE FORMS (iPad & Web Extended Screen) ====================
+const QUALITY_SKU_OPTS = [
+  { key: 'eco', label: '省电 · 4M / 15fps', fps: 15, bitrate: 4 },
+  { key: 'low', label: '流畅 · 8M / 30fps', fps: 30, bitrate: 8 },
+  { key: 'balanced', label: '均衡 · 16M / 30fps', fps: 30, bitrate: 16 },
+  { key: 'high', label: '高清 · 24M / 60fps', fps: 60, bitrate: 24 },
+  { key: 'ultra', label: '超清 · 36M / 60fps', fps: 60, bitrate: 36 },
+  { key: 'custom', label: '自定义' },
+];
+const IPAD_EDGE_OPTS = [0, 1280, 1600, 2048, 2732, 3840];
+const WEB_EDGE_OPTS = [0, 1280, 1920, 2560, 3840];
+const WEB_RES_OPTS = [
+  { key: '1280x720', w: 1280, h: 720, label: '1280×720 · 720p' },
+  { key: '1600x900', w: 1600, h: 900, label: '1600×900 · 16:9' },
+  { key: '1920x1080', w: 1920, h: 1080, label: '1920×1080 · 1080p' },
+  { key: '2560x1440', w: 2560, h: 1440, label: '2560×1440 · 2K' },
+  { key: '1440x900', w: 1440, h: 900, label: '1440×900 · 16:10' },
+  { key: '1920x1200', w: 1920, h: 1200, label: '1920×1200 · 16:10' },
+  { key: 'custom', label: '自定义' },
+];
+const WEB_VIEWER_LIMIT_OPTS = [
+  { key: '0', val: 0, label: '禁止观看' },
+  { key: '1', val: 1, label: '1 人' },
+  { key: '3', val: 3, label: '3 人' },
+  { key: '10', val: 10, label: '10 人' },
+  { key: 'custom', label: '自定义' },
+];
+
+function inferQualityKey(fps, bitrate) {
+  const hit = QUALITY_SKU_OPTS.find(o => o.fps === fps && o.bitrate === bitrate);
+  return hit ? hit.key : 'custom';
+}
+
+function getIpadResPresets() {
+  const nw = lastNativeDims.w || 1024;
+  const nh = lastNativeDims.h || 768;
+  const halfW = Math.max(320, Math.floor(nw / 2) & ~1);
+  const halfH = Math.max(240, Math.floor(nh / 2) & ~1);
+  let dblW = (nw * 2) & ~1;
+  let dblH = (nh * 2) & ~1;
+  if (dblW > 3840 || dblH > 2160) {
+    const scale = Math.min(3840 / dblW, 2160 / dblH);
+    dblW = Math.max(320, Math.floor(dblW * scale) & ~1);
+    dblH = Math.max(240, Math.floor(dblH * scale) & ~1);
+  }
+  return [
+    { key: '0x0', w: 0, h: 0, label: '自动跟随' },
+    { key: `${halfW}x${halfH}`, w: halfW, h: halfH, label: `1/2x · ${halfW}×${halfH}` },
+    { key: `${nw}x${nh}`, w: nw, h: nh, label: `1x · ${nw}×${nh}` },
+    { key: `${dblW}x${dblH}`, w: dblW, h: dblH, label: `2x · ${dblW}×${dblH}` },
+    { key: 'custom', label: '自定义' },
+  ];
+}
+
+function setVideoDirty(dirty) {
+  videoFormDirty = !!dirty;
+  const badge = document.getElementById('videoDirtyBadge');
+  const btn = document.getElementById('btnDiscardVideo');
+  const applyBtn = document.getElementById('btnApplyVideo');
+  if (badge) badge.classList.toggle('hidden', !videoFormDirty);
+  if (btn) btn.classList.toggle('hidden', !videoFormDirty);
+  if (applyBtn) applyBtn.classList.toggle('pulse', videoFormDirty);
+}
+
+function setWebDirty(dirty) {
+  webFormDirty = !!dirty;
+  const badge = document.getElementById('webDirtyBadge');
+  const btn = document.getElementById('btnDiscardWeb');
+  const applyBtn = document.getElementById('btnApplyWeb');
+  if (badge) badge.classList.toggle('hidden', !webFormDirty);
+  if (btn) btn.classList.toggle('hidden', !webFormDirty);
+  if (applyBtn) applyBtn.classList.toggle('pulse', webFormDirty);
+}
+
+function syncIpadDraftFromServer(d) {
+  const v = d.video || {};
+  const s = d.settings || {};
+  const fps = v.fps || 30;
+  const bitrate = v.bitrate_mbps || 16;
+  const w = v.width || 0;
+  const h = v.height || 0;
+  const presets = getIpadResPresets();
+  const resKey = presets.some(p => p.key === `${w}x${h}`) ? `${w}x${h}` : 'custom';
+  const edge = v.max_pixel_edge || 0;
+  const edgeMode = IPAD_EDGE_OPTS.includes(edge) ? String(edge) : 'custom';
+  const autoMif = s.auto_max_in_flight !== false;
+  const mif = s.max_in_flight ?? 2;
+  let mifMode = 'auto';
+  if (!autoMif) {
+    mifMode = [0, 2, 4].includes(mif) ? String(mif) : 'custom';
+  }
+  const next = {
+    qualityMode: inferQualityKey(fps, bitrate),
+    fps,
+    bitrate,
+    resMode: resKey,
+    width: w,
+    height: h,
+    hidpi: lastSupportsHidpi ? (v.hidpi >= 2 ? 2 : 1) : 1,
+    edgeMode,
+    maxEdge: edge,
+    mifMode,
+    autoMif,
+    maxInFlight: mif,
+    adaptive: v.adaptive_quality !== false,
+    abrSensitivity: v.abr_sensitivity || 'balanced',
+    clientCursor: !!s.client_cursor,
+    halfFpsUnfocused: !!v.half_fps_when_unfocused,
+  };
+  ipadServerBaseline = { ...next };
+  if (ipadDraft) Object.assign(ipadDraft, next);
+  else ipadDraft = next;
+}
+
+function renderIpadSkuForm() {
+  if (!ipadDraft) return;
+  const d = ipadDraft;
+  const resLbl = document.getElementById('ipadResLabel');
+  if (resLbl) {
+    resLbl.textContent = lastNativeDims.connected
+      ? `分辨率 · ${lastNativeDims.w}×${lastNativeDims.h}`
+      : '分辨率';
+  }
+
+  // Quality chips
+  const qEl = document.getElementById('ipadQualityChips');
+  if (qEl) {
+    qEl.innerHTML = QUALITY_SKU_OPTS.map(o =>
+      `<button type="button" class="sku-chip ${d.qualityMode === o.key ? 'selected' : ''}" data-q="${o.key}">${esc(o.label)}</button>`
+    ).join('');
+    qEl.querySelectorAll('button').forEach(b => b.addEventListener('click', () => {
+      if (!ipadDraft) return;
+      const k = b.dataset.q;
+      ipadDraft.qualityMode = k;
+      const opt = QUALITY_SKU_OPTS.find(o => o.key === k);
+      if (opt && opt.fps) { ipadDraft.fps = opt.fps; ipadDraft.bitrate = opt.bitrate; }
+      setVideoDirty(true);
+      renderIpadSkuForm();
+    }));
+  }
+  const qCust = document.getElementById('ipadQualityCustom');
+  if (qCust) {
+    qCust.classList.toggle('hidden', d.qualityMode !== 'custom');
+    const fInp = document.getElementById('ipadCustomFps');
+    const bInp = document.getElementById('ipadCustomBitrate');
+    if (fInp && document.activeElement !== fInp) fInp.value = d.fps;
+    if (bInp && document.activeElement !== bInp) bInp.value = d.bitrate;
+  }
+
+  // Resolution chips
+  const resPresets = getIpadResPresets();
+  const rEl = document.getElementById('ipadResChips');
+  if (rEl) {
+    rEl.innerHTML = resPresets.map(o =>
+      `<button type="button" class="sku-chip ${d.resMode === o.key ? 'selected' : ''}" data-r="${o.key}">${esc(o.label)}</button>`
+    ).join('');
+    rEl.querySelectorAll('button').forEach(b => b.addEventListener('click', () => {
+      if (!ipadDraft) return;
+      const k = b.dataset.r;
+      ipadDraft.resMode = k;
+      const opt = resPresets.find(o => o.key === k);
+      if (opt && opt.w !== undefined) {
+        ipadDraft.width = opt.w;
+        ipadDraft.height = opt.h;
+      } else if (ipadDraft.width === 0 || ipadDraft.height === 0) {
+        ipadDraft.width = lastNativeDims.w;
+        ipadDraft.height = lastNativeDims.h;
+      }
+      setVideoDirty(true);
+      renderIpadSkuForm();
+    }));
+  }
+  const rCust = document.getElementById('ipadResCustom');
+  if (rCust) {
+    rCust.classList.toggle('hidden', d.resMode !== 'custom');
+    const wInp = document.getElementById('ipadCustomW');
+    const hInp = document.getElementById('ipadCustomH');
+    if (wInp && document.activeElement !== wInp) wInp.value = d.width || lastNativeDims.w;
+    if (hInp && document.activeElement !== hInp) hInp.value = d.height || lastNativeDims.h;
+  }
+
+  // HiDPI chips
+  const hEl = document.getElementById('ipadHidpiChips');
+  if (hEl) {
+    const opts = [
+      { v: 1, label: '1x', disabled: false },
+      { v: 2, label: '2x', disabled: !lastSupportsHidpi },
+    ];
+    hEl.innerHTML = opts.map(o =>
+      `<button type="button" class="sku-chip ${d.hidpi === o.v ? 'selected' : ''}" data-h="${o.v}" ${o.disabled ? 'disabled title="仅 macOS 虚拟屏支持 2x Retina"' : ''}>${esc(o.label)}</button>`
+    ).join('');
+    hEl.querySelectorAll('button').forEach(b => b.addEventListener('click', () => {
+      if (!ipadDraft) return;
+      ipadDraft.hidpi = Number(b.dataset.h);
+      setVideoDirty(true);
+      renderIpadSkuForm();
+    }));
+  }
+
+  // Max edge chips
+  const eEl = document.getElementById('ipadEdgeChips');
+  if (eEl) {
+    const opts = [
+      { k: '0', v: 0, label: '自动' },
+      { k: '1280', v: 1280, label: '1280px' },
+      { k: '1600', v: 1600, label: '1600px' },
+      { k: '2048', v: 2048, label: '2048px' },
+      { k: '2732', v: 2732, label: '2732px' },
+      { k: '3840', v: 3840, label: '3840px' },
+      { k: 'custom', label: '自定义' },
+    ];
+    eEl.innerHTML = opts.map(o =>
+      `<button type="button" class="sku-chip ${d.edgeMode === o.k ? 'selected' : ''}" data-e="${o.k}">${esc(o.label)}</button>`
+    ).join('');
+    eEl.querySelectorAll('button').forEach(b => b.addEventListener('click', () => {
+      if (!ipadDraft) return;
+      const k = b.dataset.e;
+      ipadDraft.edgeMode = k;
+      if (k !== 'custom') ipadDraft.maxEdge = Number(k);
+      else if (!ipadDraft.maxEdge) ipadDraft.maxEdge = 2048;
+      setVideoDirty(true);
+      renderIpadSkuForm();
+    }));
+  }
+  const eCust = document.getElementById('ipadEdgeCustom');
+  if (eCust) {
+    eCust.classList.toggle('hidden', d.edgeMode !== 'custom');
+    const inp = document.getElementById('ipadCustomEdge');
+    if (inp && document.activeElement !== inp) inp.value = d.maxEdge || 2048;
+  }
+
+  // In-flight window chips
+  const mEl = document.getElementById('ipadMifChips');
+  if (mEl) {
+    const opts = [
+      { k: 'auto', label: '自动' },
+      { k: '2', label: '2 帧' },
+      { k: '4', label: '4 帧' },
+      { k: '0', label: '关闭背压' },
+      { k: 'custom', label: '自定义' },
+    ];
+    mEl.innerHTML = opts.map(o =>
+      `<button type="button" class="sku-chip ${d.mifMode === o.k ? (o.k === 'auto' ? 'selected-ok' : 'selected') : ''}" data-m="${o.k}">${esc(o.label)}</button>`
+    ).join('');
+    mEl.querySelectorAll('button').forEach(b => b.addEventListener('click', () => {
+      if (!ipadDraft) return;
+      const k = b.dataset.m;
+      ipadDraft.mifMode = k;
+      if (k === 'auto') { ipadDraft.autoMif = true; }
+      else {
+        ipadDraft.autoMif = false;
+        if (k !== 'custom') ipadDraft.maxInFlight = Number(k);
+      }
+      setVideoDirty(true);
+      renderIpadSkuForm();
+    }));
+  }
+  const mCust = document.getElementById('ipadMifCustom');
+  if (mCust) {
+    mCust.classList.toggle('hidden', d.mifMode !== 'custom');
+    const inp = document.getElementById('ipadCustomMif');
+    if (inp && document.activeElement !== inp) inp.value = d.maxInFlight;
+  }
+
+  // ABR chips (capability-gated so Linux/Windows FFmpeg hosts honestly show unsupported state)
+  const aEl = document.getElementById('ipadAbrChips');
+  if (aEl) {
+    if (!lastSupportsLiveAbr) {
+      aEl.innerHTML = `<span class="badge info">当前后端不支持实时码率降档（仅 macOS 硬件编码支持）</span>`;
+    } else {
+      const curMode = d.adaptive ? (d.abrSensitivity || 'balanced') : 'off';
+      aEl.innerHTML = [
+        { k: 'off', label: '关闭' },
+        { k: 'conservative', label: '保守' },
+        { k: 'balanced', label: '均衡' },
+        { k: 'aggressive', label: '灵敏' },
+      ].map(o =>
+        `<button type="button" class="sku-chip ${curMode === o.k ? (o.k === 'off' ? 'selected' : 'selected-ok') : ''}" data-a="${o.k}">${esc(o.label)}</button>`
+      ).join('');
+      aEl.querySelectorAll('button').forEach(b => b.addEventListener('click', () => {
+        if (!ipadDraft) return;
+        const k = b.dataset.a;
+        if (k === 'off') {
+          ipadDraft.adaptive = false;
+        } else {
+          ipadDraft.adaptive = true;
+          ipadDraft.abrSensitivity = k;
+        }
+        setVideoDirty(true);
+        renderIpadSkuForm();
+      }));
+    }
+  }
+
+  // Client cursor chips (hot-toggleable live without reconnecting)
+  const ccEl = document.getElementById('ipadCursorChips');
+  if (ccEl) {
+    ccEl.innerHTML = [
+      { v: false, label: '画面合成' },
+      { v: true, label: '客户端独立绘制' },
+    ].map(o =>
+      `<button type="button" class="sku-chip ${d.clientCursor === o.v ? (o.v ? 'selected-ok' : 'selected') : ''}" data-cc="${o.v ? '1' : '0'}">${esc(o.label)}</button>`
+    ).join('');
+    ccEl.querySelectorAll('button').forEach(b => b.addEventListener('click', () => {
+      if (!ipadDraft) return;
+      ipadDraft.clientCursor = b.dataset.cc === '1';
+      setVideoDirty(true);
+      renderIpadSkuForm();
+    }));
+  }
+
+  // Unfocused half-FPS chips
+  const ffEl = document.getElementById('ipadFocusFpsChips');
+  if (ffEl) {
+    ffEl.innerHTML = [
+      { v: false, label: '关闭' },
+      { v: true, label: '开启' },
+    ].map(o =>
+      `<button type="button" class="sku-chip ${d.halfFpsUnfocused === o.v ? (o.v ? 'selected-ok' : 'selected') : ''}" data-ff="${o.v ? '1' : '0'}">${esc(o.label)}</button>`
+    ).join('');
+    ffEl.querySelectorAll('button').forEach(b => b.addEventListener('click', () => {
+      if (!ipadDraft) return;
+      ipadDraft.halfFpsUnfocused = b.dataset.ff === '1';
+      setVideoDirty(true);
+      renderIpadSkuForm();
+    }));
+  }
+
+  const prev = document.getElementById('ipadDraftPreview');
+  if (prev) {
+    const resStr = (d.width && d.height) ? `${d.width}×${d.height}` : '自动分辨率';
+    const edgeStr = d.maxEdge ? `推流≤${d.maxEdge}px` : '推流自适应';
+    const mifStr = d.autoMif ? '在途帧自动' : `在途帧=${d.maxInFlight}`;
+    const abrLabelMap = { conservative: 'ABR保守', balanced: 'ABR均衡', aggressive: 'ABR灵敏' };
+    const abrStr = !lastSupportsLiveAbr ? 'ABR不支持' : (d.adaptive ? (abrLabelMap[d.abrSensitivity] || 'ABR均衡') : 'ABR关');
+    const ccStr = d.clientCursor ? '客户端鼠标' : '合成鼠标';
+    const ffStr = d.halfFpsUnfocused ? '失焦降帧开' : '失焦降帧关';
+    prev.textContent = `当前已选：${resStr} · ${d.hidpi}x HiDPI · ${d.fps}fps / ${d.bitrate}Mbps · ${edgeStr} · ${mifStr} · ${abrStr} · ${ccStr} · ${ffStr}`;
+  }
+}
+
+function onIpadCustomQualityInput() {
+  if (!ipadDraft) return;
+  ipadDraft.fps = parseInt(document.getElementById('ipadCustomFps')?.value, 10) || 30;
+  ipadDraft.bitrate = parseInt(document.getElementById('ipadCustomBitrate')?.value, 10) || 16;
+  setVideoDirty(true);
+  renderIpadSkuForm();
+}
+function onIpadCustomResInput() {
+  if (!ipadDraft) return;
+  ipadDraft.width = parseInt(document.getElementById('ipadCustomW')?.value, 10) || 0;
+  ipadDraft.height = parseInt(document.getElementById('ipadCustomH')?.value, 10) || 0;
+  setVideoDirty(true);
+  renderIpadSkuForm();
+}
+function onIpadCustomEdgeInput() {
+  if (!ipadDraft) return;
+  ipadDraft.maxEdge = parseInt(document.getElementById('ipadCustomEdge')?.value, 10) || 0;
+  setVideoDirty(true);
+  renderIpadSkuForm();
+}
+function onIpadCustomMifInput() {
+  if (!ipadDraft) return;
+  const v = parseInt(document.getElementById('ipadCustomMif')?.value, 10);
+  if (!isNaN(v)) ipadDraft.maxInFlight = v;
+  setVideoDirty(true);
+  renderIpadSkuForm();
+}
+
+function discardIpadSkuEdits() {
+  setVideoDirty(false);
+  if (lastAdminState) {
+    syncIpadDraftFromServer(lastAdminState);
+    renderIpadSkuForm();
+  }
+}
+
+async function applyIpadSkuSettings() {
+  if (!ipadDraft) return;
+  const d = ipadDraft;
+  if (d.resMode === 'custom' && (d.width < 320 || d.height < 240)) {
+    showToast('自定义分辨率至少为 320×240', 'err');
+    return;
+  }
+  if (d.edgeMode === 'custom' && (d.maxEdge < 640 || d.maxEdge > 3840)) {
+    showToast('自定义推流长边上限须在 640~3840 之间', 'err');
+    return;
+  }
+  const base = ipadServerBaseline;
+  const effW = d.resMode === '0x0' ? 0 : d.width;
+  const effH = d.resMode === '0x0' ? 0 : d.height;
+  const effEdge = d.edgeMode === '0' ? 0 : d.maxEdge;
+  const baseW = base ? (base.resMode === '0x0' ? 0 : base.width) : null;
+  const baseH = base ? (base.resMode === '0x0' ? 0 : base.height) : null;
+  const baseEdge = base ? (base.edgeMode === '0' ? 0 : base.maxEdge) : null;
+  // Submit ONLY modified fields (diff-patch) so untouched settings never leak CLI overrides (CFG-1),
+  // never clobber pre-low-power baselines (CFG-4), and never over-stamp per-device prefs (SEC-4).
+  const body = {};
+  if (!base || effW !== baseW || effH !== baseH) {
+    body.width = effW;
+    body.height = effH;
+  }
+  if (!base || d.fps !== base.fps) body.fps = d.fps;
+  if (!base || d.bitrate !== base.bitrate) body.bitrate_mbps = d.bitrate;
+  if (!base || d.hidpi !== base.hidpi) body.hidpi = d.hidpi;
+  if (!base || effEdge !== baseEdge) body.max_pixel_edge = effEdge;
+  if (!base || d.adaptive !== base.adaptive) body.adaptive_quality = d.adaptive;
+  if (!base || d.abrSensitivity !== base.abrSensitivity) body.abr_sensitivity = d.abrSensitivity;
+  if (!base || d.clientCursor !== base.clientCursor) body.client_cursor = d.clientCursor;
+  if (!base || d.halfFpsUnfocused !== base.halfFpsUnfocused) body.half_fps_when_unfocused = d.halfFpsUnfocused;
+  if (!base || d.autoMif !== base.autoMif || (!d.autoMif && d.maxInFlight !== base.maxInFlight)) {
+    body.auto_max_in_flight = d.autoMif;
+    if (!d.autoMif) body.max_in_flight = d.maxInFlight;
+  }
+  if (Object.keys(body).length === 0) {
+    setVideoDirty(false);
+    showToast('当前没有待应用的 iPad 设置变更', 'ok');
+    return;
+  }
+  debugTrace('apply_ipad_sku', body);
+  const msg = document.getElementById('videoMsg');
+  const r = await api('/api/admin/settings', { method: 'POST', body: JSON.stringify(body) });
+  if (r.ok) {
+    setVideoDirty(false);
+    if (r.data && r.data.video) {
+      syncIpadDraftFromServer({ video: r.data.video, settings: r.data });
+      renderIpadSkuForm();
+    }
+    const v = r.data.video;
+    const txt = `iPad 设置已生效：${v.width ? `${v.width}×${v.height}` : '自动'} · ${v.hidpi}x HiDPI · ${v.fps}fps / ${v.bitrate_mbps}Mbps`;
+    showToast(txt, 'ok');
+    if (msg) { msg.className = 'msg ok'; msg.textContent = txt; }
+    refreshAdmin();
+  } else {
+    const err = (r.data && r.data.error) || '应用失败';
+    showToast(err, 'err');
+    if (msg) { msg.className = 'msg err'; msg.textContent = err; }
+  }
+}
+
+async function resetVideoSettings() {
+  debugTrace('click_reset_video', {});
+  const msg = document.getElementById('videoMsg');
+  const r = await api('/api/admin/settings', {
+    method: 'POST',
+    body: JSON.stringify({ reset_video: true }),
+  });
+  if (r.ok) {
+    setVideoDirty(false);
+    if (r.data && r.data.video) {
+      syncIpadDraftFromServer({ video: r.data.video, settings: r.data });
+      renderIpadSkuForm();
+    }
+    const v = r.data.video;
+    const txt = `iPad 设置已重置为默认：自动分辨率 · ${v.fps}fps · ${v.bitrate_mbps}Mbps · ${v.hidpi}x HiDPI · 在途帧自动`;
+    showToast(txt, 'ok');
+    if (msg) { msg.className = 'msg ok'; msg.textContent = txt; }
+    refreshAdmin();
+  } else {
+    const err = (r.data && r.data.error) || '重置失败';
+    showToast(err, 'err');
+    if (msg) { msg.className = 'msg err'; msg.textContent = err; }
+  }
+}
+
+function syncWebDraftFromServer(d) {
+  const v = d.video || {};
+  const s = d.settings || {};
+  const ww = v.web_width || 1280;
+  const wh = v.web_height || 720;
+  const wfps = v.web_fps || 30;
+  const wbr = v.web_bitrate_mbps || 16;
+  const wedge = v.web_max_pixel_edge || 0;
+  const mw = s.max_web_viewers ?? 0;
+  const resKey = WEB_RES_OPTS.some(o => o.key === `${ww}x${wh}`) ? `${ww}x${wh}` : 'custom';
+  const vlKey = WEB_VIEWER_LIMIT_OPTS.some(o => o.val === mw) ? String(mw) : 'custom';
+  const next = {
+    screenMode: s.web_screen_mode || (s.web_independent_screen ? 'independent' : 'follow_ipad'),
+    requireApproval: !!s.web_require_approval,
+    viewerLimitMode: vlKey,
+    maxWebViewers: mw,
+    qualityMode: inferQualityKey(wfps, wbr),
+    fps: wfps,
+    bitrate: wbr,
+    resMode: resKey,
+    width: ww,
+    height: wh,
+    hidpi: lastSupportsHidpi ? (v.web_hidpi >= 2 ? 2 : 1) : 1,
+    edgeMode: WEB_EDGE_OPTS.includes(wedge) ? String(wedge) : 'custom',
+    maxEdge: wedge,
+    p2p: s.p2p_relay_enabled !== false,
+  };
+  webServerBaseline = { ...next };
+  if (webDraft) Object.assign(webDraft, next);
+  else webDraft = next;
+}
+
+function renderWebSkuForm() {
+  if (!webDraft) return;
+  const d = webDraft;
+
+  // Mode chips
+  const mEl = document.getElementById('webModeChips');
+  if (mEl) {
+    const opts = [
+      { v: 'follow_ipad', label: '跟随 iPad', disabled: false },
+      { v: 'independent', label: '独立虚拟屏', disabled: !supportsWebIndependent },
+      { v: 'main', label: '电脑主屏幕', disabled: false },
+    ];
+    mEl.innerHTML = opts.map(o =>
+      `<button type="button" class="sku-chip ${d.screenMode === o.v ? (o.v === 'main' ? 'selected-ok' : 'selected') : ''}" data-m="${o.v}" ${o.disabled ? 'disabled title="仅 macOS Extend 模式支持"' : ''}>${esc(o.label)}</button>`
+    ).join('');
+    mEl.querySelectorAll('button').forEach(b => b.addEventListener('click', () => {
+      if (!webDraft) return;
+      webDraft.screenMode = b.dataset.m;
+      setWebDirty(true);
+      renderWebSkuForm();
+    }));
+  }
+
+  // Approval chips
+  const apEl = document.getElementById('webApprovalChips');
+  if (apEl) {
+    apEl.innerHTML = [
+      { v: false, label: '口令直连' },
+      { v: true, label: '需审批与信任' },
+    ].map(o =>
+      `<button type="button" class="sku-chip ${d.requireApproval === o.v ? (o.v ? 'selected-ok' : 'selected') : ''}" data-ap="${o.v ? '1' : '0'}">${esc(o.label)}</button>`
+    ).join('');
+    apEl.querySelectorAll('button').forEach(b => b.addEventListener('click', () => {
+      if (!webDraft) return;
+      webDraft.requireApproval = b.dataset.ap === '1';
+      setWebDirty(true);
+      renderWebSkuForm();
+    }));
+  }
+
+  // Viewer limit chips
+  const vlEl = document.getElementById('webViewerLimitChips');
+  if (vlEl) {
+    vlEl.innerHTML = WEB_VIEWER_LIMIT_OPTS.map(o =>
+      `<button type="button" class="sku-chip ${d.viewerLimitMode === o.key ? (o.key === '0' ? 'selected' : 'selected-ok') : ''}" data-vl="${o.key}">${esc(o.label)}</button>`
+    ).join('');
+    vlEl.querySelectorAll('button').forEach(b => b.addEventListener('click', () => {
+      if (!webDraft) return;
+      const k = b.dataset.vl;
+      webDraft.viewerLimitMode = k;
+      if (k !== 'custom') webDraft.maxWebViewers = Number(k);
+      setWebDirty(true);
+      renderWebSkuForm();
+    }));
+  }
+  const vlCust = document.getElementById('webViewerLimitCustom');
+  if (vlCust) {
+    vlCust.classList.toggle('hidden', d.viewerLimitMode !== 'custom');
+    const inp = document.getElementById('webCustomViewerLimit');
+    if (inp && document.activeElement !== inp) inp.value = d.maxWebViewers;
+  }
+
+  // Quality chips
+  const qEl = document.getElementById('webQualityChips');
+  if (qEl) {
+    qEl.innerHTML = QUALITY_SKU_OPTS.map(o =>
+      `<button type="button" class="sku-chip ${d.qualityMode === o.key ? 'selected' : ''}" data-q="${o.key}">${esc(o.label)}</button>`
+    ).join('');
+    qEl.querySelectorAll('button').forEach(b => b.addEventListener('click', () => {
+      if (!webDraft) return;
+      const k = b.dataset.q;
+      webDraft.qualityMode = k;
+      const opt = QUALITY_SKU_OPTS.find(o => o.key === k);
+      if (opt && opt.fps) { webDraft.fps = opt.fps; webDraft.bitrate = opt.bitrate; }
+      setWebDirty(true);
+      renderWebSkuForm();
+    }));
+  }
+  const qCust = document.getElementById('webQualityCustom');
+  if (qCust) {
+    qCust.classList.toggle('hidden', d.qualityMode !== 'custom');
+    const fInp = document.getElementById('webCustomFps');
+    const bInp = document.getElementById('webCustomBitrate');
+    if (fInp && document.activeElement !== fInp) fInp.value = d.fps;
+    if (bInp && document.activeElement !== bInp) bInp.value = d.bitrate;
+  }
+
+  // Resolution chips
+  const rEl = document.getElementById('webResChips');
+  if (rEl) {
+    rEl.innerHTML = WEB_RES_OPTS.map(o =>
+      `<button type="button" class="sku-chip ${d.resMode === o.key ? 'selected' : ''}" data-r="${o.key}">${esc(o.label)}</button>`
+    ).join('');
+    rEl.querySelectorAll('button').forEach(b => b.addEventListener('click', () => {
+      if (!webDraft) return;
+      const k = b.dataset.r;
+      webDraft.resMode = k;
+      const opt = WEB_RES_OPTS.find(o => o.key === k);
+      if (opt && opt.w) { webDraft.width = opt.w; webDraft.height = opt.h; }
+      setWebDirty(true);
+      renderWebSkuForm();
+    }));
+  }
+  const rCust = document.getElementById('webResCustom');
+  if (rCust) {
+    rCust.classList.toggle('hidden', d.resMode !== 'custom');
+    const wInp = document.getElementById('webCustomW');
+    const hInp = document.getElementById('webCustomH');
+    if (wInp && document.activeElement !== wInp) wInp.value = d.width;
+    if (hInp && document.activeElement !== hInp) hInp.value = d.height;
+  }
+
+  // HiDPI chips
+  const hEl = document.getElementById('webHidpiChips');
+  if (hEl) {
+    const opts = [
+      { v: 1, label: '1x', disabled: false },
+      { v: 2, label: '2x', disabled: !lastSupportsHidpi },
+    ];
+    hEl.innerHTML = opts.map(o =>
+      `<button type="button" class="sku-chip ${d.hidpi === o.v ? 'selected' : ''}" data-h="${o.v}" ${o.disabled ? 'disabled title="仅 macOS 虚拟屏支持 2x Retina"' : ''}>${esc(o.label)}</button>`
+    ).join('');
+    hEl.querySelectorAll('button').forEach(b => b.addEventListener('click', () => {
+      if (!webDraft) return;
+      webDraft.hidpi = Number(b.dataset.h);
+      setWebDirty(true);
+      renderWebSkuForm();
+    }));
+  }
+
+  // Max edge chips
+  const eEl = document.getElementById('webEdgeChips');
+  if (eEl) {
+    const opts = [
+      { k: '0', label: '自动' },
+      { k: '1280', label: '1280px' },
+      { k: '1920', label: '1920px' },
+      { k: '2560', label: '2560px' },
+      { k: '3840', label: '3840px' },
+      { k: 'custom', label: '自定义' },
+    ];
+    eEl.innerHTML = opts.map(o =>
+      `<button type="button" class="sku-chip ${d.edgeMode === o.k ? 'selected' : ''}" data-e="${o.k}">${esc(o.label)}</button>`
+    ).join('');
+    eEl.querySelectorAll('button').forEach(b => b.addEventListener('click', () => {
+      if (!webDraft) return;
+      const k = b.dataset.e;
+      webDraft.edgeMode = k;
+      if (k !== 'custom') webDraft.maxEdge = Number(k);
+      else if (!webDraft.maxEdge) webDraft.maxEdge = 1920;
+      setWebDirty(true);
+      renderWebSkuForm();
+    }));
+  }
+  const eCust = document.getElementById('webEdgeCustom');
+  if (eCust) {
+    eCust.classList.toggle('hidden', d.edgeMode !== 'custom');
+    const inp = document.getElementById('webCustomEdge');
+    if (inp && document.activeElement !== inp) inp.value = d.maxEdge || 1920;
+  }
+
+  // P2P chips
+  const pEl = document.getElementById('webP2pChips');
+  if (pEl) {
+    pEl.innerHTML = [
+      { v: true, label: '开启' },
+      { v: false, label: '关闭' },
+    ].map(o =>
+      `<button type="button" class="sku-chip ${d.p2p === o.v ? (o.v ? 'selected-ok' : 'selected') : ''}" data-p="${o.v ? '1' : '0'}">${esc(o.label)}</button>`
+    ).join('');
+    pEl.querySelectorAll('button').forEach(b => b.addEventListener('click', () => {
+      if (!webDraft) return;
+      webDraft.p2p = b.dataset.p === '1';
+      setWebDirty(true);
+      renderWebSkuForm();
+    }));
+  }
+
+  const prev = document.getElementById('webDraftPreview');
+  if (prev) {
+    const modeStr = d.screenMode === 'main' ? '电脑主屏幕' : (d.screenMode === 'independent' ? '独立屏' : '跟随iPad');
+    const apStr = d.requireApproval ? '需审批' : '免审批';
+    const limStr = d.maxWebViewers === 0 ? '禁止观看(0)' : `最多${d.maxWebViewers}人`;
+    const edgeStr = d.maxEdge ? `推流≤${d.maxEdge}px` : '推流最高4K';
+    prev.textContent = `当前已选：${modeStr} · ${apStr} · ${limStr} · ${d.width}×${d.height} · ${d.hidpi}x HiDPI · ${d.fps}fps / ${d.bitrate}Mbps · ${edgeStr} · ${d.p2p ? 'P2P开' : 'P2P关'}`;
+  }
+}
+
+function onWebCustomViewerLimitInput() {
+  if (!webDraft) return;
+  const v = parseInt(document.getElementById('webCustomViewerLimit')?.value, 10);
+  if (!isNaN(v) && v >= 0) webDraft.maxWebViewers = v;
+  setWebDirty(true);
+  renderWebSkuForm();
+}
+function onWebCustomQualityInput() {
+  if (!webDraft) return;
+  webDraft.fps = parseInt(document.getElementById('webCustomFps')?.value, 10) || 30;
+  webDraft.bitrate = parseInt(document.getElementById('webCustomBitrate')?.value, 10) || 16;
+  setWebDirty(true);
+  renderWebSkuForm();
+}
+function onWebCustomResInput() {
+  if (!webDraft) return;
+  webDraft.width = parseInt(document.getElementById('webCustomW')?.value, 10) || 1280;
+  webDraft.height = parseInt(document.getElementById('webCustomH')?.value, 10) || 720;
+  setWebDirty(true);
+  renderWebSkuForm();
+}
+function onWebCustomEdgeInput() {
+  if (!webDraft) return;
+  webDraft.maxEdge = parseInt(document.getElementById('webCustomEdge')?.value, 10) || 0;
+  setWebDirty(true);
+  renderWebSkuForm();
+}
+
+function discardWebSkuEdits() {
+  setWebDirty(false);
+  if (lastAdminState) {
+    syncWebDraftFromServer(lastAdminState);
+    renderWebSkuForm();
+  }
+}
+
+async function applyWebSkuSettings() {
+  if (!webDraft) return;
+  const d = webDraft;
+  if (d.width < 320 || d.height < 240) {
+    showToast('网页扩展屏分辨率至少为 320×240', 'err');
+    return;
+  }
+  if (d.edgeMode === 'custom' && (d.maxEdge < 640 || d.maxEdge > 3840)) {
+    showToast('自定义推流长边上限须在 640~3840 之间', 'err');
+    return;
+  }
+  const base = webServerBaseline;
+  const effEdge = d.edgeMode === '0' ? 0 : d.maxEdge;
+  const baseEdge = base ? (base.edgeMode === '0' ? 0 : base.maxEdge) : null;
+  // Diff-patch ONLY changed Web fields to preserve CFG-1 CLI override isolation & CFG-4 low-power baseline.
+  const body = {};
+  if (!base || d.maxWebViewers !== base.maxWebViewers) body.max_web_viewers = d.maxWebViewers;
+  if (!base || d.width !== base.width || d.height !== base.height) {
+    body.web_width = d.width;
+    body.web_height = d.height;
+  }
+  if (!base || d.fps !== base.fps) body.web_fps = d.fps;
+  if (!base || d.bitrate !== base.bitrate) body.web_bitrate_mbps = d.bitrate;
+  if (!base || d.hidpi !== base.hidpi) body.web_hidpi = d.hidpi;
+  if (!base || effEdge !== baseEdge) body.web_max_pixel_edge = effEdge;
+  if (!base || d.screenMode !== base.screenMode) body.web_screen_mode = d.screenMode;
+  if (!base || d.requireApproval !== base.requireApproval) body.web_require_approval = d.requireApproval;
+  if (!base || d.p2p !== base.p2p) body.p2p_relay_enabled = d.p2p;
+  if (Object.keys(body).length === 0) {
+    setWebDirty(false);
+    showToast('当前没有待应用的网页扩展屏设置变更', 'ok');
+    return;
+  }
+  debugTrace('apply_web_sku', body);
+  const msg = document.getElementById('webScreenModeMsg');
+  const r = await api('/api/admin/settings', { method: 'POST', body: JSON.stringify(body) });
+  if (r.ok) {
+    setWebDirty(false);
+    if (r.data && r.data.video) {
+      syncWebDraftFromServer({ video: r.data.video, settings: r.data });
+      renderWebSkuForm();
+    }
+    const v = r.data.video;
+    const txt = `网页扩展屏设置已生效：观看上限 ${r.data.max_web_viewers} 人 · ${v.web_width}×${v.web_height} · ${v.web_hidpi}x · ${v.web_fps}fps / ${v.web_bitrate_mbps}Mbps`;
+    showToast(txt, 'ok');
+    if (msg) { msg.className = 'msg ok'; msg.textContent = txt; }
+    refreshAdmin();
+  } else {
+    const err = (r.data && r.data.error) || '应用失败';
+    showToast(err, 'err');
+    if (msg) { msg.className = 'msg err'; msg.textContent = err; }
+  }
+}
+
+async function resetWebSkuSettings() {
+  debugTrace('click_reset_web_video', {});
+  const msg = document.getElementById('webScreenModeMsg');
+  const r = await api('/api/admin/settings', {
+    method: 'POST',
+    body: JSON.stringify({ reset_web_video: true }),
+  });
+  if (r.ok) {
+    setWebDirty(false);
+    if (r.data && r.data.video) {
+      syncWebDraftFromServer({ video: r.data.video, settings: r.data });
+      renderWebSkuForm();
+    }
+    const txt = '网页扩展屏已重置为默认：观看上限 0（禁止观看）· 跟随 iPad · 1280×720 · 30fps / 16Mbps · 1x · P2P开';
+    showToast(txt, 'ok');
+    if (msg) { msg.className = 'msg ok'; msg.textContent = txt; }
+    refreshAdmin();
+  } else {
+    const err = (r.data && r.data.error) || '重置失败';
+    showToast(err, 'err');
+    if (msg) { msg.className = 'msg err'; msg.textContent = err; }
+  }
+}
+
+async function setViewToken() {
+  const tok = document.getElementById('newViewToken').value.trim();
+  const msg = document.getElementById('viewTokenMsg');
+  const payload = { view_token: tok };
+  const autoOpened = !lastLowPower
+    && lastAdminState
+    && lastAdminState.settings
+    && !lastAdminState.settings.low_power
+    && lastAdminState.settings.max_web_viewers === 0;
+  if (autoOpened) payload.max_web_viewers = 1;
+  const r = await api('/api/admin/settings', { method: 'POST', body: JSON.stringify(payload) });
+  if (r.ok) {
+    document.getElementById('newViewToken').value = '';
+    const activeTok = r.data.view_token || tok;
+    const openedNow = autoOpened && r.data.max_web_viewers > 0;
+    msg.className = 'msg ok';
+    msg.innerHTML = '观看口令已保存' + (openedNow ? '（已自动将网页观看上限设为 1）' : '') + '，已更新 <code>/view?token=' + esc(encodeURIComponent(activeTok)) + '</code> 链接与观看二维码。';
+    lastConnSig = '';
+    refreshAdmin();
+  } else {
+    msg.className = 'msg err';
+    msg.textContent = r.data.error || '设置失败';
+  }
+}
+
+async function rotateViewToken() {
+  const msg = document.getElementById('viewTokenMsg');
+  const payload = { rotate_view_token: true };
+  const autoOpened = !lastLowPower
+    && lastAdminState
+    && lastAdminState.settings
+    && !lastAdminState.settings.low_power
+    && lastAdminState.settings.max_web_viewers === 0;
+  if (autoOpened) payload.max_web_viewers = 1;
+  const r = await api('/api/admin/settings', { method: 'POST', body: JSON.stringify(payload) });
+  if (r.ok) {
+    const activeTok = r.data.generated_view_token || r.data.view_token || '';
+    const openedNow = autoOpened && r.data.max_web_viewers > 0;
+    msg.className = 'msg ok';
+    msg.innerHTML = '已生成新观看口令：<code>' + esc(activeTok) + '</code>' + (openedNow ? '（已自动将网页观看上限设为 1）' : '') + '，直达链接与观看二维码已自动更新。';
+    lastConnSig = '';
+    refreshAdmin();
+  } else {
+    msg.className = 'msg err';
+    msg.textContent = r.data.error || '生成失败';
+  }
+}
+
+async function disableViewToken() {
+  const msg = document.getElementById('viewTokenMsg');
+  const r = await api('/api/admin/settings', { method: 'POST', body: JSON.stringify({ disable_view_token: true }) });
+  if (r.ok) {
+    msg.className = 'msg ok';
+    msg.textContent = '已关闭网页观看、关闭独立观看端口并断开全部在线观众。';
+    lastConnSig = '';
+    refreshAdmin();
+  } else {
+    msg.className = 'msg err';
+    msg.textContent = r.data.error || '关闭失败';
+  }
+}
+
+async function addTrusted() {
+  const fingerprint = document.getElementById('addFingerprint').value.trim();
+  const name = document.getElementById('addName').value.trim() || 'Manual Device';
+  const msg = document.getElementById('trustMsg');
+  if (!fingerprint) {
+    msg.className = 'msg err';
+    msg.textContent = '请填写有效的设备指纹（示例 fp:a1b2c3d4e5f60718293a4b5c）';
+    return;
+  }
+  const r = await api('/api/admin/trusted/add', { method: 'POST', body: JSON.stringify({ fingerprint, name }) });
+  if (r.ok) {
+    document.getElementById('addFingerprint').value = '';
+    document.getElementById('addName').value = '';
+    msg.className = 'msg ok';
+    msg.textContent = '已保存到受信设备列表。';
+    refreshAdmin();
+  } else {
+    msg.className = 'msg err';
+    msg.textContent = r.data.error || '添加失败';
+  }
+}
+
+async function clearTrustedPrefs(fingerprint) {
+  if (!fingerprint) return;
+  const r = await api('/api/admin/trusted/clear-prefs', { method: 'POST', body: JSON.stringify({ fingerprint }) });
+  if (!r.ok) { showToast((r.data && r.data.error) || '清除设备偏好失败', 'err'); return; }
+  showToast('已清除该设备的独立偏好，将跟随全局/预设配置', 'ok');
+  refreshAdmin();
+}
+
+async function revokeTrusted(fingerprint) {
+  const r = await api('/api/admin/trusted/revoke', { method: 'POST', body: JSON.stringify({ fingerprint }) });
+  if (!r.ok) { showToast((r.data && r.data.error) || '撤销受信设备失败', 'err'); return; }
+  showToast('已撤销受信设备并断开对应连接', 'ok');
+  refreshAdmin();
+}
+
+function setConfigDirty(dirty) {
+  configDirty = !!dirty;
+  const b = document.getElementById('configDirtyBadge');
+  const btn = document.getElementById('btnSaveConfigYaml');
+  if (b) b.classList.toggle('hidden', !configDirty);
+  if (btn) btn.classList.toggle('pulse', configDirty);
+}
+
+function onConfigYamlInput() {
+  setConfigDirty(true);
+}
+
+function handleYamlTab(e) {
+  if (e.key !== 'Tab') return;
+  e.preventDefault();
+  const ta = e.target;
+  const start = ta.selectionStart;
+  const end = ta.selectionEnd;
+  ta.value = ta.value.substring(0, start) + '  ' + ta.value.substring(end);
+  ta.selectionStart = ta.selectionEnd = start + 2;
+  setConfigDirty(true);
+}
+
+async function toggleRuntimeDebug() {
+  const cur = !!(lastAdminState && lastAdminState.host && (lastAdminState.host.debug_logging_enabled ?? lastAdminState.host.debug_enabled));
+  const next = !cur;
+  const r = await api('/api/admin/debug', {
+    method: 'POST',
+    body: JSON.stringify({ enabled: next }),
+  });
+  if (r.ok) {
+    showToast(next ? '已实时开启 DEBUG 调试日志' : '已关闭 DEBUG 调试日志', 'ok');
+    refreshAdmin();
+  } else {
+    showToast((r.data && r.data.error) || '切换调试日志失败', 'err');
+  }
+}
+
+async function downloadDebugBundle() {
+  const r = await api('/api/admin/debug/bundle');
+  if (!r.ok || !r.data) {
+    showToast((r.data && r.data.error) || '获取诊断包失败', 'err');
+    return;
+  }
+  const text = JSON.stringify(r.data, null, 2);
+  const blob = new Blob([text], { type: 'application/json;charset=utf-8' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `idis-debug-bundle-${Date.now()}.json`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  showToast('已导出脱敏诊断包 JSON', 'ok');
+}
+
+function openConfigCard() {
+  const card = document.getElementById('configCard');
+  if (card) {
+    card.open = true;
+    card.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    if (!configDirty) loadConfigYaml(false, true);
+  }
+}
+
+function syncConfigYamlFromHost(btn) {
+  if (configDirty && btn) {
+    confirmDanger(btn, '丢弃未保存修改？', () => loadConfigYaml(false, true));
+    return;
+  }
+  loadConfigYaml(false, true);
+}
+
+function reloadConfigYamlFromDisk(btn) {
+  if (configDirty && btn) {
+    confirmDanger(btn, '丢弃修改并重载？', () => loadConfigYaml(true, true));
+    return;
+  }
+  loadConfigYaml(true, true);
+}
+
+async function loadConfigYaml(reloadDisk, forceReplace = false) {
+  const msg = document.getElementById('configYamlMsg');
+  const ed = document.getElementById('configYamlEditor');
+  if (!ed) return;
+  const url = reloadDisk ? '/api/admin/config/reload' : '/api/admin/config';
+  const r = await api(url, reloadDisk ? { method: 'POST', body: '{}' } : {});
+  if (r.ok && r.data && typeof r.data.yaml === 'string') {
+    configLoadedOnce = true;
+    // When disk YAML failed to parse at startup, load the verbatim broken disk content instead of
+    // an empty fallback template so fixing & saving never wipes existing trusted devices!
+    const textToLoad = (r.data.config_corrupt && typeof r.data.raw_disk_yaml === 'string')
+      ? r.data.raw_disk_yaml
+      : r.data.yaml;
+    if (forceReplace || reloadDisk || (document.activeElement !== ed && !configDirty)) {
+      ed.value = textToLoad;
+      setConfigDirty(false);
+    }
+    const pEl = document.getElementById('configFilePath');
+    if (pEl && r.data.path) pEl.textContent = r.data.path;
+    if (r.data.config_corrupt && msg) {
+      msg.className = 'msg err';
+      const detail = r.data.parse_error ? `（解析错误：${r.data.parse_error}）` : '';
+      msg.textContent = `警告：启动时磁盘配置文件解析失败，已加载磁盘原始内容供修复${detail}；修复后点击「保存并应用」解除只读保护。`;
+    } else if (reloadDisk) {
+      setVideoDirty(false);
+      setWebDirty(false);
+      showToast('已从磁盘重新加载配置文件并应用', 'ok');
+      if (msg) { msg.className = 'msg ok'; msg.textContent = '已从磁盘重载并热生效。'; }
+      refreshAdmin();
+    } else if (forceReplace) {
+      showToast('已同步最新配置', 'ok');
+      if (msg) { msg.className = 'msg ok'; msg.textContent = '已同步当前已落盘配置。'; }
+    }
+  } else if (reloadDisk || forceReplace) {
+    const err = (r.data && r.data.error) || '加载失败';
+    showToast(err, 'err');
+    if (msg) { msg.className = 'msg err'; msg.textContent = err; }
+  }
+}
+
+async function saveConfigYaml() {
+  const ed = document.getElementById('configYamlEditor');
+  const msg = document.getElementById('configYamlMsg');
+  if (!ed) return;
+  const r = await api('/api/admin/config', {
+    method: 'POST',
+    body: JSON.stringify({ yaml: ed.value }),
+  });
+  if (r.ok) {
+    if (r.data && typeof r.data.yaml === 'string') ed.value = r.data.yaml;
+    setConfigDirty(false);
+    setVideoDirty(false);
+    setWebDirty(false);
+    showToast('配置文件已保存并热生效', 'ok');
+    if (msg) { msg.className = 'msg ok'; msg.textContent = '已写入 ' + (r.data.path || '内存') + ' 并实时生效。'; }
+    refreshAdmin();
+  } else {
+    const err = (r.data && r.data.error) || '保存失败';
+    showToast(err, 'err');
+    if (msg) { msg.className = 'msg err'; msg.textContent = err; }
+  }
+}
+
+function downloadConfigYaml() {
+  const ed = document.getElementById('configYamlEditor');
+  const content = (ed && ed.value) ? ed.value : '';
+  if (!content) {
+    loadConfigYaml(false).then(() => {
+      if (ed && ed.value) downloadConfigYaml();
+    });
+    return;
+  }
+  const blob = new Blob([content], { type: 'text/yaml;charset=utf-8' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'idis.yaml';
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
+
+function triggerImportConfigYaml() {
+  const inp = document.getElementById('configImportInput');
+  if (inp) { inp.value = ''; inp.click(); }
+}
+
+function handleImportConfigYaml(ev) {
+  const file = ev.target && ev.target.files && ev.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = () => {
+    const ed = document.getElementById('configYamlEditor');
+    if (ed) {
+      ed.value = String(reader.result || '');
+      configLoadedOnce = true;
+      setConfigDirty(true);
+      showToast('已导入到编辑器，请点击「保存并应用」生效', 'info');
+    }
+  };
+  reader.readAsText(file);
+}
+
+async function resetConfigYaml() {
+  const ed = document.getElementById('configYamlEditor');
+  const msg = document.getElementById('configYamlMsg');
+  const r = await api('/api/admin/config/reset', {
+    method: 'POST',
+    body: JSON.stringify({ keep_trusted: true }),
+  });
+  if (r.ok) {
+    if (ed && r.data && typeof r.data.yaml === 'string') ed.value = r.data.yaml;
+    setConfigDirty(false);
+    setVideoDirty(false);
+    setWebDirty(false);
+    showToast('已重置偏好配置，保留受信设备列表', 'ok');
+    if (msg) { msg.className = 'msg ok'; msg.textContent = '偏好配置已重置为默认，已保留受信设备。'; }
+    refreshAdmin();
+  } else {
+    const err = (r.data && r.data.error) || '重置失败';
+    showToast(err, 'err');
+    if (msg) { msg.className = 'msg err'; msg.textContent = err; }
+  }
+}
+
+let lastVdRulesSig = '';
+let cachedDesktopWindows = [];
+let desktopWindowsLoadedOnce = false;
+
+function describeRuleTarget(target) {
+  if (!target || typeof target !== 'object') return '任意临时虚拟屏';
+  switch (target.kind) {
+    case 'any_virtual': return '任意临时虚拟屏';
+    case 'virtual_name': return `虚拟屏 · ${target.name || '-'}`;
+    case 'any_ipad': return '任意 iPad 扩展屏';
+    case 'device': return `指定 iPad · ${target.fingerprint || '-'}`;
+    case 'web_screen': return '网页独立屏';
+    case 'main_display': return '电脑主屏幕';
+    default: return String(target.kind || '-');
+  }
+}
+
+function renderVirtualDisplaysAndRules(d) {
+  const caps = (d.host && d.host.capabilities) || {};
+  const supportsVd = caps.virtual_display !== false;
+  const supportsRouting = caps.window_routing !== false;
+  const hint = document.getElementById('windowRoutingUnsupportedHint');
+  if (hint) {
+    if (!supportsVd && !supportsRouting) {
+      hint.textContent = '当前主机平台暂不支持独立虚拟屏与跨屏窗口归位（目前仅 macOS 支持）。';
+      hint.classList.remove('hidden');
+    } else if (caps.accessibility_permission_required && !caps.accessibility_granted) {
+      hint.textContent = '未授予 macOS 辅助功能权限，可正常创建虚拟屏，但自动/手动挪动窗口需在系统设置中开启辅助功能授权。';
+      hint.classList.remove('hidden');
+    } else {
+      hint.classList.add('hidden');
+    }
+  }
+  const btnCreate = document.getElementById('btnCreateVd');
+  if (btnCreate) btnCreate.disabled = !supportsVd;
+
+  const vds = Array.isArray(d.virtual_displays) ? d.virtual_displays : [];
+  const rules = Array.isArray(d.window_rules) ? d.window_rules : [];
+  const screens = Array.isArray(d.screens) ? d.screens : [];
+  const sig = JSON.stringify([vds, rules, screens.map(s => [s.id, s.display_id, s.name, s.kind])]);
+  if (sig === lastVdRulesSig) {
+    if (!desktopWindowsLoadedOnce && supportsRouting) {
+      desktopWindowsLoadedOnce = true;
+      refreshDesktopWindows(false);
+    }
+    return;
+  }
+  lastVdRulesSig = sig;
+
+  const vdBadge = document.getElementById('vdCountBadge');
+  if (vdBadge) {
+    vdBadge.textContent = `${vds.length} 块虚拟屏`;
+    vdBadge.className = 'badge ' + (vds.length > 0 ? 'ok' : 'info');
+  }
+  const vdBox = document.getElementById('vdListBox');
+  if (vdBox) {
+    if (!vds.length) {
+      vdBox.innerHTML = '<span style="color:var(--muted)">暂无临时虚拟屏，可点击上方「新建虚拟屏」创建。</span>';
+    } else {
+      vdBox.innerHTML = vds.map(v => `
+        <div class="row" style="justify-content:space-between;padding:6px 8px;border:1px solid var(--border);border-radius:6px;margin-bottom:6px">
+          <span><strong>${esc(v.name)}</strong> <span class="badge info">${v.width}×${v.height}</span> <span style="color:var(--muted)">ID ${v.display_id}</span></span>
+          <button class="danger" data-vd-id="${v.id}" onclick="removeVirtualDisplay(Number(this.dataset.vdId))">销毁</button>
+        </div>
+      `).join('');
+    }
+  }
+
+  const ruleBadge = document.getElementById('windowRuleCountBadge');
+  if (ruleBadge) ruleBadge.textContent = String(rules.length);
+  const rb = document.getElementById('windowRulesBody');
+  if (rb) {
+    if (!rules.length) {
+      rb.innerHTML = '<tr><td colspan="5" style="color:var(--muted)">暂无自动规则，可在下方窗口列表中点「存为规则」快速生成</td></tr>';
+    } else {
+      rb.innerHTML = rules.map((r, idx) => {
+        const condParts = [];
+        if (r.app_name) condParts.push(`应用: ${r.app_name}`);
+        if (r.bundle_id) condParts.push(`ID: ${r.bundle_id}`);
+        if (r.title_contains) condParts.push(`标题含: ${r.title_contains}`);
+        const flBadge = r.floating_only ? ' <span class="badge warn">仅悬浮窗</span>' : '';
+        const layoutTxt = r.layout === 'fill_screen' ? '铺满屏幕' : '保持尺寸';
+        return `<tr>
+          <td><span class="badge ${r.enabled ? 'ok' : 'info'}">${r.enabled ? '启用' : '停用'}</span></td>
+          <td>${esc(condParts.join(' · ') || '-')}${flBadge}</td>
+          <td>${esc(describeRuleTarget(r.target))}</td>
+          <td>${layoutTxt}</td>
+          <td>
+            <span class="row">
+              <button data-rule-idx="${idx}" onclick="toggleWindowRule(Number(this.dataset.ruleIdx))">${r.enabled ? '停用' : '启用'}</button>
+              <button class="danger" data-rule-id="${esc(r.id)}" onclick="deleteWindowRule(this.dataset.ruleId)">删除</button>
+            </span>
+          </td>
+        </tr>`;
+      }).join('');
+    }
+  }
+
+  renderDesktopWindowsTable();
+  if (!desktopWindowsLoadedOnce && supportsRouting) {
+    desktopWindowsLoadedOnce = true;
+    refreshDesktopWindows(false);
+  }
+}
+
+async function createVirtualDisplay() {
+  const nameEl = document.getElementById('newVdName');
+  const sizeEl = document.getElementById('newVdSize');
+  const msg = document.getElementById('vdActionMsg');
+  const [wStr, hStr] = String((sizeEl && sizeEl.value) || '1280x720').split('x');
+  const r = await api('/api/admin/virtual-displays', {
+    method: 'POST',
+    body: JSON.stringify({
+      name: (nameEl && nameEl.value.trim()) || '隐藏屏',
+      width: Number(wStr) || 1280,
+      height: Number(hStr) || 720,
+    }),
+  });
+  if (r.ok) {
+    if (nameEl) nameEl.value = '';
+    if (msg) { msg.className = 'msg ok'; msg.textContent = '临时虚拟屏已创建。'; }
+    showToast('已创建临时虚拟屏', 'ok');
+    await refreshAdmin();
+    refreshDesktopWindows(false);
+  } else {
+    const err = (r.data && r.data.error) || '创建虚拟屏失败';
+    if (msg) { msg.className = 'msg err'; msg.textContent = err; }
+    showToast(err, 'err');
+  }
+}
+
+async function removeVirtualDisplay(id) {
+  const msg = document.getElementById('vdActionMsg');
+  const r = await api('/api/admin/virtual-displays/remove', {
+    method: 'POST',
+    body: JSON.stringify({ id }),
+  });
+  if (r.ok) {
+    if (msg) { msg.className = 'msg ok'; msg.textContent = '临时虚拟屏已销毁。'; }
+    showToast('已销毁临时虚拟屏', 'ok');
+    await refreshAdmin();
+    refreshDesktopWindows(false);
+  } else {
+    const err = (r.data && r.data.error) || '销毁失败';
+    if (msg) { msg.className = 'msg err'; msg.textContent = err; }
+    showToast(err, 'err');
+  }
+}
+
+async function refreshDesktopWindows(showFeedback) {
+  const msg = document.getElementById('desktopWinMsg');
+  const r = await api('/api/admin/windows');
+  if (r.ok && r.data) {
+    cachedDesktopWindows = Array.isArray(r.data.windows) ? r.data.windows : [];
+    if (lastAdminState && Array.isArray(r.data.screens)) {
+      lastAdminState.screens = r.data.screens;
+    }
+    renderDesktopWindowsTable();
+    if (showFeedback) {
+      if (msg) { msg.className = 'msg ok'; msg.textContent = `已刷新，检测到 ${cachedDesktopWindows.length} 个窗口。`; }
+    }
+  } else if (showFeedback) {
+    const err = (r.data && r.data.error) || '读取窗口列表失败';
+    if (msg) { msg.className = 'msg err'; msg.textContent = err; }
+  }
+}
+
+function renderDesktopWindowsTable() {
+  const body = document.getElementById('desktopWindowsBody');
+  const badge = document.getElementById('desktopWinCountBadge');
+  if (!body) return;
+  const screens = (lastAdminState && Array.isArray(lastAdminState.screens)) ? lastAdminState.screens : [];
+  const screenById = new Map(screens.map(s => [s.display_id, s]));
+  const filterTxt = String((document.getElementById('windowFilterText') || {}).value || '').trim().toLowerCase();
+  const floatingOnly = Boolean((document.getElementById('windowFloatingOnlyFilter') || {}).checked);
+  const filtered = cachedDesktopWindows.filter(w => {
+    if (floatingOnly && !w.is_floating) return false;
+    if (!filterTxt) return true;
+    return String(w.app_name || '').toLowerCase().includes(filterTxt)
+      || String(w.title || '').toLowerCase().includes(filterTxt)
+      || String(w.bundle_id || '').toLowerCase().includes(filterTxt);
+  });
+  if (badge) badge.textContent = String(filtered.length);
+  if (!filtered.length) {
+    body.innerHTML = '<tr><td colspan="5" style="color:var(--muted)">暂无匹配窗口，可点击「刷新窗口」</td></tr>';
+    return;
+  }
+  const defaultTarget = screens.find(s => s.kind === 'virtual')
+    || screens.find(s => s.kind === 'ipad')
+    || screens[0];
+  body.innerHTML = filtered.map((w, idx) => {
+    const curScreen = screenById.get(w.display_id);
+    const curLabel = curScreen ? curScreen.name : `屏幕 ${w.display_id}`;
+    const flBadge = w.is_floating ? ' <span class="badge warn">悬浮窗</span>' : '';
+    const titleSub = w.title ? `<div style="color:var(--muted);font-size:11px">${esc(w.title)}</div>` : '';
+    const opts = screens.map(s => {
+      const sel = (defaultTarget && s.display_id === defaultTarget.display_id) ? ' selected' : '';
+      return `<option value="${s.display_id}"${sel}>${esc(s.name)}</option>`;
+    }).join('');
+    return `<tr>
+      <td><strong>${esc(w.app_name || w.bundle_id || '未知应用')}</strong>${flBadge}<div style="color:var(--muted);font-size:11px">${w.width}×${w.height}</div>${titleSub}</td>
+      <td>${esc(curLabel)}</td>
+      <td><select id="winTargetSel_${idx}" style="background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:4px 6px;font-size:12px">${opts}</select></td>
+      <td><select id="winLayoutSel_${idx}" style="background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:4px 6px;font-size:12px"><option value="keep_size" selected>保持尺寸</option><option value="fill_screen">铺满屏幕</option></select></td>
+      <td>
+        <span class="row">
+          <button class="primary" data-wid="${w.window_id}" data-pid="${w.pid}" data-row="${idx}" onclick="moveDesktopWindowRow(Number(this.dataset.wid), Number(this.dataset.pid), Number(this.dataset.row))">挪过去</button>
+          <button data-wid="${w.window_id}" data-row="${idx}" onclick="saveRuleFromWindowRow(Number(this.dataset.wid), Number(this.dataset.row))">存为规则</button>
+        </span>
+      </td>
+    </tr>`;
+  }).join('');
+}
+
+async function moveDesktopWindowRow(windowId, pid, rowIdx) {
+  const msg = document.getElementById('desktopWinMsg');
+  const tSel = document.getElementById(`winTargetSel_${rowIdx}`);
+  const lSel = document.getElementById(`winLayoutSel_${rowIdx}`);
+  const targetDisplayId = Number(tSel && tSel.value);
+  const layout = (lSel && lSel.value) || 'keep_size';
+  if (!targetDisplayId) {
+    if (msg) { msg.className = 'msg err'; msg.textContent = '请先新建虚拟屏或选择目标屏幕。'; }
+    return;
+  }
+  const r = await api('/api/admin/windows/move', {
+    method: 'POST',
+    body: JSON.stringify({ window_id: windowId, pid, target_display_id: targetDisplayId, layout }),
+  });
+  if (r.ok) {
+    if (msg) { msg.className = 'msg ok'; msg.textContent = '窗口已挪动到目标屏幕。'; }
+    showToast('已挪动窗口', 'ok');
+    refreshDesktopWindows(false);
+  } else {
+    const err = (r.data && r.data.error) || '移动窗口失败';
+    if (msg) { msg.className = 'msg err'; msg.textContent = err; }
+    showToast(err, 'err');
+  }
+}
+
+async function saveRuleFromWindowRow(windowId, rowIdx) {
+  const msg = document.getElementById('windowRuleMsg');
+  const w = cachedDesktopWindows.find(item => item.window_id === windowId);
+  if (!w) return;
+  const screens = (lastAdminState && Array.isArray(lastAdminState.screens)) ? lastAdminState.screens : [];
+  const tSel = document.getElementById(`winTargetSel_${rowIdx}`);
+  const lSel = document.getElementById(`winLayoutSel_${rowIdx}`);
+  const targetDisplayId = Number(tSel && tSel.value);
+  const targetScreen = screens.find(s => s.display_id === targetDisplayId);
+  let target = { kind: 'any_virtual' };
+  if (targetScreen) {
+    if (targetScreen.kind === 'virtual') target = { kind: 'any_virtual' };
+    else if (targetScreen.kind === 'ipad' && targetScreen.device_fingerprint) target = { kind: 'device', fingerprint: targetScreen.device_fingerprint };
+    else if (targetScreen.kind === 'ipad') target = { kind: 'any_ipad' };
+    else if (targetScreen.kind === 'web') target = { kind: 'web_screen' };
+    else if (targetScreen.is_main) target = { kind: 'main_display' };
+  }
+  const rule = {
+    id: '',
+    enabled: true,
+    app_name: w.app_name || '',
+    bundle_id: w.bundle_id || '',
+    title_contains: w.is_floating ? '' : (w.title || '').slice(0, 64),
+    floating_only: Boolean(w.is_floating),
+    target,
+    layout: (lSel && lSel.value) || 'keep_size',
+  };
+  const r = await api('/api/admin/window-rules/upsert', {
+    method: 'POST',
+    body: JSON.stringify(rule),
+  });
+  if (r.ok) {
+    if (msg) { msg.className = 'msg ok'; msg.textContent = '已保存自动归位规则并立即生效。'; }
+    showToast('已保存自动归位规则', 'ok');
+    await refreshAdmin();
+    refreshDesktopWindows(false);
+  } else {
+    const err = (r.data && r.data.error) || '保存规则失败';
+    if (msg) { msg.className = 'msg err'; msg.textContent = err; }
+    showToast(err, 'err');
+  }
+}
+
+async function toggleWindowRule(idx) {
+  const rules = (lastAdminState && Array.isArray(lastAdminState.window_rules)) ? lastAdminState.window_rules : [];
+  const rule = rules[idx];
+  if (!rule) return;
+  const r = await api('/api/admin/window-rules/upsert', {
+    method: 'POST',
+    body: JSON.stringify({ ...rule, enabled: !rule.enabled }),
+  });
+  if (r.ok) {
+    showToast(rule.enabled ? '规则已停用' : '规则已启用', 'ok');
+    refreshAdmin();
+  } else {
+    showToast((r.data && r.data.error) || '更新规则失败', 'err');
+  }
+}
+
+async function deleteWindowRule(id) {
+  const r = await api('/api/admin/window-rules/delete', {
+    method: 'POST',
+    body: JSON.stringify({ id }),
+  });
+  if (r.ok) {
+    showToast('已删除自动规则', 'ok');
+    refreshAdmin();
+  } else {
+    showToast((r.data && r.data.error) || '删除规则失败', 'err');
+  }
+}
+
+async function applyWindowRulesNow() {
+  const msg = document.getElementById('windowRuleMsg');
+  const r = await api('/api/admin/window-rules/apply', {
+    method: 'POST',
+    body: JSON.stringify({}),
+  });
+  if (r.ok && r.data && r.data.report) {
+    const rep = r.data.report;
+    const summary = `已执行：挪动 ${rep.moved} 个，跳过 ${rep.skipped} 个，失败 ${rep.failed} 个`
+      + (rep.errors && rep.errors.length ? `（${rep.errors[0]}）` : '');
+    if (msg) { msg.className = 'msg ' + (rep.failed > 0 ? 'err' : 'ok'); msg.textContent = summary; }
+    showToast(summary, rep.failed > 0 ? 'warn' : 'ok');
+    refreshDesktopWindows(false);
+  } else {
+    const err = (r.data && r.data.error) || '执行规则失败';
+    if (msg) { msg.className = 'msg err'; msg.textContent = err; }
+    showToast(err, 'err');
+  }
+}
+
+checkAuth();
+</script>
+</body>
+</html>

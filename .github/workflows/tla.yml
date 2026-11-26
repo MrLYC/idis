@@ -1,0 +1,57 @@
+name: TLA+ Invariant Verification
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/architecture.md"
+      - "docs/tla/**"
+      - "src/session/**"
+      - "src/web/**"
+      - "src/user_config.rs"
+      - "src/trust.rs"
+      - "src/platform/**"
+      - "macos/bridge.m"
+      - ".github/workflows/tla.yml"
+  pull_request:
+    paths:
+      - "docs/architecture.md"
+      - "docs/tla/**"
+      - "src/session/**"
+      - "src/web/**"
+      - "src/user_config.rs"
+      - "src/trust.rs"
+      - "src/platform/**"
+      - "macos/bridge.m"
+      - ".github/workflows/tla.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tla-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tlc:
+    name: Run TLC Model Checker
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Cache tla2tools.jar
+        id: cache-tla
+        uses: actions/cache@v4
+        with:
+          path: /tmp/tla2tools.jar
+          key: tla2tools-v1.8.0
+
+      - name: Run TLC on all TLA+ specifications
+        run: ./docs/tla/check.sh --download

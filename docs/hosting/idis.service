@@ -1,0 +1,13 @@
+[Unit]
+Description=idis Web Extended Screen Host
+Requires=idis.socket
+After=idis.socket graphical-session.target network-online.target
+
+[Service]
+Type=simple
+# 修改为实际 idis 可执行文件路径；如需抓屏，请确认 DISPLAY 与 XAUTHORITY 与当前 X11 会话一致。
+# 如需同时预托管传统 Wi-Fi 端口，请取消 idis.socket 中对应端口注释并在此添加 --wifi。
+Environment=DISPLAY=:0
+ExecStart=/usr/local/bin/idis --web --no-usb --idle-exit-secs 300 --port-idle-close-secs 300
+KillSignal=SIGTERM
+TimeoutStopSec=10

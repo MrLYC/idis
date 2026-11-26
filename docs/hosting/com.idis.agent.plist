@@ -1,0 +1,87 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  macOS launchd Socket Activation 后台托管模板（平时 0 进程 / 0 内存 / 0 CPU，访问管理端秒起，空闲自动退出）
+
+  使用方法：
+  1. 将本文件复制到 ~/Library/LaunchAgents/com.idis.agent.plist
+  2. 修改 ProgramArguments 中的 idis 绝对路径与参数（按需调整 --idle-exit-secs、--port-idle-close-secs 等）
+  3. 加载并启用：
+       launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.idis.agent.plist
+  4. 卸载停用：
+       launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.idis.agent.plist
+
+  说明：
+  - 默认仅由 launchd 在内核态托管本机管理端口 127.0.0.1:8787（完全不阻止 Mac 深睡眠）。
+  - 浏览器访问 http://127.0.0.1:8787/ 时，launchd 瞬时拉起 idis 并移交监听 socket。
+  - 在管理后台开启网页扩展屏或 Wi-Fi 端口后，对应对外端口自动按需开启，并在无连接超时后自动关闭。
+  - 全局无活跃连接持续 --idle-exit-secs（默认 300 秒）后 idis 自动退出，恢复 0 进程待机。
+  - 如需同时预托管传统 Wi-Fi 端口，可取消下方 telemetry / data 注释并添加 --wifi 参数。
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.idis.agent</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/idis</string>
+    <string>--web</string>
+    <string>--no-usb</string>
+    <string>--idle-exit-secs</string>
+    <string>300</string>
+    <string>--port-idle-close-secs</string>
+    <string>300</string>
+  </array>
+
+  <key>Sockets</key>
+  <dict>
+    <key>web</key>
+    <dict>
+      <key>SockNodeName</key>
+      <string>127.0.0.1</string>
+      <key>SockServiceName</key>
+      <string>8787</string>
+      <key>SockType</key>
+      <string>stream</string>
+      <key>SockFamily</key>
+      <string>IPv4</string>
+    </dict>
+    <!-- 可选：如需预托管传统 Wi-Fi 客户端端口，取消注释并在 ProgramArguments 加入 <string>--wifi</string>
+    <key>telemetry</key>
+    <dict>
+      <key>SockNodeName</key>
+      <string>0.0.0.0</string>
+      <key>SockServiceName</key>
+      <string>56845</string>
+      <key>SockType</key>
+      <string>stream</string>
+      <key>SockFamily</key>
+      <string>IPv4</string>
+    </dict>
+    <key>data</key>
+    <dict>
+      <key>SockNodeName</key>
+      <string>0.0.0.0</string>
+      <key>SockServiceName</key>
+      <string>56846</string>
+      <key>SockType</key>
+      <string>stream</string>
+      <key>SockFamily</key>
+      <string>IPv4</string>
+    </dict>
+    -->
+  </dict>
+
+  <key>RunAtLoad</key>
+  <false/>
+  <key>KeepAlive</key>
+  <false/>
+  <key>ProcessType</key>
+  <string>Adaptive</string>
+  <key>StandardOutPath</key>
+  <string>/tmp/idis.launchd.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/idis.launchd.err.log</string>
+</dict>
+</plist>

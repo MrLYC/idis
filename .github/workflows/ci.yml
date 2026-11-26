@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test-and-lint:
+    name: Test & Lint (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run cargo test
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "12.3"
+        run: cargo test --locked
+
+      - name: Run cargo clippy
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "12.3"
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Run Web frontend & static integrity tests
+        if: matrix.os == 'ubuntu-latest'
+        run: node tests/web_frontend_test.mjs

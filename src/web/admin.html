@@ -351,11 +351,43 @@
       </div>
     </div>
 
+    <div class="card hidden" id="screenRecordingWarnBanner" style="border-color:var(--danger);background:rgba(248,81,73,.1)">
+      <div class="row" style="justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap">
+        <div style="flex:1;min-width:260px">
+          <strong style="color:var(--danger)">需要授予 macOS「屏幕录制」权限才能投屏</strong>
+          <div style="color:var(--muted);font-size:12px;margin-top:4px;line-height:1.6" id="screenRecordingWarnDetail">
+            请前往主机「系统设置 → 隐私与安全性 → 屏幕录制」，勾选启动 <code>idis</code> 的终端应用或 <code id="screenRecExePath">idis</code>（升级新版本后如已勾选，请先关闭再重新打开），完成后重启 <code>idis</code>。
+          </div>
+        </div>
+        <div class="row" style="gap:8px;flex-wrap:wrap">
+          <button class="primary" onclick="requestOsPermission('screen_recording')">打开屏幕录制设置</button>
+          <button onclick="requestOsPermission('recheck')">重新检测权限</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="card hidden" id="captureErrorBanner" style="border-color:var(--warn);background:rgba(210,153,34,.1)">
+      <div class="row" style="justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap">
+        <div style="flex:1;min-width:260px">
+          <strong style="color:var(--warn)">最近一次屏幕采集启动失败</strong>
+          <div style="color:var(--muted);font-size:12px;margin-top:3px" id="captureErrorDetail"></div>
+        </div>
+        <div class="row" style="gap:8px">
+          <button onclick="requestOsPermission('recheck')">检测系统权限</button>
+          <button onclick="requestOsPermission('dismiss_capture_error')">知道了</button>
+        </div>
+      </div>
+    </div>
+
     <div class="card hidden" id="accessibilityWarnBanner" style="border-color:var(--warn);background:rgba(210,153,34,.1)">
-      <div class="row" style="justify-content:space-between;align-items:center">
-        <div>
+      <div class="row" style="justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap">
+        <div style="flex:1;min-width:260px">
           <strong style="color:var(--warn)">尚未授予系统辅助功能权限</strong>
           <div style="color:var(--muted);font-size:12px;margin-top:2px">远程键鼠输入已开启，但系统未授予辅助功能权限，触摸与键盘事件将被系统忽略。请前往「系统设置 → 隐私与安全性 → 辅助功能」勾选终端或 <code>idis</code>。</div>
+        </div>
+        <div class="row" style="gap:8px;flex-wrap:wrap">
+          <button class="warn" onclick="requestOsPermission('accessibility')">打开辅助功能设置</button>
+          <button onclick="requestOsPermission('recheck')">重新检测</button>
         </div>
       </div>
     </div>
@@ -1782,9 +1814,27 @@ async function refreshAdmin() {
   // Trusted devices (use data-* + DOM listener instead of inline onclick to eliminate XSS & quote syntax bugs)
   const corruptBanner = document.getElementById('configCorruptBanner');
   if (corruptBanner) corruptBanner.classList.toggle('hidden', !d.host.config_corrupt);
+  const caps = d.host.capabilities || {};
+  const lastCapErr = d.host.last_capture_error || null;
+  const needScreenRec = (!!caps.screen_recording_permission_required && !caps.screen_recording_granted)
+    || (lastCapErr && lastCapErr.code === 'screen_recording_denied');
+  const screenRecBanner = document.getElementById('screenRecordingWarnBanner');
+  if (screenRecBanner) {
+    screenRecBanner.classList.toggle('hidden', !needScreenRec);
+    const exeEl = document.getElementById('screenRecExePath');
+    if (exeEl) exeEl.textContent = d.host.executable_path || 'idis';
+  }
+  const capErrBanner = document.getElementById('captureErrorBanner');
+  if (capErrBanner) {
+    const showOtherCapErr = !needScreenRec && !!lastCapErr;
+    capErrBanner.classList.toggle('hidden', !showOtherCapErr);
+    const capErrDetail = document.getElementById('captureErrorDetail');
+    if (capErrDetail && showOtherCapErr) {
+      capErrDetail.textContent = lastCapErr.message || '屏幕采集启动失败，请重试或导出诊断包查看详情。';
+    }
+  }
   const accBanner = document.getElementById('accessibilityWarnBanner');
   if (accBanner) {
-    const caps = d.host.capabilities || {};
     const needAcc = !!caps.accessibility_permission_required && !caps.accessibility_granted && !!d.settings.allow_input;
     accBanner.classList.toggle('hidden', !needAcc);
   }
@@ -3181,6 +3231,19 @@ async function toggleRuntimeDebug() {
     refreshAdmin();
   } else {
     showToast((r.data && r.data.error) || '切换调试日志失败', 'err');
+  }
+}
+
+async function requestOsPermission(kind) {
+  const r = await api('/api/admin/permissions/request', {
+    method: 'POST',
+    body: JSON.stringify({ kind }),
+  });
+  if (r.ok) {
+    showToast((r.data && r.data.message) || '已执行权限检查', 'ok');
+    refreshAdmin();
+  } else {
+    showToast((r.data && r.data.error) || '请求系统权限失败', 'err');
   }
 }
 

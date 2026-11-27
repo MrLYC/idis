@@ -1970,6 +1970,8 @@ static inline CMTime id_sc_min_frame_interval(uint32_t fps) {
                     // First-frame watchdog with automatic escalation for Intel/AMD Macs where
                     // SCStream starts cleanly yet emits 0 frames:
                     //   Tier 0 (NV12) --1.5s--> Tier 1 (minimal 32BGRA) --2.0s--> Tier 2 (CGDisplayStream / Screenshot fallback)
+                    // Pass attempt:0 so escalation reuses the existing online CGVirtualDisplay
+                    // WITHOUT re-applying display modes or flickering the Mac's main screen.
                     uint64_t watchDelayMs = (tier == 0) ? 1500ULL : 2000ULL;
                     __weak typeof(self) weakWatch = self;
                     dispatch_after(
@@ -1996,7 +1998,7 @@ static inline CMTime id_sc_min_frame_interval(uint32_t fps) {
                                     tier,
                                     nextTier
                                 );
-                                [strongWatch scheduleCaptureRestartAfterMs:150 targetW:0 targetH:0 attempt:1];
+                                [strongWatch scheduleCaptureRestartAfterMs:120 targetW:0 targetH:0 attempt:0];
                             }
                         }
                     );
@@ -2006,7 +2008,7 @@ static inline CMTime id_sc_min_frame_interval(uint32_t fps) {
             if (permissionDenied) {
                 return NO;
             }
-            if (displayMissing && hasVirtual && self.virtualDisplay && (attempt % 2 == 1)) {
+            if (displayMissing && hasVirtual && self.virtualDisplay && attempt == 1 && !self.virtualDisplay.lastModeMatchedExact) {
                 [self.virtualDisplay selectMatchingCGDisplayModeLogicalW:self.requestedLogicalW
                                                                 logicalH:self.requestedLogicalH];
             }
@@ -2027,6 +2029,23 @@ static inline CMTime id_sc_min_frame_interval(uint32_t fps) {
                    && self.displayID != kCGNullDirectDisplay
                    && CGDisplayIsOnline(self.displayID));
     if (online && !forceRecreate) {
+        // Avoid calling `applySettings:` / `CGDisplaySetDisplayMode` when the virtual display is
+        // already online at the requested geometry & HiDPI scale — redundant mode-set calls force
+        // WindowServer to flash the Mac's primary display on Intel hardware!
+        CGRect curBounds = CGDisplayBounds(self.displayID);
+        if (curBounds.size.width < 320.0 || curBounds.size.height < 240.0) {
+            os_unfair_lock_lock(&self->_boundsLock);
+            curBounds = self->_scDisplayFrame;
+            os_unfair_lock_unlock(&self->_boundsLock);
+        }
+        uint32_t curW = (uint32_t)llround(curBounds.size.width);
+        uint32_t curH = (uint32_t)llround(curBounds.size.height);
+        BOOL sameDims = (curW >= 320 && curH >= 240
+                         && abs((int)curW - (int)logW) <= 2
+                         && abs((int)curH - (int)logH) <= 2);
+        if (sameDims && self.virtualDisplay.hiDPI == self.hiDPI) {
+            return YES;
+        }
         self.virtualDisplay.hiDPI = self.hiDPI;
         [self.virtualDisplay applyWidth:logW height:logH];
         return YES;
@@ -2159,8 +2178,12 @@ static inline CMTime id_sc_min_frame_interval(uint32_t fps) {
                     && !atomic_load_explicit(&strongSelf->_stopped, memory_order_acquire)
                     && !atomic_load_explicit(&strongSelf->_sleeping, memory_order_acquire)
                     && atomic_load_explicit(&strongSelf->_generation, memory_order_acquire) == myGen) {
-                    // Capped exponential backoff (0.5s -> 1s -> 2s -> 4s -> 5s) repeating until unlocked/recovered or stopped.
-                    int nextAttempt = attempt < 10 ? (attempt + 1) : 10;
+                    if (atomic_load_explicit(&gLastScreenCaptureDenied, memory_order_acquire) || attempt >= 6) {
+                        id_diag_log("sc_restart_stopped", @"attempt=%d denied=%d vdOk=%d encOk=%d", attempt, atomic_load_explicit(&gLastScreenCaptureDenied, memory_order_acquire) ? 1 : 0, vdOk ? 1 : 0, encOk ? 1 : 0);
+                        return;
+                    }
+                    // Capped exponential backoff (0.5s -> 1s -> 2s -> 4s -> 5s), bounded to avoid infinite flicker loops.
+                    int nextAttempt = attempt + 1;
                     int64_t nextDelay = (int64_t)MIN(5000, 500 * (1 << MIN(attempt, 3)));
                     id_diag_log("sc_restart_retry", @"attempt=%d nextDelayMs=%lld vdOk=%d encOk=%d", attempt, (long long)nextDelay, vdOk ? 1 : 0, encOk ? 1 : 0);
                     [strongSelf scheduleCaptureRestartAfterMs:nextDelay targetW:targetW targetH:targetH attempt:nextAttempt];
@@ -3150,7 +3173,7 @@ void *id_macos_capture_start(
                 uint32_t expectedH = (height * ctrl.hiDPI) & ~1u;
                 BOOL modeSelected = vd.lastModeMatchedExact;
                 for (int attempt = 0; attempt < 20; attempt++) {
-                    if (!modeSelected && (attempt == 0 || attempt == 2 || attempt == 5 || attempt == 9 || attempt == 14)) {
+                    if (!modeSelected && (attempt == 1 || attempt == 7)) {
                         modeSelected = [vd selectMatchingCGDisplayModeLogicalW:width logicalH:height];
                     }
                     usleep(40000);
@@ -3441,6 +3464,58 @@ int32_t id_macos_is_accessibility_trusted(void) {
 
 int32_t id_macos_is_screen_capture_granted(void) {
     return atomic_load_explicit(&gLastScreenCaptureDenied, memory_order_acquire) ? 0 : 1;
+}
+
+int32_t id_macos_probe_screen_capture_permission(void) {
+    @autoreleasepool {
+        if (@available(macOS 12.3, *)) {
+            dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+            __block int32_t granted = 1;
+            [SCShareableContent getShareableContentExcludingDesktopWindows:NO
+                                                       onScreenWindowsOnly:YES
+                                                         completionHandler:^(SCShareableContent *content, NSError *error) {
+                @autoreleasepool {
+                    if (error && error.code == -3801) {
+                        granted = 0;
+                        atomic_store_explicit(&gLastScreenCaptureDenied, YES, memory_order_release);
+                        id_diag_log("sc_probe_denied", @"code=%ld err=%@", (long)error.code, error.localizedDescription);
+                    } else if (content != nil) {
+                        granted = 1;
+                        atomic_store_explicit(&gLastScreenCaptureDenied, NO, memory_order_release);
+                    }
+                    dispatch_semaphore_signal(sem);
+                }
+            }];
+            dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)));
+            return granted;
+        }
+        return 1;
+    }
+}
+
+int32_t id_macos_request_permission(int32_t kind) {
+    @autoreleasepool {
+        if (kind == 0) {
+            if (@available(macOS 10.15, *)) {
+                (void)CGRequestScreenCaptureAccess();
+            }
+            NSURL *url = [NSURL URLWithString:@"x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"];
+            if (url) {
+                [[NSWorkspace sharedWorkspace] openURL:url];
+            }
+            return id_macos_probe_screen_capture_permission();
+        }
+        if (kind == 1) {
+            NSDictionary *opts = @{ (__bridge id)kAXTrustedCheckOptionPrompt: @YES };
+            Boolean trusted = AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)opts);
+            NSURL *url = [NSURL URLWithString:@"x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"];
+            if (url) {
+                [[NSWorkspace sharedWorkspace] openURL:url];
+            }
+            return trusted ? 1 : 0;
+        }
+        return 0;
+    }
 }
 
 int32_t id_macos_is_screen_locked(void) {

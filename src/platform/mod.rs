@@ -552,6 +552,8 @@ pub struct PlatformCapabilities {
     pub true_capture_pause: bool,
     pub accessibility_permission_required: bool,
     pub accessibility_granted: bool,
+    pub screen_recording_permission_required: bool,
+    pub screen_recording_granted: bool,
 }
 
 /// Platform abstraction implemented natively on macOS, Linux, and Windows, plus Mock for tests.
@@ -582,8 +584,18 @@ pub trait DisplayBackend: Send + Sync {
             true_capture_pause: false,
             accessibility_permission_required: false,
             accessibility_granted: true,
+            screen_recording_permission_required: false,
+            screen_recording_granted: true,
         }
     }
+
+    /// Prompt the OS permission dialog / open System Settings for `"screen_recording"` or `"accessibility"`.
+    fn request_permission(&self, _kind: &str) -> Result<String> {
+        Ok("当前平台无需额外系统权限授权".to_string())
+    }
+
+    /// Actively re-probe OS capture/input permissions on demand (used by Web Admin "重新检测" button).
+    fn recheck_permissions(&self) {}
 
     /// Live OS screen-lock query (overridable by MockBackend for deterministic lock-policy tests).
     fn is_host_screen_locked(&self) -> bool {

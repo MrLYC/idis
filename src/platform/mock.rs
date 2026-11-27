@@ -392,6 +392,8 @@ impl DisplayBackend for MockBackend {
             true_capture_pause: true,
             accessibility_permission_required: false,
             accessibility_granted: self.accessibility_granted.load(Ordering::Acquire),
+            screen_recording_permission_required: false,
+            screen_recording_granted: true,
         }
     }
 

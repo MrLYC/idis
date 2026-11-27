@@ -701,7 +701,7 @@ impl SessionRegistry {
             eff_hidpi,
             capture_mode
         );
-        let (mut cap_handle, frame_rx) = self.backend.start_capture(&CaptureParams {
+        let (mut cap_handle, frame_rx) = match self.backend.start_capture(&CaptureParams {
             mode: capture_mode,
             display_id: if watch_main { 0 } else { self.config.display_id },
             capture_rect: if watch_main {
@@ -729,7 +729,16 @@ impl SessionRegistry {
             } else {
                 stable_display_serial("idis-web-viewer")
             },
-        })?;
+        }) {
+            Ok(v) => {
+                self.clear_capture_error();
+                v
+            }
+            Err(e) => {
+                self.record_capture_error("web", &e);
+                return Err(e);
+            }
+        };
         if self.is_low_power() {
             let _ = cap_handle.set_low_power(true);
         }

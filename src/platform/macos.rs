@@ -119,6 +119,8 @@ extern "C" {
     fn id_macos_inject_text(units: *const u16, len: usize);
     fn id_macos_is_accessibility_trusted() -> i32;
     fn id_macos_is_screen_capture_granted() -> i32;
+    fn id_macos_probe_screen_capture_permission() -> i32;
+    fn id_macos_request_permission(kind: i32) -> i32;
     fn id_macos_is_screen_locked() -> i32;
     fn id_macos_pump_main_runloop();
     fn id_macos_resolve_iface_ip(
@@ -277,6 +279,17 @@ pub struct MacOsBackend;
 
 impl MacOsBackend {
     pub fn new() -> Self {
+        // Run one non-blocking ScreenCaptureKit permission probe at startup so Web Admin
+        // immediately knows whether Screen Recording permission is granted without any
+        // `CGPreflightScreenCaptureAccess()` false-negatives.
+        std::thread::spawn(|| {
+            let granted = unsafe { id_macos_probe_screen_capture_permission() } != 0;
+            if !granted {
+                tracing::warn!(
+                    "macOS Screen Recording permission is NOT granted — open System Settings -> Privacy & Security -> Screen Recording, enable your Terminal app or `idis` (after upgrading, toggle off & on), then restart `idis`."
+                );
+            }
+        });
         Self
     }
 }
@@ -767,7 +780,35 @@ impl DisplayBackend for MacOsBackend {
             true_capture_pause: true,
             accessibility_permission_required: true,
             accessibility_granted: is_accessibility_trusted(),
+            screen_recording_permission_required: true,
+            screen_recording_granted: unsafe { id_macos_is_screen_capture_granted() } != 0,
         }
+    }
+
+    fn request_permission(&self, kind: &str) -> Result<String> {
+        match kind {
+            "screen_recording" => {
+                let granted = unsafe { id_macos_request_permission(0) } != 0;
+                if granted {
+                    Ok("屏幕录制权限已授权，可直接连接使用。".to_string())
+                } else {
+                    Ok("已在主机上打开「系统设置 → 隐私与安全性 → 屏幕录制」。请勾选当前终端或 idis（升级版本后请先关闭再重新打开），然后重启 idis。".to_string())
+                }
+            }
+            "accessibility" => {
+                let granted = unsafe { id_macos_request_permission(1) } != 0;
+                if granted {
+                    Ok("辅助功能权限已授权，远程键鼠与触控已可用。".to_string())
+                } else {
+                    Ok("已在主机上打开「系统设置 → 隐私与安全性 → 辅助功能」。请勾选当前终端或 idis 后点击重新检测。".to_string())
+                }
+            }
+            other => Err(anyhow!("未知权限类型: {other}")),
+        }
+    }
+
+    fn recheck_permissions(&self) {
+        let _ = unsafe { id_macos_probe_screen_capture_permission() };
     }
 
     fn host_system_info(&self, override_host_name: &str) -> HostSystemInfo {
@@ -841,11 +882,11 @@ impl DisplayBackend for MacOsBackend {
             let screen_ok = unsafe { id_macos_is_screen_capture_granted() } != 0;
             if !screen_ok {
                 return Err(anyhow!(
-                    "failed to start macOS display capture/encoder (Screen Recording permission is not granted in System Settings -> Privacy & Security -> Screen Recording)"
+                    "macOS 拒绝了屏幕录制权限：请前往「系统设置 → 隐私与安全性 → 屏幕录制」勾选当前终端或 idis（升级版本后请先关闭再重新打开），然后重启 idis。（Screen Recording permission denied）"
                 ));
             }
             return Err(anyhow!(
-                "failed to start macOS display capture/encoder (virtual display or ScreenCaptureKit did not become ready in time; please reconnect)"
+                "启动 macOS 屏幕采集失败（虚拟屏或 ScreenCaptureKit 尚未就绪，请稍后重试或重新连接）"
             ));
         }
         Ok((Box::new(MacCaptureHandle { ptr, tx_box }), rx))

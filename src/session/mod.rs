@@ -277,6 +277,16 @@ pub(super) fn default_web_hidpi() -> u32 {
     1
 }
 
+/// Structured record of the most recent screen-capture failure surfaced to Web Admin so users
+/// receive guided OS permission approval instructions instead of silent or opaque failures.
+#[derive(Debug, Clone, Serialize)]
+pub struct CaptureErrorNotice {
+    pub code: String,
+    pub source: String,
+    pub message: String,
+    pub ts_unix: u64,
+}
+
 /// Central session coordinator shared by Wi-Fi, USB, and Web transports.
 pub(super) type CachedWebFrameSlot = Arc<Mutex<Option<(u64, Arc<EncodedFrame>)>>>;
 
@@ -311,6 +321,7 @@ pub struct SessionRegistry {
     window_rules: Mutex<Vec<WindowRule>>,
     gestures: Mutex<EdgeGesturesConfig>,
     last_gesture: Mutex<Option<LastGestureSnapshot>>,
+    last_capture_error: Mutex<Option<CaptureErrorNotice>>,
     next_window_rule_id: AtomicU64,
     next_virtual_display_id: AtomicU64,
     virtual_display_shutdown_epoch: AtomicU64,
@@ -874,6 +885,7 @@ impl SessionRegistry {
             window_rules: Mutex::new(init_window_rules),
             gestures: Mutex::new(init_gestures),
             last_gesture: Mutex::new(None),
+            last_capture_error: Mutex::new(None),
             next_window_rule_id: AtomicU64::new(1),
             next_virtual_display_id: AtomicU64::new(1),
             virtual_display_shutdown_epoch: AtomicU64::new(1),
@@ -949,6 +961,78 @@ impl SessionRegistry {
 
     pub fn last_gesture(&self) -> Option<LastGestureSnapshot> {
         self.last_gesture.lock().unwrap().clone()
+    }
+
+    pub fn last_capture_error(&self) -> Option<CaptureErrorNotice> {
+        self.last_capture_error.lock().unwrap().clone()
+    }
+
+    pub fn clear_capture_error(&self) {
+        *self.last_capture_error.lock().unwrap() = None;
+    }
+
+    pub(super) fn record_capture_error(&self, source: &str, err: &anyhow::Error) {
+        let msg = format!("{err:#}");
+        let caps = self.backend.capabilities();
+        let is_perm_denied = (caps.screen_recording_permission_required
+            && !caps.screen_recording_granted)
+            || msg.contains("屏幕录制权限")
+            || msg.contains("Screen Recording permission");
+        let code = if is_perm_denied {
+            "screen_recording_denied"
+        } else {
+            "capture_failed"
+        };
+        let ts_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        *self.last_capture_error.lock().unwrap() = Some(CaptureErrorNotice {
+            code: code.to_string(),
+            source: source.to_string(),
+            message: msg,
+            ts_unix,
+        });
+    }
+
+    pub fn request_os_permission(&self, kind: &str) -> anyhow::Result<String> {
+        match kind {
+            "recheck" => {
+                self.backend.recheck_permissions();
+                let caps = self.backend.capabilities();
+                if caps.screen_recording_granted {
+                    let mut g = self.last_capture_error.lock().unwrap();
+                    if g.as_ref().is_some_and(|e| e.code == "screen_recording_denied") {
+                        *g = None;
+                    }
+                }
+                if caps.screen_recording_permission_required && !caps.screen_recording_granted {
+                    Ok("检测到屏幕录制权限仍未生效：若刚刚勾选，请先重启 idis 进程再试。".to_string())
+                } else if caps.accessibility_permission_required
+                    && !caps.accessibility_granted
+                    && self.is_input_allowed()
+                {
+                    Ok("屏幕录制权限正常；辅助功能权限尚未生效。".to_string())
+                } else {
+                    Ok("系统权限检测通过。".to_string())
+                }
+            }
+            "dismiss_capture_error" => {
+                self.clear_capture_error();
+                Ok("已关闭错误提示。".to_string())
+            }
+            other => {
+                let msg = self.backend.request_permission(other)?;
+                let caps = self.backend.capabilities();
+                if caps.screen_recording_granted {
+                    let mut g = self.last_capture_error.lock().unwrap();
+                    if g.as_ref().is_some_and(|e| e.code == "screen_recording_denied") {
+                        *g = None;
+                    }
+                }
+                Ok(msg)
+            }
+        }
     }
 
     pub fn is_config_corrupt(&self) -> bool {

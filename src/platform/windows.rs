@@ -885,6 +885,8 @@ impl DisplayBackend for WindowsBackend {
             true_capture_pause: true,
             accessibility_permission_required: false,
             accessibility_granted: true,
+            screen_recording_permission_required: false,
+            screen_recording_granted: true,
         }
     }
 

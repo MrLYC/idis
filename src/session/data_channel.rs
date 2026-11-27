@@ -183,8 +183,12 @@ impl SessionRegistry {
                 &hs.name
             }),
         }) {
-            Ok(v) => v,
+            Ok(v) => {
+                self.clear_capture_error();
+                v
+            }
             Err(e) => {
+                self.record_capture_error("ipad", &e);
                 error!("[{key}] failed to start display capture/encoder: {e:#}");
                 sentry::integrations::anyhow::capture_anyhow(&e);
                 // Clear & close the stored data_writer so client isn't hung on an open dead socket,

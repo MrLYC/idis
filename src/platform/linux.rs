@@ -506,6 +506,8 @@ impl DisplayBackend for LinuxBackend {
             true_capture_pause: false,
             accessibility_permission_required: false,
             accessibility_granted: true,
+            screen_recording_permission_required: false,
+            screen_recording_granted: true,
         }
     }
 

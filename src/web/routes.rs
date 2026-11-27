@@ -1359,6 +1359,17 @@ pub(super) fn handle_connection(
             }
             handle_admin_window_rules_apply(&mut stream, peer, &state)
         }
+        ("POST", "/api/admin/permissions/request") => {
+            if !is_admin {
+                return send_json(
+                    &mut stream,
+                    "401 Unauthorized",
+                    &[],
+                    &serde_json::json!({ "error": "unauthorized" }),
+                );
+            }
+            handle_admin_permissions_request(&mut stream, peer, &state, &req.body)
+        }
         _ => send_json(
             &mut stream,
             "404 Not Found",
@@ -1444,6 +1455,8 @@ fn handle_admin_state(stream: &mut TcpStream, state: &WebState) -> Result<()> {
         "supports_hidpi": state.registry.supports_hidpi(),
         "supports_independent_web_screen": state.registry.supports_independent_web_screen(),
         "capabilities": state.registry.capabilities(),
+        "executable_path": std::env::current_exe().ok().map(|p| p.display().to_string()),
+        "last_capture_error": state.registry.last_capture_error(),
         "config_corrupt": state.registry.is_config_corrupt(),
         "debug_enabled": crate::debug_trace::is_debug_logging_enabled(),
         "debug_logging_enabled": crate::debug_trace::is_debug_logging_enabled(),
@@ -2565,6 +2578,51 @@ fn handle_admin_window_rules_apply(
                 &serde_json::json!({
                     "ok": true,
                     "report": report,
+                }),
+            )
+        }
+        Err(e) => send_json(
+            stream,
+            "400 Bad Request",
+            &[],
+            &serde_json::json!({ "error": format!("{e:#}") }),
+        ),
+    }
+}
+
+fn handle_admin_permissions_request(
+    stream: &mut TcpStream,
+    peer: SocketAddr,
+    state: &WebState,
+    body: &[u8],
+) -> Result<()> {
+    #[derive(Deserialize)]
+    struct PermissionReq {
+        kind: String,
+    }
+    let Ok(payload) = serde_json::from_slice::<PermissionReq>(body) else {
+        return send_json(
+            stream,
+            "400 Bad Request",
+            &[],
+            &serde_json::json!({ "error": "invalid json" }),
+        );
+    };
+    match state.registry.request_os_permission(&payload.kind) {
+        Ok(msg) => {
+            info!(
+                "[web {peer}] Admin permission action kind={:?} -> {msg}",
+                payload.kind
+            );
+            send_json(
+                stream,
+                "200 OK",
+                &[],
+                &serde_json::json!({
+                    "ok": true,
+                    "message": msg,
+                    "capabilities": state.registry.capabilities(),
+                    "last_capture_error": state.registry.last_capture_error(),
                 }),
             )
         }

@@ -1175,7 +1175,7 @@ tr:last-child td {
         </div>
         <h1>打开浏览器，让手边的平板或电脑秒变第二块高清副屏</h1>
         <p class="hero-lead">
-          idis 运行在你的主机电脑上，观看端无需安装任何软件。扫描二维码或输入口令即可全屏使用，也支持老款 iPad 插线直连、独立虚拟屏、悬浮窗自动收纳、弱网不黑屏自适应与多人局域网接力。
+          idis 运行在你的主机电脑上，观看端无需安装任何软件。扫描二维码或输入口令即可全屏使用，也支持老款 iPad 插线直连、四区边缘滑动手势与本地按日期截图、独立虚拟屏、悬浮窗自动收纳、弱网不黑屏自适应与多人局域网接力。
         </p>
         <div class="hero-actions">
           <a class="btn btn-primary" href="#workflow">开始交互导览</a>
@@ -1280,7 +1280,7 @@ tr:last-child td {
       <div class="metric-label">弱网 5 档调速始终保持原始分辨率，零黑屏</div>
     </div>
     <div class="metric-card">
-      <div class="metric-val">138 + 5</div>
+      <div class="metric-val">149 + 5</div>
       <div class="metric-label">项跨平台自动质检与定期异常乱码轰炸演练</div>
     </div>
     <div class="metric-card">
@@ -1428,9 +1428,9 @@ tr:last-child td {
   <section id="features" class="chapter">
     <div class="chapter-head">
       <div class="chapter-kicker"><span class="chapter-num">02</span><span>功能交互</span></div>
-      <h2>不只是投屏：多屏切换、锁屏护隐私、悬浮窗自动收纳</h2>
+      <h2>不只是投屏：多屏切换、锁屏护隐私、悬浮窗收纳与四区边缘手势</h2>
       <p class="chapter-lead">
-        所有高频控制都集中在一块清晰的工作台里：随时切换副屏画面来源，设定电脑锁屏后的保护动作，一键开启低电量省电，还能让置顶小浮窗自动躲进免耗电虚拟屏。
+        所有高频控制都集中在一块清晰的工作台里：随时切换副屏画面来源，设定电脑锁屏后的保护动作，一键开启低电量省电，让置顶小浮窗自动躲进免耗电虚拟屏，还能在 iPad 左右四块边缘轻滑触发本地截图、暂停或快捷操作。
       </p>
       <div class="analogy-bar">
         <strong>一秒理解：</strong>相当于在书桌旁架起一张随时可折叠的隐形副桌，还配了一位懂分寸的收纳员——主动帮你将碍眼的悬浮条归位，你伸手拿回主桌时绝不跟你抢。
@@ -1542,6 +1542,107 @@ tr:last-child td {
       </div>
     </div>
 
+    <div class="card" style="margin-top: 20px;">
+      <div class="split-grid">
+        <div>
+          <div class="control-group">
+            <div class="panel-label">v0.3.8 新特性 · iPad 四区边缘滑动手势</div>
+            <p style="margin: 0 0 12px; font-size: 14px; color: var(--ink-secondary);">
+              将平板左右两侧划分为上下四块边缘热区，从边缘向内轻滑即可触发专属动作。点击右侧任意热区或下方按钮即可体验；屏幕中间点击、写字与上下滚动始终零延迟透传，绝不误触。
+            </p>
+            <div class="chip-row" id="gest-zone-chips">
+              <button type="button" class="chip active" data-gest-zone="lt" aria-pressed="true">左上边缘向右滑</button>
+              <button type="button" class="chip" data-gest-zone="lb" aria-pressed="false">左下边缘向右滑</button>
+              <button type="button" class="chip" data-gest-zone="rt" aria-pressed="false">右上边缘向左滑</button>
+              <button type="button" class="chip" data-gest-zone="rb" aria-pressed="false">右下边缘向左滑</button>
+            </div>
+          </div>
+
+          <div class="control-group">
+            <div class="panel-label">为当前边缘热区自定义动作</div>
+            <div class="chip-row" id="gest-action-chips">
+              <button type="button" class="chip active" data-gest-act="screenshot" aria-pressed="true">本地按日期截图</button>
+              <button type="button" class="chip" data-gest-act="pause" aria-pressed="false">暂停或恢复画面</button>
+              <button type="button" class="chip" data-gest-act="input" aria-pressed="false">切换触控与只读</button>
+              <button type="button" class="chip" data-gest-act="preset" aria-pressed="false">切换场景预设</button>
+              <button type="button" class="chip" data-gest-act="hotkey" aria-pressed="false">发送自定义快捷键</button>
+              <button type="button" class="chip" data-gest-act="disconnect" aria-pressed="false">安全断开当前设备</button>
+            </div>
+          </div>
+
+          <div class="control-group" style="margin-bottom: 0;">
+            <div class="panel-label">手势与画质亮点</div>
+            <div style="font-size: 13.5px; color: var(--ink-secondary); line-height: 1.75;">
+              <div>• <strong>本地按日期自动归档截图：</strong>直接保存高清 PNG 至本机图片目录的每日子文件夹，默认路径示例 <code style="font-size: 12.5px; background: var(--surface-muted); padding: 1px 6px; border-radius: 5px;">idis-2026-11-28/idis-20261128-021800-128.png</code>，不抢焦点。</div>
+              <div>• <strong>自动贴合平板物理分辨率：</strong>默认自动档精准匹配 iPad 面板比例与清晰度上限，彻底告别右侧与下方黑边。</div>
+              <div>• <strong>镜像主屏观看更跟手：</strong>网页端升级多帧有序队列、主屏加速完整底图刷新并支持多档平滑追帧，滚动阅读不卡顿。</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="stage-col">
+          <div class="stage-header">
+            <span class="stage-title">四区边缘手势演练板</span>
+            <span class="pill ok" id="gest-status-pill">已触发 · 左上边缘向右滑</span>
+          </div>
+          <div class="svg-frame">
+            <svg viewBox="0 0 600 226" role="group" aria-label="iPad 四区边缘滑动手势交互演示">
+              <!-- Outer iPad bezel -->
+              <rect x="76" y="14" width="448" height="198" rx="22" fill="#FFFFFF" stroke="#1C1917" stroke-width="2.5"/>
+              <rect x="94" y="28" width="412" height="170" rx="12" fill="#FCFBF8" stroke="#E4DFD5" stroke-width="1.5"/>
+
+              <!-- Safe Center Touch Area -->
+              <rect x="174" y="42" width="252" height="142" rx="10" fill="#FFFFFF" stroke="#E4DFD5" stroke-dasharray="4 4"/>
+              <text x="300" y="96" text-anchor="middle" font-size="13.5" font-weight="700" fill="#1C1917" id="gest-center-title">中间正常触控区</text>
+              <text x="300" y="118" text-anchor="middle" font-size="11.5" fill="#57534E" id="gest-center-sub">点击、书写与上下拖动零延迟透传</text>
+              <rect x="214" y="134" width="172" height="28" rx="8" fill="#EFF6FF" stroke="#BFDBFE"/>
+              <text x="300" y="152" text-anchor="middle" font-size="11.5" font-weight="700" fill="#1D4ED8" id="gest-center-badge">当前动作：本地按日期截图</text>
+
+              <!-- Zone 1: Left Top -->
+              <g class="gest-zone" data-gest-zone="lt" role="button" tabindex="0" aria-pressed="true" aria-label="演练左上边缘向右滑手势" style="cursor: pointer;">
+                <rect id="gest-rect-lt" x="100" y="34" width="66" height="76" rx="9" fill="#EFF6FF" stroke="#1D4ED8" stroke-width="2"/>
+                <text x="133" y="64" text-anchor="middle" font-size="11.5" font-weight="700" fill="#1D4ED8">左上</text>
+                <text x="133" y="83" text-anchor="middle" font-size="11" fill="#57534E" id="gest-lbl-lt">截图</text>
+                <text x="133" y="100" text-anchor="middle" font-size="11" font-weight="700" fill="#1D4ED8">→</text>
+              </g>
+
+              <!-- Zone 2: Left Bottom -->
+              <g class="gest-zone" data-gest-zone="lb" role="button" tabindex="0" aria-pressed="false" aria-label="演练左下边缘向右滑手势" style="cursor: pointer;">
+                <rect id="gest-rect-lb" x="100" y="116" width="66" height="76" rx="9" fill="#F2EFE9" stroke="#CCC4B6" stroke-width="1.8"/>
+                <text x="133" y="146" text-anchor="middle" font-size="11.5" font-weight="700" fill="#1C1917">左下</text>
+                <text x="133" y="165" text-anchor="middle" font-size="11" fill="#57534E" id="gest-lbl-lb">暂停</text>
+                <text x="133" y="182" text-anchor="middle" font-size="11" font-weight="700" fill="#57534E">→</text>
+              </g>
+
+              <!-- Zone 3: Right Top -->
+              <g class="gest-zone" data-gest-zone="rt" role="button" tabindex="0" aria-pressed="false" aria-label="演练右上边缘向左滑手势" style="cursor: pointer;">
+                <rect id="gest-rect-rt" x="434" y="34" width="66" height="76" rx="9" fill="#F2EFE9" stroke="#CCC4B6" stroke-width="1.8"/>
+                <text x="467" y="64" text-anchor="middle" font-size="11.5" font-weight="700" fill="#1C1917">右上</text>
+                <text x="467" y="83" text-anchor="middle" font-size="11" fill="#57534E" id="gest-lbl-rt">触控</text>
+                <text x="467" y="100" text-anchor="middle" font-size="11" font-weight="700" fill="#57534E">←</text>
+              </g>
+
+              <!-- Zone 4: Right Bottom -->
+              <g class="gest-zone" data-gest-zone="rb" role="button" tabindex="0" aria-pressed="false" aria-label="演练右下边缘向左滑手势" style="cursor: pointer;">
+                <rect id="gest-rect-rb" x="434" y="116" width="66" height="76" rx="9" fill="#F2EFE9" stroke="#CCC4B6" stroke-width="1.8"/>
+                <text x="467" y="146" text-anchor="middle" font-size="11.5" font-weight="700" fill="#1C1917">右下</text>
+                <text x="467" y="165" text-anchor="middle" font-size="11" fill="#57534E" id="gest-lbl-rb">预设</text>
+                <text x="467" y="182" text-anchor="middle" font-size="11" font-weight="700" fill="#57534E">←</text>
+              </g>
+
+              <!-- Active swipe trail indicator -->
+              <line id="gest-swipe-line" x1="112" y1="72" x2="210" y2="72" stroke="#C2410C" stroke-width="3.5" stroke-linecap="round" class="flow-line"/>
+              <circle id="gest-swipe-dot" cx="210" cy="72" r="6" fill="#C2410C"/>
+            </svg>
+          </div>
+          <div class="status-box ok" id="gest-feedback-box" aria-live="polite">
+            <div class="status-title" id="gest-feedback-title">左上边缘向右滑 · 已保存本地高清截图</div>
+            <div id="gest-feedback-desc">已直接抓取当前画面并保存至本机图片目录的 idis-2026-11-28/idis-20261128-021800-128.png，不打断电脑正在输入的工作窗口。</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <div class="table-hint">左右滑动查看完整三端能力对比 →</div>
     <div class="table-wrap" tabindex="0" role="region" aria-label="跨平台能力对比表">
       <table>
@@ -1556,15 +1657,21 @@ tr:last-child td {
         <tbody>
           <tr>
             <td><strong>网页扩展屏与多人局域网接力</strong></td>
-            <td>系统原生高速采集与芯片硬件加速</td>
+            <td>系统原生高速采集、主屏加速底图与芯片硬件加速</td>
             <td>原生桌面采集，自动适配显卡加速</td>
             <td>原生高速桌面抓取，适配主流显卡加速</td>
           </tr>
           <tr>
             <td><strong>独立虚拟屏与免耗电临时屏</strong></td>
-            <td>原生支持，最多 4 块免耗电临时副屏</td>
+            <td>苹果芯片与 Intel 机型均支持，自动贴合平板比例无黑边，最多 4 块临时屏</td>
             <td>主屏与区域采集</td>
             <td>主屏与多屏采集</td>
+          </tr>
+          <tr>
+            <td><strong>iPad 四区边缘手势与按日期截图</strong></td>
+            <td>支持四区自定义手势，原生显存帧直出 PNG 按日归档</td>
+            <td>支持四区自定义手势与本地按日归档截图</td>
+            <td>支持四区自定义手势与本地按日归档截图</td>
           </tr>
           <tr>
             <td><strong>置顶悬浮窗识别与自动收纳</strong></td>
@@ -1973,14 +2080,14 @@ tr:last-child td {
                 <text x="270" y="180" text-anchor="middle" font-size="13" font-weight="700" fill="#15803D">31 项异常乱码轰炸与极端断网演练</text>
               </g>
               <!-- Layer 1 Base -->
-              <g class="pyr-layer selected" data-pyr="0" role="button" tabindex="0" aria-pressed="true" aria-label="查看底座层：107 项核心与流程测试及 5 组界面校验" style="cursor:pointer;">
+              <g class="pyr-layer selected" data-pyr="0" role="button" tabindex="0" aria-pressed="true" aria-label="查看底座层：118 项核心与流程测试及 5 组界面校验" style="cursor:pointer;">
                 <polygon id="pyr-poly-0" points="56,210 484,210 520,260 20,260" fill="#FFFFFF" stroke="#1C1917" stroke-width="2"/>
-                <text x="270" y="240" text-anchor="middle" font-size="13" font-weight="700" fill="#1C1917">107 项核心与流程测试 + 5 组界面校验</text>
+                <text x="270" y="240" text-anchor="middle" font-size="13" font-weight="700" fill="#1C1917">118 项核心与流程测试 + 5 组界面校验</text>
               </g>
             </svg>
           </div>
           <div class="status-box" id="pyr-detail" aria-live="polite">
-            <strong>底座 · 基础功能与完整流程：</strong>涵盖 79 项核心逻辑体检、25 项完整连接流程检验、3 项模拟器验证与 5 组界面按钮核验，每次更新都在 macOS、Linux、Windows 三端自动全量跑通。
+            <strong>底座 · 基础功能与完整流程：</strong>涵盖 90 项核心逻辑体检、25 项完整连接流程检验、3 项模拟器验证与 5 组界面按钮核验，每次更新都在 macOS、Linux、Windows 三端自动全量跑通。
           </div>
         </div>
 
@@ -3008,20 +3115,20 @@ tr:last-child td {
   // =========================================================================
   var pipeStages = [
     {
-      name: "1. 硬件采集 — 画面不动就不干活",
-      desc: "三端均直接调用系统原生高速录屏能力，仅在画面变化时工作。观看端切到后台或没人连接时采集立刻暂停，绝不在后台空转耗电。"
+      name: "1. 硬件采集 — 自动贴合比例，静止立刻省电",
+      desc: "三端均直接调用系统原生高速录屏能力，仅在画面变化时工作；macOS 苹果芯片与 Intel 机型均会自动贴合平板物理分辨率，告别右侧或下方黑边，无人连接时采集立刻暂停。"
     },
     {
-      name: "2. 硬件压缩 — 完整底图搭配轻量变化",
-      desc: "调用芯片内置硬件压缩能力，定期产出完整底图，平时仅传输像素局部变化。既把流量压低几倍，又保持极低电脑负载。"
+      name: "2. 硬件压缩 — 场景自适应完整底图节奏",
+      desc: "调用芯片内置硬件压缩能力，镜像主屏自动缩短完整底图间隔让网页观看更跟手，扩展副屏保持高压缩率省流量，始终维持极低电脑负载。"
     },
     {
-      name: "3. 实时传输 — 只留最新画面，绝不积压排队",
-      desc: "内部采用只留最新一帧的保鲜通道，旧画面来不及发直接丢弃，防止操作发飘滞后；多人观看时同一画面只打包一次，全员共享并支持局域网接力。"
+      name: "3. 实时传输 — 多帧保鲜队列与完整底图直通",
+      desc: "网页端采用 8 帧有序保鲜队列并支持新完整底图直通刷新，既避免高速滚动时丢帧卡顿，又防止积压滞后；多人观看时同一画面只打包一次，全员共享并支持局域网接力。"
     },
     {
-      name: "4. 浏览器播放 — 零安装直接原生硬解",
-      desc: "浏览器通过自带播放器直接硬件解码，无需装插件。一旦中途丢包或切换画面源，严格等到下一张完整底图到达再刷新，杜绝绿屏与花屏。"
+      name: "4. 浏览器播放 — 多档平滑追帧与防花屏护栏",
+      desc: "浏览器通过自带播放器直接硬件解码，内置四档温和加速追帧与底图边界保护，画面丝滑不跳帧；一旦中途丢包或切源，严格等到下一张完整底图到达再刷新，杜绝绿屏与花屏。"
     }
   ];
 
@@ -3691,7 +3798,7 @@ tr:last-child td {
   // 9. Chapter 6: Testing Pyramid & Chaos Fault Injector
   // =========================================================================
   var pyrDetails = [
-    "<strong>底座 · 基础功能与完整流程：</strong>涵盖 79 项核心逻辑体检、25 项完整连接流程检验、3 项模拟器验证与 5 组界面按钮核验，每次更新都在 macOS、Linux、Windows 三端自动全量跑通。",
+    "<strong>底座 · 基础功能与完整流程：</strong>涵盖 90 项核心逻辑体检、25 项完整连接流程检验、3 项模拟器验证与 5 组界面按钮核验，每次更新都在 macOS、Linux、Windows 三端自动全量跑通。",
     "<strong>中层 · 31 项异常乱码轰炸与极端断网演练：</strong>专门向系统投喂残缺乱码、模拟极端弱网并反复执行 19 种突然拔线与强退故障，每次代码更新几秒内全部重跑一遍。",
     "<strong>高层 · 仿真设备与真实画面播放检验：</strong>用仿真平板与浏览器批量检验横竖屏旋转、弱网波动、多人接力切换，并确认收到的视频画面每一帧都能清晰播出来。",
     "<strong>塔尖 · 数学全路径穷举与定期轰炸：</strong>用 3 套数学模型穷举所有极端并发组合，再配合每两周自动运行的 5 组高强度乱码轰炸测试，持续挖掘隐蔽边界隐患。"
@@ -4195,6 +4302,149 @@ tr:last-child td {
   });
 
   renderTla();
+
+  // =========================================================================
+  // 11. v0.3.8 iPad 4-Zone Edge Swipe Gestures Interactive Playground
+  // =========================================================================
+  var gestZoneMeta = {
+    lt: { name: "左上边缘向右滑", x1: 112, y1: 72, x2: 210, y2: 72 },
+    lb: { name: "左下边缘向右滑", x1: 112, y1: 154, x2: 210, y2: 154 },
+    rt: { name: "右上边缘向左滑", x1: 488, y1: 72, x2: 390, y2: 72 },
+    rb: { name: "右下边缘向左滑", x1: 488, y1: 154, x2: 390, y2: 154 }
+  };
+  var gestActionMeta = {
+    screenshot: {
+      short: "截图",
+      label: "本地按日期截图",
+      tone: "ok",
+      title: "已保存本地高清截图",
+      desc: "已直接抓取当前画面并保存至本机图片目录的 idis-2026-11-28/idis-20261128-021800-128.png，不打断电脑正在输入的工作窗口。"
+    },
+    pause: {
+      short: "暂停",
+      label: "暂停或恢复画面",
+      tone: "warn",
+      title: "已切换画面暂停与恢复",
+      desc: "一键定格当前副屏画面保护隐私，再次从同一边缘向内轻滑即可瞬间恢复流畅同步。"
+    },
+    input: {
+      short: "触控",
+      label: "切换触控与只读",
+      tone: "accent",
+      title: "已切换 iPad 触控开关",
+      desc: "在防误触只读与触控操作模式之间瞬时切换，切回只读时会自动松开所有已按按键，防止卡键。"
+    },
+    preset: {
+      short: "预设",
+      label: "切换场景预设",
+      tone: "accent",
+      title: "已轮换至下一套场景预设",
+      desc: "可在日常均衡、高清副屏、极简省电与网页共享之间快速循环切换，无需回到电脑端管理页。"
+    },
+    hotkey: {
+      short: "热键",
+      label: "发送自定义快捷键",
+      tone: "ok",
+      title: "已向主机发送自定义组合键",
+      desc: "支持在管理页为任意热区绑定常用组合键，例如锁屏、切换桌面空间或静音麦，一滑即达。"
+    },
+    disconnect: {
+      short: "断开",
+      label: "安全断开当前设备",
+      tone: "danger",
+      title: "已主动安全断开当前副屏会话",
+      desc: "立刻释放虚拟副屏并清理占用的连接名额，平板可随时再次重连，绝不留僵死会话。"
+    }
+  };
+  var gestBindings = {
+    lt: "screenshot",
+    lb: "pause",
+    rt: "input",
+    rb: "preset"
+  };
+  var gestActiveZone = "lt";
+
+  function renderGestures() {
+    var zMeta = gestZoneMeta[gestActiveZone];
+    var actKey = gestBindings[gestActiveZone];
+    var aMeta = gestActionMeta[actKey];
+
+    ["lt", "lb", "rt", "rb"].forEach(function (zk) {
+      var rect = byId("gest-rect-" + zk);
+      var lbl = byId("gest-lbl-" + zk);
+      var on = zk === gestActiveZone;
+      if (rect) {
+        rect.setAttribute("fill", on ? "#EFF6FF" : "#F2EFE9");
+        rect.setAttribute("stroke", on ? "#1D4ED8" : "#CCC4B6");
+        rect.setAttribute("stroke-width", on ? "2.2" : "1.6");
+      }
+      if (lbl) {
+        lbl.textContent = gestActionMeta[gestBindings[zk]].short;
+      }
+    });
+
+    document.querySelectorAll(".gest-zone").forEach(function (g) {
+      g.setAttribute("aria-pressed", String(g.getAttribute("data-gest-zone") === gestActiveZone));
+    });
+    document.querySelectorAll("#gest-zone-chips .chip").forEach(function (c) {
+      var on = c.getAttribute("data-gest-zone") === gestActiveZone;
+      c.classList.toggle("active", on);
+      c.setAttribute("aria-pressed", String(on));
+    });
+    document.querySelectorAll("#gest-action-chips .chip").forEach(function (c) {
+      var on = c.getAttribute("data-gest-act") === actKey;
+      c.classList.toggle("active", on);
+      c.setAttribute("aria-pressed", String(on));
+    });
+
+    var line = byId("gest-swipe-line");
+    var dot = byId("gest-swipe-dot");
+    if (line && dot) {
+      line.setAttribute("x1", String(zMeta.x1));
+      line.setAttribute("y1", String(zMeta.y1));
+      line.setAttribute("x2", String(zMeta.x2));
+      line.setAttribute("y2", String(zMeta.y2));
+      dot.setAttribute("cx", String(zMeta.x2));
+      dot.setAttribute("cy", String(zMeta.y2));
+    }
+
+    var pill = byId("gest-status-pill");
+    var badge = byId("gest-center-badge");
+    var box = byId("gest-feedback-box");
+    var title = byId("gest-feedback-title");
+    var desc = byId("gest-feedback-desc");
+    if (pill) {
+      pill.textContent = "已触发 · " + zMeta.name;
+      pill.className = "pill " + aMeta.tone;
+    }
+    if (badge) badge.textContent = "当前动作：" + aMeta.label;
+    if (box) box.className = "status-box " + aMeta.tone;
+    if (title) title.textContent = zMeta.name + " · " + aMeta.title;
+    if (desc) desc.textContent = aMeta.desc;
+  }
+
+  document.querySelectorAll(".gest-zone").forEach(function (g) {
+    bindKeyboardClick(g, function () {
+      gestActiveZone = g.getAttribute("data-gest-zone") || "lt";
+      renderGestures();
+    });
+  });
+  document.querySelectorAll("#gest-zone-chips .chip").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      gestActiveZone = btn.getAttribute("data-gest-zone") || "lt";
+      renderGestures();
+    });
+  });
+  document.querySelectorAll("#gest-action-chips .chip").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      var act = btn.getAttribute("data-gest-act");
+      if (act && gestActionMeta[act]) {
+        gestBindings[gestActiveZone] = act;
+        renderGestures();
+      }
+    });
+  });
+  renderGestures();
 })();
 </script>
 </body>

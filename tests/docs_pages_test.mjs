@@ -432,6 +432,12 @@ function contrastRatio(fgHex, bgHex) {
   assert.equal(byIdMap.get('feat-btn-dragback').disabled, false);
   byIdMap.get('feat-viewer-click').dispatch('keydown', { key: 'Enter' });
 
+  // Ch 2b: v0.3.8 4-zone iPad edge gesture playground
+  querySelectorAll('.gest-zone').find((g) => g.getAttribute('data-gest-zone') === 'rb').dispatch('keydown', { key: 'Enter' });
+  querySelectorAll('#gest-action-chips .chip').find((c) => c.getAttribute('data-gest-act') === 'hotkey').click();
+  assert.equal(byIdMap.get('gest-lbl-rb').textContent, '热键');
+  assert.ok(byIdMap.get('gest-feedback-title').textContent.includes('右下边缘向左滑'));
+
   // Ch 3: disable gate + drop -> glitch preview visible; re-enable gate -> clean preview visible
   byIdMap.get('pipe-gate-btn').click();
   byIdMap.get('pipe-drop-btn').click();

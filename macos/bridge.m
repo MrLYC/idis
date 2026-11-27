@@ -3,6 +3,7 @@
 #import <CoreGraphics/CoreGraphics.h>
 #import <CoreMedia/CoreMedia.h>
 #import <CoreVideo/CoreVideo.h>
+#import <IOSurface/IOSurface.h>
 #import <VideoToolbox/VideoToolbox.h>
 #import <ScreenCaptureKit/ScreenCaptureKit.h>
 #import <IOKit/IOMessage.h>
@@ -43,6 +44,7 @@ extern char **environ;
 
 typedef void (*IDDiagCallback)(const char *event, const char *detail);
 static _Atomic(IDDiagCallback) gDiagCallback = NULL;
+static _Atomic BOOL gLastScreenCaptureDenied = NO;
 
 void id_macos_set_diag_callback(IDDiagCallback cb) {
     atomic_store_explicit(&gDiagCallback, cb, memory_order_release);
@@ -752,6 +754,84 @@ static void fit_capture_to_sc_frame(
     *cfgH = fitH;
 }
 
+typedef void (^IDCGDisplayStreamFrameAvailableHandler)(
+    int32_t status,
+    uint64_t displayTime,
+    IOSurfaceRef _Nullable frameSurface,
+    void * _Nullable updateRef
+);
+typedef CFTypeRef _Nullable (*IDCGDisplayStreamCreateWithDispatchQueueFn)(
+    CGDirectDisplayID display,
+    size_t outputWidth,
+    size_t outputHeight,
+    int32_t pixelFormat,
+    CFDictionaryRef _Nullable properties,
+    dispatch_queue_t queue,
+    IDCGDisplayStreamFrameAvailableHandler _Nullable handler
+);
+typedef CGError (*IDCGDisplayStreamStartFn)(CFTypeRef stream);
+typedef CGError (*IDCGDisplayStreamStopFn)(CFTypeRef stream);
+typedef CGImageRef _Nullable (*IDCGDisplayCreateImageFn)(CGDirectDisplayID displayID);
+
+@protocol IDSCScreenshotManagerProto <NSObject>
++ (void)captureImageWithFilter:(id)contentFilter
+                 configuration:(id)config
+             completionHandler:(void (^)(CGImageRef _Nullable sampleBuffer, NSError * _Nullable error))completionHandler;
+@end
+
+static CVPixelBufferRef id_pixel_buffer_from_cgimage(CGImageRef image, uint32_t dstW, uint32_t dstH) {
+    if (!image) return NULL;
+    size_t imgW = CGImageGetWidth(image);
+    size_t imgH = CGImageGetHeight(image);
+    uint32_t w = (dstW >= 320 ? dstW : (uint32_t)imgW) & ~1u;
+    uint32_t h = (dstH >= 240 ? dstH : (uint32_t)imgH) & ~1u;
+    if (w < 320 || h < 240) return NULL;
+
+    NSDictionary *attrs = @{
+        (__bridge NSString *)kCVPixelBufferCGImageCompatibilityKey: @YES,
+        (__bridge NSString *)kCVPixelBufferCGBitmapContextCompatibilityKey: @YES,
+        (__bridge NSString *)kCVPixelBufferIOSurfacePropertiesKey: @{},
+    };
+    CVPixelBufferRef pb = NULL;
+    CVReturn cr = CVPixelBufferCreate(
+        kCFAllocatorDefault,
+        w,
+        h,
+        kCVPixelFormatType_32BGRA,
+        (__bridge CFDictionaryRef)attrs,
+        &pb
+    );
+    if (cr != kCVReturnSuccess || !pb) return NULL;
+    if (CVPixelBufferLockBaseAddress(pb, 0) != kCVReturnSuccess) {
+        CVPixelBufferRelease(pb);
+        return NULL;
+    }
+    void *base = CVPixelBufferGetBaseAddress(pb);
+    size_t bpr = CVPixelBufferGetBytesPerRow(pb);
+    CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+    if (!cs) cs = CGColorSpaceCreateDeviceRGB();
+    CGContextRef ctx = CGBitmapContextCreate(
+        base,
+        w,
+        h,
+        8,
+        bpr,
+        cs,
+        (CGBitmapInfo)(kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst)
+    );
+    if (cs) CGColorSpaceRelease(cs);
+    if (!ctx) {
+        CVPixelBufferUnlockBaseAddress(pb, 0);
+        CVPixelBufferRelease(pb);
+        return NULL;
+    }
+    CGContextSetInterpolationQuality(ctx, kCGInterpolationMedium);
+    CGContextDrawImage(ctx, CGRectMake(0, 0, (CGFloat)w, (CGFloat)h), image);
+    CGContextRelease(ctx);
+    CVPixelBufferUnlockBaseAddress(pb, 0);
+    return pb;
+}
+
 @interface IDCaptureController : NSObject <SCStreamOutput, SCStreamDelegate> {
 @public
     _Atomic BOOL _stopped;
@@ -788,6 +868,9 @@ static void fit_capture_to_sc_frame(
     _Atomic uint64_t _lastCursorDiagKey;
     _Atomic BOOL _atomicShowCursor;
     _Atomic uint64_t _lastScaleHealNs;
+    _Atomic uint32_t _captureTier;
+    _Atomic uint32_t _nullPbLogCount;
+    _Atomic BOOL _fallbackBusy;
 }
 @property (nonatomic, strong) IDVirtualDisplayWrapper *virtualDisplay;
 @property (nonatomic, assign) BOOL useVirtualDisplay;
@@ -826,8 +909,15 @@ static void fit_capture_to_sc_frame(
 @property (nonatomic, strong) dispatch_source_t refineTimer;
 @property (nonatomic, strong) NSThread *unlockObserverThread;
 @property (nonatomic, assign) CFRunLoopRef unlockRunLoop;
+@property (nonatomic, assign) CFTypeRef cgDisplayStream;
+@property (nonatomic, strong) dispatch_source_t fallbackPollTimer;
+@property (nonatomic, strong) id fallbackScFilter;
+@property (nonatomic, strong) id fallbackScConfig;
 - (void)handleVTEncodeFailure:(OSStatus)status isRefine:(BOOL)isRefine;
 - (void)scheduleCaptureRestartAfterMs:(int64_t)delayMs targetW:(uint32_t)targetW targetH:(uint32_t)targetH attempt:(int)attempt;
+- (void)processFallbackPixelBuffer:(CVPixelBufferRef)pb sourceTag:(const char *)sourceTag;
+- (void)startFallbackPollLockedWithFilter:(id)filter config:(id)cfg width:(uint32_t)w height:(uint32_t)h fps:(uint32_t)fps;
+- (BOOL)startCoreGraphicsFallbackLockedWithFilter:(id)filter config:(id)cfg width:(uint32_t)w height:(uint32_t)h fps:(uint32_t)fps showCursor:(BOOL)showCursor;
 @end
 
 static BOOL id_is_screen_locked(void) {
@@ -1391,6 +1481,24 @@ static inline CMTime id_sc_min_frame_interval(uint32_t fps) {
 
 // Must only be called on `self.lifecycleQueue`.
 - (void)stopScreenCaptureKitLocked {
+    if (self.fallbackPollTimer) {
+        dispatch_source_cancel(self.fallbackPollTimer);
+        self.fallbackPollTimer = nil;
+    }
+    self.fallbackScFilter = nil;
+    self.fallbackScConfig = nil;
+    atomic_store_explicit(&_fallbackBusy, NO, memory_order_release);
+
+    if (self.cgDisplayStream) {
+        CFTypeRef cgStream = self.cgDisplayStream;
+        self.cgDisplayStream = NULL;
+        IDCGDisplayStreamStopFn stopFn = (IDCGDisplayStreamStopFn)dlsym(RTLD_DEFAULT, "CGDisplayStreamStop");
+        if (stopFn) {
+            stopFn(cgStream);
+        }
+        CFRelease(cgStream);
+    }
+
     if (@available(macOS 12.3, *)) {
         if (self.scStream) {
             SCStream *stream = self.scStream;
@@ -1405,6 +1513,254 @@ static inline CMTime id_sc_min_frame_interval(uint32_t fps) {
     }
 }
 
+// Called on `self.queue` for Tier-2 fallback frames (CGDisplayStream IOSurface or screenshot poll).
+- (void)processFallbackPixelBuffer:(CVPixelBufferRef)pb sourceTag:(const char *)sourceTag {
+    if (!pb
+        || atomic_load_explicit(&_stopped, memory_order_acquire)
+        || atomic_load_explicit(&_sleeping, memory_order_acquire)
+        || atomic_load_explicit(&_paused, memory_order_acquire)) {
+        return;
+    }
+    uint32_t pbW = (uint32_t)CVPixelBufferGetWidth(pb) & ~1u;
+    uint32_t pbH = (uint32_t)CVPixelBufferGetHeight(pb) & ~1u;
+    if (pbW < 320 || pbH < 240) return;
+
+    BOOL firstPb = !atomic_exchange_explicit(&_loggedFirstPb, YES, memory_order_acq_rel);
+    if (firstPb) {
+        id_diag_log(
+            "fallback_first_frame",
+            @"src=%s displayID=%u pb=%ux%u enc=%ux%u tier=%u",
+            sourceTag ?: "unknown",
+            self.displayID,
+            pbW,
+            pbH,
+            self.encWidth,
+            self.encHeight,
+            atomic_load_explicit(&_captureTier, memory_order_acquire)
+        );
+    }
+    if (pbW != self.encWidth || pbH != self.encHeight || !self.vtSession) {
+        if (![self createEncoderWidth:pbW height:pbH]) {
+            return;
+        }
+    }
+    [self encodePixelBuffer:pb];
+}
+
+// Must only be called on `self.lifecycleQueue`.
+- (void)startFallbackPollLockedWithFilter:(id)filter config:(id)cfg width:(uint32_t)w height:(uint32_t)h fps:(uint32_t)fps {
+    if (self.fallbackPollTimer) {
+        dispatch_source_cancel(self.fallbackPollTimer);
+        self.fallbackPollTimer = nil;
+    }
+    self.fallbackScFilter = filter;
+    self.fallbackScConfig = cfg;
+    atomic_store_explicit(&_fallbackBusy, NO, memory_order_release);
+
+    uint32_t pollFps = fps > 0 ? MIN(fps, 30u) : 15u;
+    uint64_t intervalNs = (uint64_t)(1000000000ULL / (uint64_t)pollFps);
+    CGDirectDisplayID targetID = self.displayID;
+    uint64_t startGen = atomic_load_explicit(&_generation, memory_order_acquire);
+    Class ssCls = NSClassFromString(@"SCScreenshotManager");
+    BOOL canUseSCScreenshot = (ssCls != Nil && [ssCls respondsToSelector:@selector(captureImageWithFilter:configuration:completionHandler:)] && filter != nil && cfg != nil);
+    IDCGDisplayCreateImageFn cgCreateImage = (IDCGDisplayCreateImageFn)dlsym(RTLD_DEFAULT, "CGDisplayCreateImage");
+    id_diag_log(
+        "fallback_poll_start",
+        @"displayID=%u size=%ux%u pollFps=%u scScreenshot=%d cgCreateImage=%d",
+        targetID,
+        w,
+        h,
+        pollFps,
+        canUseSCScreenshot ? 1 : 0,
+        cgCreateImage != NULL ? 1 : 0
+    );
+
+    __weak typeof(self) weakSelf = self;
+    dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, self.queue);
+    if (!timer) return;
+    dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, 0), intervalNs, intervalNs / 4);
+    dispatch_source_set_event_handler(timer, ^{
+        @autoreleasepool {
+            IDCaptureController *strongSelf = weakSelf;
+            if (!strongSelf
+                || atomic_load_explicit(&strongSelf->_stopped, memory_order_acquire)
+                || atomic_load_explicit(&strongSelf->_sleeping, memory_order_acquire)
+                || atomic_load_explicit(&strongSelf->_paused, memory_order_acquire)
+                || atomic_load_explicit(&strongSelf->_generation, memory_order_acquire) != startGen) {
+                return;
+            }
+            if (atomic_exchange_explicit(&strongSelf->_fallbackBusy, YES, memory_order_acq_rel)) {
+                return;
+            }
+            if (canUseSCScreenshot) {
+                [(Class<IDSCScreenshotManagerProto>)ssCls captureImageWithFilter:filter
+                                                                   configuration:cfg
+                                                               completionHandler:^(CGImageRef _Nullable img, NSError * _Nullable err) {
+                    @autoreleasepool {
+                        if (img) {
+                            CGImageRetain(img);
+                            dispatch_async(strongSelf.queue, ^{
+                                @autoreleasepool {
+                                    CVPixelBufferRef pb = id_pixel_buffer_from_cgimage(img, w, h);
+                                    CGImageRelease(img);
+                                    if (pb) {
+                                        [strongSelf processFallbackPixelBuffer:pb sourceTag:"sc_screenshot"];
+                                        CVPixelBufferRelease(pb);
+                                    }
+                                    atomic_store_explicit(&strongSelf->_fallbackBusy, NO, memory_order_release);
+                                }
+                            });
+                        } else {
+                            if (err) {
+                                id_diag_log("fallback_sc_screenshot_err", @"err=%@", err.localizedDescription);
+                            }
+                            if (cgCreateImage) {
+                                CGImageRef cgImg = cgCreateImage(targetID);
+                                if (cgImg) {
+                                    dispatch_async(strongSelf.queue, ^{
+                                        @autoreleasepool {
+                                            CVPixelBufferRef pb = id_pixel_buffer_from_cgimage(cgImg, w, h);
+                                            CGImageRelease(cgImg);
+                                            if (pb) {
+                                                [strongSelf processFallbackPixelBuffer:pb sourceTag:"cg_image"];
+                                                CVPixelBufferRelease(pb);
+                                            }
+                                            atomic_store_explicit(&strongSelf->_fallbackBusy, NO, memory_order_release);
+                                        }
+                                    });
+                                    return;
+                                }
+                            }
+                            atomic_store_explicit(&strongSelf->_fallbackBusy, NO, memory_order_release);
+                        }
+                    }
+                }];
+            } else if (cgCreateImage) {
+                CGImageRef cgImg = cgCreateImage(targetID);
+                if (cgImg) {
+                    CVPixelBufferRef pb = id_pixel_buffer_from_cgimage(cgImg, w, h);
+                    CGImageRelease(cgImg);
+                    if (pb) {
+                        [strongSelf processFallbackPixelBuffer:pb sourceTag:"cg_image"];
+                        CVPixelBufferRelease(pb);
+                    }
+                }
+                atomic_store_explicit(&strongSelf->_fallbackBusy, NO, memory_order_release);
+            } else {
+                atomic_store_explicit(&strongSelf->_fallbackBusy, NO, memory_order_release);
+            }
+        }
+    });
+    dispatch_resume(timer);
+    self.fallbackPollTimer = timer;
+}
+
+// Must only be called on `self.lifecycleQueue`.
+- (BOOL)startCoreGraphicsFallbackLockedWithFilter:(id)filter
+                                           config:(id)cfg
+                                            width:(uint32_t)w
+                                           height:(uint32_t)h
+                                              fps:(uint32_t)fps
+                                       showCursor:(BOOL)showCursor {
+    CGDirectDisplayID targetID = self.displayID;
+    uint64_t startGen = atomic_load_explicit(&_generation, memory_order_acquire);
+    atomic_store_explicit(&_loggedFirstPb, NO, memory_order_release);
+
+    IDCGDisplayStreamCreateWithDispatchQueueFn createFn =
+        (IDCGDisplayStreamCreateWithDispatchQueueFn)dlsym(RTLD_DEFAULT, "CGDisplayStreamCreateWithDispatchQueue");
+    IDCGDisplayStreamStartFn startFn =
+        (IDCGDisplayStreamStartFn)dlsym(RTLD_DEFAULT, "CGDisplayStreamStart");
+
+    if (createFn && startFn) {
+        NSMutableDictionary *props = [NSMutableDictionary dictionary];
+        CFStringRef *kShowCursor = (CFStringRef *)dlsym(RTLD_DEFAULT, "kCGDisplayStreamShowCursor");
+        CFStringRef *kMinFrameTime = (CFStringRef *)dlsym(RTLD_DEFAULT, "kCGDisplayStreamMinimumFrameTime");
+        CFStringRef *kQueueDepth = (CFStringRef *)dlsym(RTLD_DEFAULT, "kCGDisplayStreamQueueDepth");
+        if (kShowCursor && *kShowCursor) {
+            props[(__bridge NSString *)(*kShowCursor)] = @(showCursor);
+        }
+        if (kMinFrameTime && *kMinFrameTime) {
+            double minDt = 1.0 / (double)(fps > 0 ? fps : 30);
+            props[(__bridge NSString *)(*kMinFrameTime)] = @(minDt);
+        }
+        if (kQueueDepth && *kQueueDepth) {
+            props[(__bridge NSString *)(*kQueueDepth)] = @(4);
+        }
+
+        __weak typeof(self) weakSelf = self;
+        CFTypeRef cgStream = createFn(
+            targetID,
+            (size_t)w,
+            (size_t)h,
+            (int32_t)kCVPixelFormatType_32BGRA,
+            (__bridge CFDictionaryRef)props,
+            self.queue,
+            ^(int32_t status, uint64_t displayTime, IOSurfaceRef _Nullable frameSurface, void * _Nullable updateRef) {
+                (void)displayTime;
+                (void)updateRef;
+                @autoreleasepool {
+                    IDCaptureController *strongSelf = weakSelf;
+                    if (!strongSelf
+                        || atomic_load_explicit(&strongSelf->_stopped, memory_order_acquire)
+                        || atomic_load_explicit(&strongSelf->_sleeping, memory_order_acquire)
+                        || atomic_load_explicit(&strongSelf->_paused, memory_order_acquire)
+                        || atomic_load_explicit(&strongSelf->_generation, memory_order_acquire) != startGen) {
+                        return;
+                    }
+                    if (status != 0 || !frameSurface) return;
+                    CVPixelBufferRef pb = NULL;
+                    if (CVPixelBufferCreateWithIOSurface(kCFAllocatorDefault, frameSurface, NULL, &pb) == kCVReturnSuccess && pb) {
+                        [strongSelf processFallbackPixelBuffer:pb sourceTag:"cg_display_stream"];
+                        CVPixelBufferRelease(pb);
+                    }
+                }
+            }
+        );
+        if (cgStream) {
+            CGError stErr = startFn(cgStream);
+            id_diag_log("cg_stream_start", @"targetID=%u size=%ux%u fps=%u err=%d", targetID, w, h, fps, (int)stErr);
+            if (stErr == kCGErrorSuccess) {
+                self.cgDisplayStream = cgStream;
+                // If CGDisplayStream is stubbed/silent on macOS 15+ or static display, escalate to screenshot poll after 1.5s.
+                __weak typeof(self) weakPoll = self;
+                dispatch_after(
+                    dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1500ULL * NSEC_PER_MSEC)),
+                    self.lifecycleQueue,
+                    ^{
+                        @autoreleasepool {
+                            IDCaptureController *strongPoll = weakPoll;
+                            if (!strongPoll
+                                || atomic_load_explicit(&strongPoll->_stopped, memory_order_acquire)
+                                || atomic_load_explicit(&strongPoll->_sleeping, memory_order_acquire)
+                                || atomic_load_explicit(&strongPoll->_paused, memory_order_acquire)
+                                || atomic_load_explicit(&strongPoll->_generation, memory_order_acquire) != startGen
+                                || atomic_load_explicit(&strongPoll->_loggedFirstPb, memory_order_acquire)) {
+                                return;
+                            }
+                            id_diag_log("cg_stream_silent", @"targetID=%u -> switching to screenshot poll fallback", targetID);
+                            if (strongPoll.cgDisplayStream) {
+                                CFTypeRef sRef = strongPoll.cgDisplayStream;
+                                strongPoll.cgDisplayStream = NULL;
+                                IDCGDisplayStreamStopFn stopFn = (IDCGDisplayStreamStopFn)dlsym(RTLD_DEFAULT, "CGDisplayStreamStop");
+                                if (stopFn) stopFn(sRef);
+                                CFRelease(sRef);
+                            }
+                            [strongPoll startFallbackPollLockedWithFilter:filter config:cfg width:w height:h fps:fps];
+                        }
+                    }
+                );
+                return YES;
+            }
+            CFRelease(cgStream);
+        } else {
+            id_diag_log("cg_stream_null", @"targetID=%u size=%ux%u -> starting screenshot poll fallback", targetID, w, h);
+        }
+    }
+
+    [self startFallbackPollLockedWithFilter:filter config:cfg width:w height:h fps:fps];
+    return self.fallbackPollTimer != nil;
+}
+
 // Must only be called on `self.lifecycleQueue`.
 - (BOOL)startScreenCaptureKitLockedWithWidth:(uint32_t)w height:(uint32_t)h {
     if (@available(macOS 12.3, *)) {
@@ -1412,15 +1768,11 @@ static inline CMTime id_sc_min_frame_interval(uint32_t fps) {
         uint32_t fps = self.fps > 0 ? self.fps : 30;
         BOOL hasVirtual = (self.virtualDisplay != nil);
         // Cold-start CGVirtualDisplay registration in ScreenCaptureKit can take ~3-4s on macOS 15+.
-        // Allow up to ~5.5s of capped backoff when waiting for a newly created virtual display while
-        // failing fast immediately if Screen Recording TCC permission is genuinely not granted.
+        // Do NOT pre-block on `CGPreflightScreenCaptureAccess()`, which frequently false-negatives
+        // for CLI binaries launched under an authorized terminal on macOS 14/15; instead let
+        // `SCShareableContent` report real `-3801` (SCStreamErrorUserDeclined) if actually denied.
         int maxAttempts = hasVirtual ? 15 : 2;
-        if (@available(macOS 10.15, *)) {
-            if (!CGPreflightScreenCaptureAccess()) {
-                id_diag_log("sc_permission_denied", @"targetID=%u", targetID);
-                return NO;
-            }
-        }
+        uint32_t tier = atomic_load_explicit(&_captureTier, memory_order_acquire);
 
         for (int attempt = 0; attempt < maxAttempts; attempt++) {
             if (atomic_load_explicit(&_stopped, memory_order_acquire)
@@ -1438,6 +1790,13 @@ static inline CMTime id_sc_min_frame_interval(uint32_t fps) {
             uint64_t startGen = atomic_load_explicit(&_generation, memory_order_acquire);
             __block BOOL ok = NO;
             __block BOOL displayMissing = NO;
+            __block BOOL permissionDenied = NO;
+            __block BOOL wantCgFallback = NO;
+            __block id fallbackFilter = nil;
+            __block id fallbackCfg = nil;
+            __block uint32_t fallbackW = w;
+            __block uint32_t fallbackH = h;
+            __block BOOL fallbackCursor = atomic_load_explicit(&_atomicShowCursor, memory_order_acquire);
             __block _Atomic BOOL timedOut = NO;
 
             [SCShareableContent getShareableContentExcludingDesktopWindows:NO
@@ -1451,10 +1810,17 @@ static inline CMTime id_sc_min_frame_interval(uint32_t fps) {
                         return;
                     }
                     if (error || !content) {
-                        id_diag_log("sc_content_err", @"attempt=%d err=%@", attempt, error ? error.localizedDescription : @"nil");
+                        if (error && error.code == -3801) {
+                            permissionDenied = YES;
+                            atomic_store_explicit(&gLastScreenCaptureDenied, YES, memory_order_release);
+                            id_diag_log("sc_permission_denied", @"attempt=%d targetID=%u code=%ld err=%@", attempt, targetID, (long)error.code, error.localizedDescription);
+                        } else {
+                            id_diag_log("sc_content_err", @"attempt=%d code=%ld err=%@", attempt, error ? (long)error.code : 0L, error ? error.localizedDescription : @"nil");
+                        }
                         dispatch_semaphore_signal(sem);
                         return;
                     }
+                    atomic_store_explicit(&gLastScreenCaptureDenied, NO, memory_order_release);
                     SCDisplay *found = nil;
                     for (SCDisplay *d in content.displays) {
                         if (d.displayID == targetID) {
@@ -1512,24 +1878,38 @@ static inline CMTime id_sc_min_frame_interval(uint32_t fps) {
                     cfg.width = cfgW;
                     cfg.height = cfgH;
                     cfg.scalesToFit = YES;
-                    // On macOS 14+, request full Retina backing capture resolution (SCCaptureResolutionBest = 1).
-                    if ([cfg respondsToSelector:NSSelectorFromString(@"setCaptureResolution:")]) {
-                        [cfg setValue:@(1) forKey:@"captureResolution"];
-                    }
-                    // Native NV12 (4:2:0 video range) cuts framebuffer bandwidth by 62.5% vs 32BGRA and
-                    // feeds VideoToolbox directly without a BGRA->YUV color-space conversion pass.
-                    cfg.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
-                    cfg.colorSpaceName = kCGColorSpaceSRGB;
-                    cfg.colorMatrix = kCVImageBufferYCbCrMatrix_ITU_R_709_2;
-                    cfg.minimumFrameInterval = id_sc_min_frame_interval(fps);
-                    cfg.queueDepth = 4;
                     BOOL wantCursor = atomic_load_explicit(&self->_atomicShowCursor, memory_order_acquire);
                     cfg.showsCursor = wantCursor;
+                    if (tier == 0) {
+                        // Tier 0: native NV12 + Retina best resolution (62.5% less bandwidth on Apple Silicon).
+                        if ([cfg respondsToSelector:NSSelectorFromString(@"setCaptureResolution:")]) {
+                            [cfg setValue:@(1) forKey:@"captureResolution"];
+                        }
+                        cfg.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
+                        cfg.colorSpaceName = kCGColorSpaceSRGB;
+                        cfg.colorMatrix = kCVImageBufferYCbCrMatrix_ITU_R_709_2;
+                    } else {
+                        // Tier 1/2: minimal 32BGRA config for Intel/AMD GPU ScreenCaptureKit compatibility.
+                        cfg.pixelFormat = kCVPixelFormatType_32BGRA;
+                    }
+                    cfg.minimumFrameInterval = id_sc_min_frame_interval(fps);
+                    cfg.queueDepth = 4;
+
+                    if (tier >= 2) {
+                        wantCgFallback = YES;
+                        fallbackFilter = filter;
+                        fallbackCfg = cfg;
+                        fallbackW = cfgW;
+                        fallbackH = cfgH;
+                        fallbackCursor = wantCursor;
+                        dispatch_semaphore_signal(sem);
+                        return;
+                    }
 
                     SCStream *stream = [[SCStream alloc] initWithFilter:filter configuration:cfg delegate:self];
                     NSError *addErr = nil;
                     if (![stream addStreamOutput:self type:SCStreamOutputTypeScreen sampleHandlerQueue:self.queue error:&addErr]) {
-                        id_diag_log("sc_add_output_err", @"err=%@", addErr ? addErr.localizedDescription : @"nil");
+                        id_diag_log("sc_add_output_err", @"tier=%u err=%@", tier, addErr ? addErr.localizedDescription : @"nil");
                         dispatch_semaphore_signal(sem);
                         return;
                     }
@@ -1541,6 +1921,7 @@ static inline CMTime id_sc_min_frame_interval(uint32_t fps) {
                             if (!startErr && !stale) {
                                 self.scStream = stream;
                                 atomic_store_explicit(&self->_loggedFirstPb, NO, memory_order_release);
+                                atomic_store_explicit(&self->_nullPbLogCount, 0, memory_order_release);
                                 ok = YES;
                             } else if (!startErr) {
                                 // Controller stopped, timed out, or superseded mid-start: tear down orphan immediately.
@@ -1548,16 +1929,18 @@ static inline CMTime id_sc_min_frame_interval(uint32_t fps) {
                             }
                             id_diag_log(
                                 "sc_start",
-                                @"attempt=%d targetID=%u foundID=%u scFrame=(%.0f,%.0f %.0fx%.0f) cfg=%ux%u fps=%u showsCursor=%d ok=%d err=%@",
+                                @"attempt=%d tier=%u fmt=%s targetID=%u foundID=%u scFrame=(%.0f,%.0f %.0fx%.0f) cfg=%ux%u fps=%u showsCursor=%d ok=%d err=%@",
                                 attempt,
+                                tier,
+                                tier == 0 ? "420v" : "BGRA",
                                 targetID,
                                 found.displayID,
                                 scFrame.origin.x,
                                 scFrame.origin.y,
                                 scFrame.size.width,
                                 scFrame.size.height,
-                                w,
-                                h,
+                                cfgW,
+                                cfgH,
                                 fps,
                                 wantCursor ? 1 : 0,
                                 ok ? 1 : 0,
@@ -1572,33 +1955,56 @@ static inline CMTime id_sc_min_frame_interval(uint32_t fps) {
             long waitRes = dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)));
             if (waitRes != 0) {
                 atomic_store_explicit(&timedOut, YES, memory_order_release);
-                id_diag_log("sc_start_timeout", @"attempt=%d targetID=%u", attempt, targetID);
+                id_diag_log("sc_start_timeout", @"attempt=%d tier=%u targetID=%u", attempt, tier, targetID);
+            }
+            if (wantCgFallback && !permissionDenied) {
+                ok = [self startCoreGraphicsFallbackLockedWithFilter:fallbackFilter
+                                                              config:fallbackCfg
+                                                               width:fallbackW
+                                                              height:fallbackH
+                                                                 fps:fps
+                                                          showCursor:fallbackCursor];
             }
             if (ok) {
-                // One-shot 2.5s first-frame watchdog: if SCStream started cleanly yet delivered
-                // zero sample buffers (e.g. compositor/mode race on Intel macOS), trigger one
-                // automatic capture restart so the client never stays stuck on "Connecting...".
-                __weak typeof(self) weakWatch = self;
-                dispatch_after(
-                    dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2500ULL * NSEC_PER_MSEC)),
-                    self.lifecycleQueue,
-                    ^{
-                        @autoreleasepool {
-                            IDCaptureController *strongWatch = weakWatch;
-                            if (!strongWatch
-                                || atomic_load_explicit(&strongWatch->_stopped, memory_order_acquire)
-                                || atomic_load_explicit(&strongWatch->_sleeping, memory_order_acquire)
-                                || atomic_load_explicit(&strongWatch->_paused, memory_order_acquire)
-                                || atomic_load_explicit(&strongWatch->_generation, memory_order_acquire) != startGen
-                                || atomic_load_explicit(&strongWatch->_loggedFirstPb, memory_order_acquire)) {
-                                return;
+                if (tier < 2) {
+                    // First-frame watchdog with automatic escalation for Intel/AMD Macs where
+                    // SCStream starts cleanly yet emits 0 frames:
+                    //   Tier 0 (NV12) --1.5s--> Tier 1 (minimal 32BGRA) --2.0s--> Tier 2 (CGDisplayStream / Screenshot fallback)
+                    uint64_t watchDelayMs = (tier == 0) ? 1500ULL : 2000ULL;
+                    __weak typeof(self) weakWatch = self;
+                    dispatch_after(
+                        dispatch_time(DISPATCH_TIME_NOW, (int64_t)(watchDelayMs * NSEC_PER_MSEC)),
+                        self.lifecycleQueue,
+                        ^{
+                            @autoreleasepool {
+                                IDCaptureController *strongWatch = weakWatch;
+                                if (!strongWatch
+                                    || atomic_load_explicit(&strongWatch->_stopped, memory_order_acquire)
+                                    || atomic_load_explicit(&strongWatch->_sleeping, memory_order_acquire)
+                                    || atomic_load_explicit(&strongWatch->_paused, memory_order_acquire)
+                                    || atomic_load_explicit(&strongWatch->_generation, memory_order_acquire) != startGen
+                                    || atomic_load_explicit(&strongWatch->_loggedFirstPb, memory_order_acquire)) {
+                                    return;
+                                }
+                                uint32_t nextTier = tier + 1;
+                                atomic_store_explicit(&strongWatch->_captureTier, nextTier, memory_order_release);
+                                id_diag_log(
+                                    "sc_first_frame_watchdog",
+                                    @"targetID=%u silent after %llums -> escalating tier %u->%u",
+                                    targetID,
+                                    (unsigned long long)watchDelayMs,
+                                    tier,
+                                    nextTier
+                                );
+                                [strongWatch scheduleCaptureRestartAfterMs:150 targetW:0 targetH:0 attempt:1];
                             }
-                            id_diag_log("sc_first_frame_watchdog", @"targetID=%u -> restarting silent SCStream", targetID);
-                            [strongWatch scheduleCaptureRestartAfterMs:200 targetW:0 targetH:0 attempt:1];
                         }
-                    }
-                );
+                    );
+                }
                 return YES;
+            }
+            if (permissionDenied) {
+                return NO;
             }
             if (displayMissing && hasVirtual && self.virtualDisplay && (attempt % 2 == 1)) {
                 [self.virtualDisplay selectMatchingCGDisplayModeLogicalW:self.requestedLogicalW
@@ -1976,7 +2382,28 @@ static void id_unlock_keepalive_timer_cb(CFRunLoopTimerRef timer, void *info) {
         || atomic_load_explicit(&_sleeping, memory_order_acquire)
         || type != SCStreamOutputTypeScreen) return;
     CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(sampleBuffer);
-    if (!pb) return;
+    if (!pb) {
+        uint32_t nullCnt = atomic_fetch_add_explicit(&_nullPbLogCount, 1, memory_order_relaxed) + 1;
+        if (nullCnt <= 5) {
+            NSNumber *frameSt = nil;
+            if (@available(macOS 12.3, *)) {
+                CFArrayRef atts = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, false);
+                if (atts && CFArrayGetCount(atts) > 0) {
+                    NSDictionary *att = (__bridge NSDictionary *)CFArrayGetValueAtIndex(atts, 0);
+                    frameSt = att[SCStreamFrameInfoStatus];
+                }
+            }
+            id_diag_log(
+                "sc_null_pb",
+                @"displayID=%u count=%u status=%@ tier=%u",
+                self.displayID,
+                nullCnt,
+                frameSt ? frameSt.stringValue : @"nil",
+                atomic_load_explicit(&_captureTier, memory_order_acquire)
+            );
+        }
+        return;
+    }
 
     // Periodically check if the user changed the virtual display's resolution in macOS System Settings.
     self.modeCheckCounter++;
@@ -2396,6 +2823,12 @@ static void id_unlock_keepalive_timer_cb(CFRunLoopTimerRef timer, void *info) {
                     ok = YES;
                     return;
                 }
+                uint32_t curTier = atomic_load_explicit(&self->_captureTier, memory_order_acquire);
+                if (curTier >= 2) {
+                    [self scheduleCaptureRestartAfterMs:50 targetW:newPixW targetH:newPixH attempt:0];
+                    ok = YES;
+                    return;
+                }
                 if (!self.scStream) {
                     ok = NO;
                     return;
@@ -2411,12 +2844,16 @@ static void id_unlock_keepalive_timer_cb(CFRunLoopTimerRef timer, void *info) {
                 cfg.width = cfgW;
                 cfg.height = cfgH;
                 cfg.scalesToFit = YES;
-                if ([cfg respondsToSelector:NSSelectorFromString(@"setCaptureResolution:")]) {
-                    [cfg setValue:@(1) forKey:@"captureResolution"];
+                if (curTier == 0) {
+                    if ([cfg respondsToSelector:NSSelectorFromString(@"setCaptureResolution:")]) {
+                        [cfg setValue:@(1) forKey:@"captureResolution"];
+                    }
+                    cfg.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
+                    cfg.colorSpaceName = kCGColorSpaceSRGB;
+                    cfg.colorMatrix = kCVImageBufferYCbCrMatrix_ITU_R_709_2;
+                } else {
+                    cfg.pixelFormat = kCVPixelFormatType_32BGRA;
                 }
-                cfg.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
-                cfg.colorSpaceName = kCGColorSpaceSRGB;
-                cfg.colorMatrix = kCVImageBufferYCbCrMatrix_ITU_R_709_2;
                 cfg.minimumFrameInterval = id_sc_min_frame_interval(effFps);
                 cfg.queueDepth = 4;
                 cfg.showsCursor = atomic_load_explicit(&self->_atomicShowCursor, memory_order_acquire);
@@ -2641,6 +3078,9 @@ void *id_macos_capture_start(
         atomic_store_explicit(&ctrl->_generation, 1, memory_order_release);
         atomic_store_explicit(&ctrl->_vtErrorStreak, 0, memory_order_release);
         atomic_store_explicit(&ctrl->_lastVtRebuildNs, 0, memory_order_release);
+        atomic_store_explicit(&ctrl->_captureTier, 0, memory_order_release);
+        atomic_store_explicit(&ctrl->_nullPbLogCount, 0, memory_order_release);
+        atomic_store_explicit(&ctrl->_fallbackBusy, NO, memory_order_release);
         // Must start at 0 so `createEncoderWidth:height:` seeds the true encoded pixel dimensions (e.g. 2x HiDPI).
         atomic_store_explicit(&ctrl->_atomicSize, 0, memory_order_release);
         ctrl.useVirtualDisplay = (use_virtual_display != 0);
@@ -3000,10 +3440,7 @@ int32_t id_macos_is_accessibility_trusted(void) {
 }
 
 int32_t id_macos_is_screen_capture_granted(void) {
-    if (@available(macOS 10.15, *)) {
-        return CGPreflightScreenCaptureAccess() ? 1 : 0;
-    }
-    return 1;
+    return atomic_load_explicit(&gLastScreenCaptureDenied, memory_order_acquire) ? 0 : 1;
 }
 
 int32_t id_macos_is_screen_locked(void) {

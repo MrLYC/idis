@@ -6,7 +6,8 @@ use super::{SessionRegistry, SessionSnapshot, WebScreenSnapshot, WebViewerSnapsh
 use crate::abr::{AbrController, AbrStatusSnapshot, AbrTargets, AbrWindowSample};
 use crate::config::{CaptureMode, WebScreenMode};
 use crate::platform::{
-    clamp_pixel_dimensions, latest_frame_channel, CaptureParams, RecvFrameError,
+    bounded_frame_channel, clamp_pixel_dimensions, latest_frame_channel, CaptureParams,
+    RecvFrameError,
 };
 use anyhow::{anyhow, Result};
 use std::net::{IpAddr, SocketAddr};
@@ -353,76 +354,115 @@ impl SessionRegistry {
             .map(|d| (d.fingerprint, d.prefs))
             .collect();
         let supports_hidpi = self.backend.supports_hidpi();
-        let map = self.sessions.lock().unwrap();
-        let mut out: Vec<SessionSnapshot> = map
-            .iter()
-            .map(|(key, s)| {
-                let dev_prefs = s
-                    .fingerprint
-                    .as_deref()
-                    .and_then(|fp| trusted_prefs.get(&fp.to_ascii_lowercase()));
-                let vs = Self::overlay_device_prefs(base_vs.clone(), dev_prefs, low_power);
-                let eff_hidpi = if supports_hidpi { vs.hidpi.max(1) } else { 1 };
-                let (phys_w, phys_h) = s
-                    .handshake
-                    .as_ref()
-                    .map(|hs| hs.effective_resolution())
-                    .unwrap_or((0, 0));
-                let (lw, lh) = s
-                    .handshake
-                    .as_ref()
-                    .map(|hs| Self::resolve_dimensions_for_settings(hs, &vs, supports_hidpi))
-                    .unwrap_or((0, 0));
-                let (w, h) = s
-                    .capture
-                    .as_ref()
-                    .and_then(|c| c.actual_size.lock().ok().map(|g| *g))
-                    .filter(|&(aw, ah)| aw > 0 && ah > 0)
-                    .unwrap_or((lw, lh));
-                let backing_exact = lw > 0 && lh > 0 && w == lw * eff_hidpi && h == lh * eff_hidpi;
-                let panel_exact = if phys_w > 0 && phys_h > 0 && w > 0 && h > 0 {
-                    (phys_w % w == 0 || w % phys_w == 0) && (phys_h % h == 0 || h % phys_h == 0)
-                } else {
-                    true
-                };
-                let is_pixel_exact = backing_exact && panel_exact;
-                SessionSnapshot {
-                    id: s.id,
-                    key: key.clone(),
-                    transport: if s.is_usb { "usb" } else { "wifi" }.to_string(),
-                    fingerprint: s.fingerprint.clone(),
-                    uid: s.handshake.as_ref().map(|hs| hs.uid.clone()),
-                    name: s.handshake.as_ref().map(|hs| hs.name.clone()),
-                    model: s.handshake.as_ref().map(|hs| hs.model.clone()),
-                    authorized: s.authorized,
-                    awaiting_confirm: s.awaiting_confirm,
-                    streaming: s.capture.is_some(),
-                    stream_paused: s.stream_paused.load(Ordering::Acquire),
-                    width: w,
-                    height: h,
-                    native_width: phys_w,
-                    native_height: phys_h,
-                    logical_width: lw,
-                    logical_height: lh,
-                    hidpi: eff_hidpi,
-                    integer_scale: vs.integer_scale,
-                    is_pixel_exact,
-                    connected_secs: s.connected_at.elapsed().as_secs(),
-                    idle_secs: s.last_activity.elapsed().as_secs(),
-                    in_flight: s.flow.in_flight(),
-                    max_in_flight: s.flow.max_in_flight(),
-                    auto_max_in_flight: self.is_auto_max_in_flight(),
-                    dropped_frames: s.flow.dropped_frames(),
-                    udp_cursor: !s.is_usb
-                        && s.handshake.as_ref().is_some_and(|hs| hs.udp_port > 0)
-                        && s.udp_cursor_enabled.load(Ordering::Acquire),
-                    abr: s
+        let mut entries: Vec<(SessionSnapshot, Option<u32>)> = {
+            let map = self.sessions.lock().unwrap();
+            map.iter()
+                .map(|(key, s)| {
+                    let dev_prefs = s
+                        .fingerprint
+                        .as_deref()
+                        .and_then(|fp| trusted_prefs.get(&fp.to_ascii_lowercase()));
+                    let vs = Self::overlay_device_prefs(base_vs.clone(), dev_prefs, low_power);
+                    let eff_hidpi = if supports_hidpi { vs.hidpi.max(1) } else { 1 };
+                    let (phys_w, phys_h) = s
+                        .handshake
+                        .as_ref()
+                        .map(|hs| hs.effective_resolution())
+                        .unwrap_or((0, 0));
+                    let (lw, lh) = s
+                        .handshake
+                        .as_ref()
+                        .map(|hs| Self::resolve_dimensions_for_settings(hs, &vs, supports_hidpi))
+                        .unwrap_or((0, 0));
+                    let (w, h) = s
                         .capture
                         .as_ref()
-                        .and_then(|c| c.abr_status.lock().ok().map(|g| *g)),
+                        .and_then(|c| c.actual_size.lock().ok().map(|g| *g))
+                        .filter(|&(aw, ah)| aw > 0 && ah > 0)
+                        .unwrap_or((lw, lh));
+                    let display_id = s
+                        .capture
+                        .as_ref()
+                        .and_then(|c| c.handle.try_lock().ok().and_then(|h| h.display_id()));
+                    let backing_exact =
+                        lw > 0 && lh > 0 && w == lw * eff_hidpi && h == lh * eff_hidpi;
+                    let panel_exact = if phys_w > 0 && phys_h > 0 && w > 0 && h > 0 {
+                        (phys_w % w == 0 || w % phys_w == 0)
+                            && (phys_h % h == 0 || h % phys_h == 0)
+                    } else {
+                        true
+                    };
+                    let is_pixel_exact = backing_exact && panel_exact;
+                    (
+                        SessionSnapshot {
+                            id: s.id,
+                            key: key.clone(),
+                            transport: if s.is_usb { "usb" } else { "wifi" }.to_string(),
+                            fingerprint: s.fingerprint.clone(),
+                            uid: s.handshake.as_ref().map(|hs| hs.uid.clone()),
+                            name: s.handshake.as_ref().map(|hs| hs.name.clone()),
+                            model: s.handshake.as_ref().map(|hs| hs.model.clone()),
+                            authorized: s.authorized,
+                            awaiting_confirm: s.awaiting_confirm,
+                            streaming: s.capture.is_some(),
+                            stream_paused: s.stream_paused.load(Ordering::Acquire),
+                            width: w,
+                            height: h,
+                            native_width: phys_w,
+                            native_height: phys_h,
+                            logical_width: lw,
+                            logical_height: lh,
+                            hidpi: eff_hidpi,
+                            integer_scale: vs.integer_scale,
+                            is_pixel_exact,
+                            connected_secs: s.connected_at.elapsed().as_secs(),
+                            idle_secs: s.last_activity.elapsed().as_secs(),
+                            in_flight: s.flow.in_flight(),
+                            max_in_flight: s.flow.max_in_flight(),
+                            auto_max_in_flight: self.is_auto_max_in_flight(),
+                            dropped_frames: s.flow.dropped_frames(),
+                            udp_cursor: !s.is_usb
+                                && s.handshake.as_ref().is_some_and(|hs| hs.udp_port > 0)
+                                && s.udp_cursor_enabled.load(Ordering::Acquire),
+                            abr: s
+                                .capture
+                                .as_ref()
+                                .and_then(|c| c.abr_status.lock().ok().map(|g| *g)),
+                        },
+                        display_id,
+                    )
+                })
+                .collect()
+        };
+        // Reconcile reported logical dimensions against live OS display bounds outside the
+        // `sessions` lock so macOS WindowServer mode fallbacks (e.g. 1600x1200) are accurately
+        // reflected in both `logical_width/height` and `is_pixel_exact`.
+        for (snap, did_opt) in &mut entries {
+            if let Some(did) = *did_opt {
+                if let Some((_, _, bw, bh)) = self.backend.display_bounds(did) {
+                    if bw >= 320 && bh >= 240 {
+                        snap.logical_width = bw;
+                        snap.logical_height = bh;
+                        let backing_exact = snap.width == bw * snap.hidpi
+                            && snap.height == bh * snap.hidpi;
+                        let panel_exact = if snap.native_width > 0
+                            && snap.native_height > 0
+                            && snap.width > 0
+                            && snap.height > 0
+                        {
+                            (snap.native_width % snap.width == 0
+                                || snap.width % snap.native_width == 0)
+                                && (snap.native_height % snap.height == 0
+                                    || snap.height % snap.native_height == 0)
+                        } else {
+                            true
+                        };
+                        snap.is_pixel_exact = backing_exact && panel_exact;
+                    }
                 }
-            })
-            .collect();
+            }
+        }
+        let mut out: Vec<SessionSnapshot> = entries.into_iter().map(|(s, _)| s).collect();
         out.sort_by_key(|s| s.id);
         out
     }
@@ -1080,7 +1120,13 @@ impl SessionRegistry {
             ));
         }
         let sub_id = self.next_session_id.fetch_add(1, Ordering::Relaxed);
-        let (tx, rx) = latest_frame_channel();
+        // Use an 8-frame bounded consecutive FIFO in IPPP mode so transient Wi-Fi TCP write
+        // micro-stalls (>33ms) never overwrite in-flight P-frames or trigger 300-1000ms IDR storms.
+        let (tx, rx) = if self.config.all_intra {
+            latest_frame_channel()
+        } else {
+            bounded_frame_channel(8)
+        };
         let use_standalone = {
             // Consistent lock order: `standalone_web_capture` -> `sessions` -> `web_subscribers`.
             let standalone = self.standalone_web_capture.lock().unwrap();

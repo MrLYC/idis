@@ -391,6 +391,8 @@ let mseErrorWindowStart = 0;
 let mseErrorCount = 0;
 let mseAwaitingIdr = true;
 let lastNeedIdrAt = 0;
+let lastAppendedKind = 0;
+let lastIdrBufferedTime = 0;
 let tabHidePauseTimer = null;
 let tabVisibilitySentHidden = false;
 let urlTokenFailed = false;
@@ -779,6 +781,8 @@ function resetMediaSource(codec, initToReplay = null) {
   const video = document.getElementById('screenVideo');
   sbQueue = [];
   sourceBuffer = null;
+  lastAppendedKind = 0;
+  lastIdrBufferedTime = 0;
   currentCodec = codec;
   pendingInit = initToReplay || null;
 
@@ -836,6 +840,10 @@ function resetMediaSource(codec, initToReplay = null) {
       });
       mySb.addEventListener('updateend', () => {
         if (sourceBuffer !== mySb) return;
+        if (lastAppendedKind === 2 && video && video.buffered.length > 0) {
+          lastIdrBufferedTime = video.buffered.end(video.buffered.length - 1);
+        }
+        lastAppendedKind = 0;
         trimAndChaseLive(video);
         pumpQueue();
       });
@@ -862,8 +870,10 @@ function pumpQueue() {
   if (!sourceBuffer || sourceBuffer.updating || sbQueue.length === 0) return;
   const next = sbQueue.shift();
   try {
+    lastAppendedKind = next.kind;
     sourceBuffer.appendBuffer(next.payload);
   } catch (e) {
+    lastAppendedKind = 0;
     if (e.name === 'QuotaExceededError') {
       // Preserve init segment (including `next` itself if it was an init segment) when evicting media backlog.
       if (next.kind === 1) {
@@ -900,23 +910,34 @@ function trimAndChaseLive(video) {
     const start = video.buffered.start(0);
     const end = video.buffered.end(video.buffered.length - 1);
     const lag = end - video.currentTime;
-    // 3-stage smooth live catch-up: gentle playbackRate ramp for small drift, hard seek only when >450ms behind.
-    if (video.currentTime < start || lag > 0.45) {
+    // 4-stage smooth live catch-up: use gentle playbackRate ramps up to 1.0s so mobile/Android
+    // MediaCodec never stutters on hard seeks mid-GOP; hard-seek only on >1.0s drift or underrun.
+    if (video.currentTime < start || lag > 1.0) {
       video.playbackRate = 1.0;
-      video.currentTime = Math.max(start, end - 0.04);
+      video.currentTime = Math.max(start, end - 0.05);
+      if (lag > 1.0) requestStreamIdr();
+    } else if (lag > 0.45) {
+      if (video.playbackRate !== 1.25) video.playbackRate = 1.25;
     } else if (lag > 0.25) {
-      if (video.playbackRate !== 1.15) video.playbackRate = 1.15;
+      if (video.playbackRate !== 1.12) video.playbackRate = 1.12;
     } else if (lag > 0.12) {
-      if (video.playbackRate !== 1.06) video.playbackRate = 1.06;
+      if (video.playbackRate !== 1.05) video.playbackRate = 1.05;
     } else if (lag <= 0.10 && video.playbackRate !== 1.0) {
       video.playbackRate = 1.0;
     }
     if (video.paused && !document.hidden) {
       video.play().catch(() => {});
     }
-    // Keep ~3.0s of history (safe for 2s GOP IPPP and Safari MSE QuotaExceededError).
-    if (end - start > 3.5 && video.currentTime - start > 2.2) {
-      try { sourceBuffer.remove(start, Math.max(start, video.currentTime - 1.2)); } catch (_) {}
+    // Evict old history only up to the latest safely-buffered IDR boundary so 2s and 8s GOP IPPP
+    // streams never orphan active P-frames and trigger Chrome/Android re-decode stalls.
+    if (end - start > 9.5 && video.currentTime - start > 3.0) {
+      const idrGuard = (lastIdrBufferedTime > start + 0.1 && lastIdrBufferedTime <= video.currentTime)
+        ? (lastIdrBufferedTime - 0.05)
+        : (video.currentTime - 1.2);
+      const removeEnd = Math.min(video.currentTime - 1.2, idrGuard);
+      if (removeEnd > start + 0.5) {
+        try { sourceBuffer.remove(start, removeEnd); } catch (_) {}
+      }
     }
   }
 }
@@ -1452,9 +1473,10 @@ function handleStreamBinary(kind, payload, fromP2p) {
       relayToP2pChildren(5, payload);
     }
     // Only drop older media frames, NEVER drop queued init segments (kind === 1).
-    // When trimming IPPP backlog, drop all stale media and gate on next IDR to protect DPB.
+    // Allow up to 16 queued frames (~530ms at 30fps) so normal mobile Wi-Fi TCP bursts never wipe
+    // consecutive IPPP P-frames and stall waiting for a round-trip IDR.
     const mediaCount = sbQueue.reduce((n, item) => n + (item.kind !== 1 ? 1 : 0), 0);
-    if (mediaCount > 6) {
+    if (mediaCount > 16) {
       sbQueue = sbQueue.filter(item => item.kind === 1);
       if (!isIdr) {
         mseAwaitingIdr = true;

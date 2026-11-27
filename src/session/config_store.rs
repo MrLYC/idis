@@ -614,8 +614,9 @@ impl SessionRegistry {
 
     /// Compute the effective streaming long-edge pixel ceiling for a specific iPad session.
     /// In auto mode (`vs.max_pixel_edge == 0`), adapts per screen while respecting 2x Retina HiDPI
-    /// (e.g. legacy iPad reporting `1024x768` logical points at `2x HiDPI` streams true `2048x1536`,
-    /// never clamped down to `1024px`).
+    /// (e.g. legacy iPad reporting `1024x768` logical points at `2x HiDPI` streams true `2048x1536`),
+    /// and never oversamples beyond the connected iPad's actual physical panel long edge
+    /// (preventing 3840x2880 streams onto a 2048x1536 panel when a user selects 2048x1536 @ 2x).
     pub fn effective_ipad_max_pixel_edge(hs: &ClientHandshake, vs: &VideoSettings) -> u32 {
         if vs.max_pixel_edge >= 640 {
             vs.max_pixel_edge.clamp(640, WEB_MAX_PIXEL_EDGE) & !1
@@ -623,14 +624,24 @@ impl SessionRegistry {
             let (pw, ph) = hs.effective_resolution();
             let panel_edge = pw.max(ph);
             let scale = if vs.hidpi >= 2 { 2 } else { 1 };
-            let target_edge = if vs.width >= 320 && vs.height >= 240 {
-                vs.width.max(vs.height).saturating_mul(scale)
-            } else if scale >= 2 && panel_edge <= 1400 {
-                // Legacy iDisplay on Retina iPads often reports 1x UIKit points (e.g. 1024x768);
-                // allow full 2x Retina pixels (2048x1536) in auto mode.
-                panel_edge.saturating_mul(scale)
+            let physical_panel_edge = if panel_edge >= 640 {
+                if scale >= 2 && panel_edge <= 1400 {
+                    // Legacy iDisplay on Retina iPads often reports 1x UIKit points (e.g. 1024x768);
+                    // allow full 2x Retina pixels (2048x1536) in auto mode.
+                    panel_edge.saturating_mul(2)
+                } else {
+                    panel_edge
+                }
             } else {
-                panel_edge
+                IPAD_MAX_PIXEL_EDGE
+            };
+            let target_edge = if vs.width >= 320 && vs.height >= 240 {
+                vs.width
+                    .max(vs.height)
+                    .saturating_mul(scale)
+                    .min(physical_panel_edge)
+            } else {
+                physical_panel_edge
             };
             if target_edge >= 640 {
                 target_edge.clamp(640, WEB_MAX_PIXEL_EDGE) & !1

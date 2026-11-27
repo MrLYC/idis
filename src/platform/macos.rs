@@ -118,6 +118,7 @@ extern "C" {
     fn id_macos_inject_unicode_mods(ch: u16, mods: u8);
     fn id_macos_inject_text(units: *const u16, len: usize);
     fn id_macos_is_accessibility_trusted() -> i32;
+    fn id_macos_is_screen_capture_granted() -> i32;
     fn id_macos_is_screen_locked() -> i32;
     fn id_macos_pump_main_runloop();
     fn id_macos_resolve_iface_ip(
@@ -821,8 +822,14 @@ impl DisplayBackend for MacOsBackend {
         };
         if ptr.is_null() {
             unsafe { drop(Box::from_raw(tx_box)) };
+            let screen_ok = unsafe { id_macos_is_screen_capture_granted() } != 0;
+            if !screen_ok {
+                return Err(anyhow!(
+                    "failed to start macOS display capture/encoder (Screen Recording permission is not granted in System Settings -> Privacy & Security -> Screen Recording)"
+                ));
+            }
             return Err(anyhow!(
-                "failed to start macOS display capture/encoder (check Screen Recording permission in System Settings)"
+                "failed to start macOS display capture/encoder (virtual display or ScreenCaptureKit did not become ready in time; please reconnect)"
             ));
         }
         Ok((Box::new(MacCaptureHandle { ptr, tx_box }), rx))

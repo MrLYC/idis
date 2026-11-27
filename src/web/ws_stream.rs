@@ -621,7 +621,11 @@ pub(super) fn handle_ws_stream(
         match sub.rx.recv_timeout_shared_tagged(Duration::from_millis(120)) {
             Ok((frame_seq, frame_source_epoch, frame, ov)) => {
                 if ov > 0 {
-                    viewer_awaiting_idr = true;
+                    let got_fresh_idr = frame.is_keyframe
+                        && crate::protocol::annexb::is_self_contained_idr(&frame.annex_b);
+                    if !got_fresh_idr {
+                        viewer_awaiting_idr = true;
+                    }
                     if matches!(
                         state.registry.current_web_stream_source(),
                         "standalone" | "main"

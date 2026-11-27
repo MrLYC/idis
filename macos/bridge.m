@@ -1105,10 +1105,12 @@ static inline CMTime id_sc_min_frame_interval(uint32_t fps) {
     VTSessionSetProperty(session, kVTCompressionPropertyKey_YCbCrMatrix, kCVImageBufferYCbCrMatrix_ITU_R_709_2);
 
     int32_t fpsVal = (int32_t)(self.fps > 0 ? self.fps : 30);
-    // Over reliable lossless TCP (IPPP mode), a periodic giant IDR every 2s creates 50-500x Wi-Fi
-    // airtime bursts; space periodic IDRs to 8s while keeping instant on-demand `request_keyframe()`
-    // for new Web viewers, reconnects, and DPB resyncs.
-    int32_t maxKeyInterval = temporal ? MAX(30, fpsVal * 8) : 1;
+    // Over reliable lossless TCP (IPPP mode), iPad virtual-display streams use an 8s GOP to avoid
+    // periodic Wi-Fi airtime bursts, while host Main-display capture (Web MSE) uses a 2s GOP so
+    // mobile/desktop browsers recover and seek smoothly with minimal buffer overhead.
+    int32_t maxKeyInterval = temporal
+        ? (self.useVirtualDisplay ? MAX(30, fpsVal * 8) : MAX(30, fpsVal * 2))
+        : 1;
     OSStatus kiSt = noErr;
     CFNumberRef kiNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &maxKeyInterval);
     if (kiNum) {
@@ -1375,7 +1377,16 @@ static inline CMTime id_sc_min_frame_interval(uint32_t fps) {
         CGDirectDisplayID targetID = self.displayID;
         uint32_t fps = self.fps > 0 ? self.fps : 30;
         BOOL hasVirtual = (self.virtualDisplay != nil);
-        int maxAttempts = hasVirtual ? 8 : 2;
+        // Cold-start CGVirtualDisplay registration in ScreenCaptureKit can take ~3-4s on macOS 15+.
+        // Allow up to ~5.5s of capped backoff when waiting for a newly created virtual display while
+        // failing fast immediately if Screen Recording TCC permission is genuinely not granted.
+        int maxAttempts = hasVirtual ? 15 : 2;
+        if (@available(macOS 10.15, *)) {
+            if (!CGPreflightScreenCaptureAccess()) {
+                id_diag_log("sc_permission_denied", @"targetID=%u", targetID);
+                return NO;
+            }
+        }
 
         for (int attempt = 0; attempt < maxAttempts; attempt++) {
             if (atomic_load_explicit(&_stopped, memory_order_acquire)
@@ -1384,7 +1395,9 @@ static inline CMTime id_sc_min_frame_interval(uint32_t fps) {
                 return NO;
             }
             if (attempt > 0) {
-                usleep((useconds_t)(120000 + attempt * 60000));
+                uint32_t delayUs = (uint32_t)(120000 + attempt * 50000);
+                if (delayUs > 450000) delayUs = 450000;
+                usleep((useconds_t)delayUs);
             }
 
             dispatch_semaphore_t sem = dispatch_semaphore_create(0);
@@ -1505,7 +1518,8 @@ static inline CMTime id_sc_min_frame_interval(uint32_t fps) {
                 id_diag_log("sc_start_timeout", @"attempt=%d targetID=%u", attempt, targetID);
             }
             if (ok) return YES;
-            if (!displayMissing && attempt >= 1) break;
+            int nonMissingLimit = hasVirtual ? 3 : 1;
+            if (!displayMissing && attempt >= nonMissingLimit) break;
         }
         return NO;
     }
@@ -2147,7 +2161,7 @@ static void id_unlock_keepalive_timer_cb(CFRunLoopTimerRef timer, void *info) {
     // transitions (which would otherwise force legacy iDisplay to reset its decoder and flash).
     int32_t fpsVal = (int32_t)(self.fps > 0 ? self.fps : 30);
     if (!self.allIntra) {
-        int32_t keyInterval = MAX(30, fpsVal * 8);
+        int32_t keyInterval = self.useVirtualDisplay ? MAX(30, fpsVal * 8) : MAX(30, fpsVal * 2);
         CFNumberRef kfNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &keyInterval);
         if (kfNum) {
             VTSessionSetProperty(self.vtSession, kVTCompressionPropertyKey_MaxKeyFrameInterval, kfNum);
@@ -2846,6 +2860,13 @@ void id_macos_capture_stop(void *handle) {
 
 int32_t id_macos_is_accessibility_trusted(void) {
     return AXIsProcessTrusted() ? 1 : 0;
+}
+
+int32_t id_macos_is_screen_capture_granted(void) {
+    if (@available(macOS 10.15, *)) {
+        return CGPreflightScreenCaptureAccess() ? 1 : 0;
+    }
+    return 1;
 }
 
 int32_t id_macos_is_screen_locked(void) {

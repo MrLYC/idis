@@ -76,6 +76,26 @@ use std::time::Duration;
         // Legacy iPad reporting 1024x768 points at 2x Retina streams true 2048px (not clamped to 1024px)
         assert_eq!(SessionRegistry::effective_ipad_max_pixel_edge(&make_hs(1024, 768), &vs), 2048);
         assert_eq!(SessionRegistry::effective_web_max_pixel_edge(&vs), 3840);
+        // Manual 2048x1536 @ 2x with auto max_pixel_edge=0 on a 2048x1536 iPad MUST cap at the
+        // iPad's physical 2048px long edge instead of oversampling to 3840x2880 (3.5x wasted pixels).
+        vs.width = 2048;
+        vs.height = 1536;
+        assert_eq!(SessionRegistry::effective_ipad_max_pixel_edge(&make_hs(2048, 1536), &vs), 2048);
+        assert_eq!(SessionRegistry::effective_ipad_max_pixel_edge(&make_hs(2732, 2048), &vs), 2732);
+        // Manual lower 1x resolution does not wastefully upscale beyond its own backing size.
+        vs.width = 1024;
+        vs.height = 768;
+        vs.hidpi = 1;
+        assert_eq!(SessionRegistry::effective_ipad_max_pixel_edge(&make_hs(2048, 1536), &vs), 1024);
+        // Explicit manual max_pixel_edge override still takes precedence.
+        vs.width = 2048;
+        vs.height = 1536;
+        vs.hidpi = 2;
+        vs.max_pixel_edge = 3840;
+        assert_eq!(SessionRegistry::effective_ipad_max_pixel_edge(&make_hs(2048, 1536), &vs), 3840);
+        vs.width = 0;
+        vs.height = 0;
+        vs.max_pixel_edge = 0;
         vs.hidpi = 1;
         assert_eq!(SessionRegistry::effective_ipad_max_pixel_edge(&make_hs(1024, 768), &vs), 1024);
         vs.hidpi = 2;
@@ -796,6 +816,66 @@ use std::time::Duration;
             sh as f64 * 0.21,
         );
         assert!(reg.list_sessions().is_empty());
+    }
+
+    #[test]
+    fn list_sessions_reports_live_os_display_bounds_when_windowserver_clamps_mode() {
+        use crate::protocol::keyed_archive::ArchivedValue;
+        use clap::Parser;
+        use std::collections::BTreeMap;
+
+        let cfg = AppConfig::try_parse_from(["idis", "--auto-accept", "--config", "none"]).unwrap();
+        let backend = Arc::new(crate::platform::mock::MockBackend::new());
+        let reg = SessionRegistry::new(cfg, backend.clone());
+
+        struct DummyWriter;
+        impl crate::transport::FrameWriter for DummyWriter {
+            fn send_frame(&self, _payload: &[u8]) -> anyhow::Result<()> {
+                Ok(())
+            }
+            fn close(&self) {}
+        }
+
+        let key = "127.0.0.1";
+        let sid = reg
+            .register_telemetry(key.to_string(), Arc::new(DummyWriter), 56846, false)
+            .unwrap();
+        let mut hdict = BTreeMap::new();
+        hdict.insert(
+            "uniqueIdentifier".to_string(),
+            ArchivedValue::String("ipad-bounds-1".to_string()),
+        );
+        hdict.insert("name".to_string(), ArchivedValue::String("iPad".to_string()));
+        hdict.insert("width".to_string(), ArchivedValue::Int(2048));
+        hdict.insert("height".to_string(), ArchivedValue::Int(1536));
+        let hs = crate::protocol::messages::MessagePacket::new_send(
+            "Handshake",
+            ArchivedValue::Dict(hdict),
+        );
+        reg.handle_telemetry_bytes_for_session(key, Some(sid), &hs.encode().unwrap())
+            .unwrap();
+        reg.attach_data_channel_checked(key, Some(sid), Arc::new(DummyWriter))
+            .unwrap();
+
+        // Simulate macOS WindowServer falling back the virtual display mode to 1600x1200.
+        let did = {
+            let map = reg.sessions.lock().unwrap();
+            let hdl = map.get(key).unwrap().capture.as_ref().unwrap().handle.clone();
+            let id = hdl.lock().unwrap().display_id().unwrap();
+            id
+        };
+        backend
+            .mock_display_bounds
+            .lock()
+            .unwrap()
+            .insert(did, (0, 900, 1600, 1200));
+
+        let snap = &reg.list_sessions()[0];
+        assert_eq!(snap.logical_width, 1600);
+        assert_eq!(snap.logical_height, 1200);
+        assert!(!snap.is_pixel_exact);
+
+        reg.close_session_if_id(key, sid);
     }
 
     #[test]

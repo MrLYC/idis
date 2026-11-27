@@ -1478,6 +1478,25 @@ static inline CMTime id_sc_min_frame_interval(uint32_t fps) {
                         return;
                     }
                     CGRect scFrame = found.frame;
+                    if (hasVirtual && (scFrame.size.width < 320.0 || scFrame.size.height < 240.0)) {
+                        // Intel macOS (x86_64) briefly exposes newly created CGVirtualDisplays in
+                        // SCShareableContent with a 1x1 placeholder frame before WindowServer commits
+                        // the real mode; starting SCStream against a 1x1 SCDisplay yields 0 frames
+                        // forever. Treat <320x240 as not-yet-ready and retry until the real mode lands.
+                        displayMissing = YES;
+                        id_diag_log(
+                            "sc_virtual_display_placeholder",
+                            @"attempt=%d targetID=%u scFrame=(%.0f,%.0f %.0fx%.0f)",
+                            attempt,
+                            targetID,
+                            scFrame.origin.x,
+                            scFrame.origin.y,
+                            scFrame.size.width,
+                            scFrame.size.height
+                        );
+                        dispatch_semaphore_signal(sem);
+                        return;
+                    }
                     if (scFrame.size.width > 0.0 && scFrame.size.height > 0.0) {
                         os_unfair_lock_lock(&self->_boundsLock);
                         self->_scDisplayFrame = scFrame;
@@ -1555,7 +1574,36 @@ static inline CMTime id_sc_min_frame_interval(uint32_t fps) {
                 atomic_store_explicit(&timedOut, YES, memory_order_release);
                 id_diag_log("sc_start_timeout", @"attempt=%d targetID=%u", attempt, targetID);
             }
-            if (ok) return YES;
+            if (ok) {
+                // One-shot 2.5s first-frame watchdog: if SCStream started cleanly yet delivered
+                // zero sample buffers (e.g. compositor/mode race on Intel macOS), trigger one
+                // automatic capture restart so the client never stays stuck on "Connecting...".
+                __weak typeof(self) weakWatch = self;
+                dispatch_after(
+                    dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2500ULL * NSEC_PER_MSEC)),
+                    self.lifecycleQueue,
+                    ^{
+                        @autoreleasepool {
+                            IDCaptureController *strongWatch = weakWatch;
+                            if (!strongWatch
+                                || atomic_load_explicit(&strongWatch->_stopped, memory_order_acquire)
+                                || atomic_load_explicit(&strongWatch->_sleeping, memory_order_acquire)
+                                || atomic_load_explicit(&strongWatch->_paused, memory_order_acquire)
+                                || atomic_load_explicit(&strongWatch->_generation, memory_order_acquire) != startGen
+                                || atomic_load_explicit(&strongWatch->_loggedFirstPb, memory_order_acquire)) {
+                                return;
+                            }
+                            id_diag_log("sc_first_frame_watchdog", @"targetID=%u -> restarting silent SCStream", targetID);
+                            [strongWatch scheduleCaptureRestartAfterMs:200 targetW:0 targetH:0 attempt:1];
+                        }
+                    }
+                );
+                return YES;
+            }
+            if (displayMissing && hasVirtual && self.virtualDisplay && (attempt % 2 == 1)) {
+                [self.virtualDisplay selectMatchingCGDisplayModeLogicalW:self.requestedLogicalW
+                                                                logicalH:self.requestedLogicalH];
+            }
             int nonMissingLimit = hasVirtual ? 3 : 1;
             if (!displayMissing && attempt >= nonMissingLimit) break;
         }
@@ -2165,7 +2213,7 @@ static void id_unlock_keepalive_timer_cb(CFRunLoopTimerRef timer, void *info) {
                                 || atomic_load_explicit(&self->_generation, memory_order_acquire) != myGen) {
                                 return;
                             }
-                            if (!modeSelected && (attempt == 0 || attempt == 2 || attempt == 5)) {
+                            if (!modeSelected && (attempt == 0 || attempt == 2 || attempt == 5 || attempt == 9 || attempt == 13)) {
                                 modeSelected = [self.virtualDisplay selectMatchingCGDisplayModeLogicalW:w logicalH:h];
                             }
                             usleep(40000);
@@ -2654,12 +2702,13 @@ void *id_macos_capture_start(
                 ctrl.virtualDisplay = vd;
                 ctrl.displayID = vd.displayID;
                 atomic_store_explicit(&ctrl->_atomicDisplayID, (uint32_t)vd.displayID, memory_order_release);
-                // Wait up to 480ms for WindowServer to register the new virtual display mode cleanly.
+                // Wait up to 800ms for WindowServer to leave the initial 1x1 placeholder mode
+                // (especially on Intel x86_64 macOS) and commit the requested virtual display mode.
                 uint32_t expectedW = (width * ctrl.hiDPI) & ~1u;
                 uint32_t expectedH = (height * ctrl.hiDPI) & ~1u;
                 BOOL modeSelected = vd.lastModeMatchedExact;
-                for (int attempt = 0; attempt < 12; attempt++) {
-                    if (!modeSelected && (attempt == 0 || attempt == 2 || attempt == 5)) {
+                for (int attempt = 0; attempt < 20; attempt++) {
+                    if (!modeSelected && (attempt == 0 || attempt == 2 || attempt == 5 || attempt == 9 || attempt == 14)) {
                         modeSelected = [vd selectMatchingCGDisplayModeLogicalW:width logicalH:height];
                     }
                     usleep(40000);

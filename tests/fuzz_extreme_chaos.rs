@@ -2624,9 +2624,10 @@ fn chaos_writer_deadline_under_slow_draining_reader() {
         shrink_sndbuf(&writer, 4096);
         let _ = writer.set_nodelay(true);
 
-        // Pre-fill kernel buffers deterministically so subsequent write starts saturated
+        // Pre-fill kernel buffers deterministically until WouldBlock (macOS arm64 loopback can
+        // autotune 2-4 MiB even after SO_SNDBUF/SO_RCVBUF hints, so 1 MiB is not always enough).
         let _ = writer.set_nonblocking(true);
-        let fill = [0xAAu8; 4096];
+        let fill = [0xAAu8; 64 * 1024];
         for _ in 0..256 {
             match writer.write(&fill) {
                 Ok(0) => break,
@@ -2640,17 +2641,17 @@ fn chaos_writer_deadline_under_slow_draining_reader() {
         let sr = stop_r.clone();
         let r_join = thread::spawn(move || {
             let _ = reader.set_read_timeout(Some(Duration::from_millis(100)));
-            let mut buf = [0u8; 4096];
+            let mut buf = [0u8; 1024];
             while !sr.load(Ordering::Acquire) {
                 match reader.read(&mut buf) {
                     Ok(0) => break,
-                    Ok(_) => thread::sleep(Duration::from_millis(20)),
+                    Ok(_) => thread::sleep(Duration::from_millis(30)),
                     Err(_) => {}
                 }
             }
         });
 
-        let big = vec![0x5Au8; 512 * 1024];
+        let big = vec![0x5Au8; 2 * 1024 * 1024];
         let t0 = Instant::now();
         let res = if use_ws {
             write_ws_frame_tcp_with_deadline(

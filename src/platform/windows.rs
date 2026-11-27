@@ -107,7 +107,7 @@ impl Default for WindowsBackend {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct WinMonitorInfo {
     display_id: u32,
     hmon: HMONITOR,

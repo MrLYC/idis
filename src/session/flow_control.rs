@@ -12,10 +12,10 @@ use tracing::{debug, info};
 
 #[derive(Default)]
 struct RttTracker {
-    /// Bounded FIFO of send timestamps (ms since `epoch`) for in-flight frames so pipelined
-    /// sends (`in_flight >= 2`) match each ACK against the oldest in-flight frame instead of the
-    /// most recently transmitted frame (prevents Uniform[0, 16.7ms] RTT aliasing at 60fps).
-    send_times_ms: VecDeque<u64>,
+    /// Bounded FIFO of `(sent_at_ms, counted_in_flight)` for in-flight frames so pipelined sends
+    /// (`in_flight >= 2`) match each ACK against the oldest in-flight frame, while clamped 120ms
+    /// safety probes (`counted_in_flight == false`) never over-reclaim live `in_flight` tokens.
+    send_times_ms: VecDeque<(u64, bool)>,
     ewma_rtt_ms_x10: Option<u64>,
     /// Timestamp (ms since `epoch`) of the most recent EWMA update so stale samples expire
     /// instead of freezing ABR on an old congestion spike.
@@ -111,7 +111,7 @@ impl FlowControl {
         let limit = self.max_in_flight.load(Ordering::Relaxed);
         if limit == 0 || !self.acked_ever.load(Ordering::Acquire) {
             self.last_sent_ms.store(now, Ordering::Relaxed);
-            self.record_send_timestamp(now, 4);
+            self.record_send_timestamp(now, false);
             return true;
         }
         const ACK_EXPIRE_MS: u64 = 500;
@@ -127,15 +127,16 @@ impl FlowControl {
             cur = 0;
         } else if cur > 0 {
             // Prune expired send timestamps (>500ms) from dropped ACKs; when ACKs are actively
-            // flowing, reclaim leaked phantom `in_flight` tokens so pipeline depth self-heals!
-            // During a live blackhole (`now - last_ack >= 500`), keep `in_flight` clamped so we
-            // only probe every 120ms without bursting.
+            // flowing, reclaim leaked phantom `in_flight` tokens (only for entries that actually
+            // incremented `in_flight`, never for clamped probes!).
             let mut expired = 0u32;
             if let Ok(mut g) = self.rtt.lock() {
-                while let Some(&oldest) = g.send_times_ms.front() {
+                while let Some(&(oldest, counted)) = g.send_times_ms.front() {
                     if now.saturating_sub(oldest) >= ACK_EXPIRE_MS {
                         g.send_times_ms.pop_front();
-                        expired = expired.saturating_add(1);
+                        if counted {
+                            expired = expired.saturating_add(1);
+                        }
                     } else {
                         break;
                     }
@@ -148,14 +149,17 @@ impl FlowControl {
         if cur < limit {
             self.in_flight.fetch_add(1, Ordering::AcqRel);
             self.last_sent_ms.store(now, Ordering::Relaxed);
-            self.record_send_timestamp(now, (limit as usize).max(1));
+            self.record_send_timestamp(now, true);
             return true;
         }
         // Safety release: if >120ms passed without any ACK, allow 1 probe frame without clobbering
-        // any concurrent ACK decrements (atomic CAS bounded to `limit`). Always record `now` so
-        // the first post-blackhole ACK measures true live RTT instead of a stale 1.9s timestamp.
+        // any concurrent ACK decrements (atomic CAS bounded to `limit`).
+        // - During a true >=500ms blackhole (`now - last_ack >= ACK_EXPIRE_MS`), reset stale queue
+        //   entries so the first recovery ACK measures fresh live RTT instead of a blackhole probe.
+        // - During a brief 120-499ms stall, preserve non-expired in-flight timestamps so delayed
+        //   ACKs measure true RTT instead of a bogus 15-25ms probe delta.
         if now.saturating_sub(last) >= 120 {
-            loop {
+            let incremented = loop {
                 let next = (cur + 1).min(limit);
                 match self.in_flight.compare_exchange_weak(
                     cur,
@@ -163,12 +167,13 @@ impl FlowControl {
                     Ordering::AcqRel,
                     Ordering::Acquire,
                 ) {
-                    Ok(_) => break,
+                    Ok(_) => break next > cur,
                     Err(actual) => cur = actual,
                 }
-            }
+            };
             self.last_sent_ms.store(now, Ordering::Relaxed);
-            self.record_send_timestamp(now, (limit as usize).max(1));
+            let in_blackhole = now.saturating_sub(last_ack) >= ACK_EXPIRE_MS;
+            self.record_probe_send_timestamp(now, ACK_EXPIRE_MS, in_blackhole, incremented);
             return true;
         }
         if count_drop {
@@ -193,13 +198,38 @@ impl FlowControl {
         }
     }
 
-    fn record_send_timestamp(&self, now: u64, cap: usize) {
+    fn record_send_timestamp(&self, now: u64, counted_in_flight: bool) {
         if let Ok(mut g) = self.rtt.lock() {
-            let cap = cap.clamp(1, MAX_RTT_TIMESTAMP_QUEUE);
-            while g.send_times_ms.len() >= cap {
+            while g.send_times_ms.len() >= MAX_RTT_TIMESTAMP_QUEUE {
                 g.send_times_ms.pop_front();
             }
-            g.send_times_ms.push_back(now);
+            g.send_times_ms.push_back((now, counted_in_flight));
+        }
+    }
+
+    fn record_probe_send_timestamp(
+        &self,
+        now: u64,
+        ack_expire_ms: u64,
+        in_blackhole: bool,
+        counted_in_flight: bool,
+    ) {
+        if let Ok(mut g) = self.rtt.lock() {
+            if in_blackhole {
+                g.send_times_ms.clear();
+            } else {
+                while let Some(&(oldest, _)) = g.send_times_ms.front() {
+                    if now.saturating_sub(oldest) >= ack_expire_ms {
+                        g.send_times_ms.pop_front();
+                    } else {
+                        break;
+                    }
+                }
+                while g.send_times_ms.len() >= MAX_RTT_TIMESTAMP_QUEUE {
+                    g.send_times_ms.pop_front();
+                }
+            }
+            g.send_times_ms.push_back((now, counted_in_flight));
         }
     }
 
@@ -215,17 +245,20 @@ impl FlowControl {
         self.last_ack_ms.store(now, Ordering::Relaxed);
         let mut expired = 0u32;
         if let Ok(mut g) = self.rtt.lock() {
-            // Discard expired timestamps (>500ms) from lost ACKs and reclaim their leaked tokens.
-            while let Some(&oldest) = g.send_times_ms.front() {
+            // Discard expired timestamps (>500ms) from lost ACKs and reclaim only tokens that
+            // actually incremented `in_flight` (never clamped safety probes).
+            while let Some(&(oldest, counted)) = g.send_times_ms.front() {
                 let age = now.saturating_sub(oldest);
                 if (age > ACK_EXPIRE_MS && g.send_times_ms.len() > 1) || age > 2000 {
                     g.send_times_ms.pop_front();
-                    expired = expired.saturating_add(1);
+                    if counted {
+                        expired = expired.saturating_add(1);
+                    }
                 } else {
                     break;
                 }
             }
-            if let Some(sent_at) = g.send_times_ms.pop_front() {
+            if let Some((sent_at, _)) = g.send_times_ms.pop_front() {
                 let sample_ms = now.saturating_sub(sent_at);
                 if sample_ms <= 2000 {
                     let sample_x10 = sample_ms * 10;
@@ -664,5 +697,60 @@ pub(super) fn broadcast_to_web_subscribers_tagged(
         }
     }
     send_frame_to_web_subscribers_tagged(subscribers, source_epoch, frame);
+}
+
+#[cfg(test)]
+mod flow_control_probe_tests {
+    use super::*;
+
+    #[test]
+    fn safety_probe_preserves_inflight_timestamp_and_prunes_post_blackhole_stale() {
+        let fc = FlowControl::new(2);
+        // Arm ACK tracking with 1 normal frame (50ms RTT)
+        assert!(fc.try_acquire_send_at(0, true));
+        fc.on_frame_received_at(50);
+        assert_eq!(fc.ewma_rtt_ms_at(50), Some(50.0));
+
+        // Fill window (limit=2) at t=100, t=116
+        assert!(fc.try_acquire_send_at(100, true));
+        assert!(fc.try_acquire_send_at(116, true));
+        // Stall until t=240 (124ms since last send): 120ms safety probe fires!
+        assert!(fc.try_acquire_send_at(240, true));
+        // Delayed ACK for the t=100 frame arrives 17ms later at t=257.
+        // MUST measure true 157ms latency (EWMA = (50*3 + 157)/4 = 76.7ms), NOT bogus 17ms!
+        fc.on_frame_received_at(257);
+        let rtt = fc.ewma_rtt_ms_at(257).expect("fresh EWMA RTT");
+        assert!(
+            rtt >= 70.0,
+            "120ms probe must not evict non-expired in-flight timestamp (got bogus low rtt={rtt:.1}ms)"
+        );
+
+        // Next normal send right after 1st delayed ACK MUST NOT evict the 2nd delayed frame (t=116)!
+        assert!(fc.try_acquire_send_at(258, true));
+        fc.on_frame_received_at(260); // ACK for t=116 (144ms true RTT, NOT 20ms from t=240 probe)
+        let rtt2 = fc.ewma_rtt_ms_at(260).expect("2nd delayed ACK RTT");
+        assert!(
+            rtt2 >= 85.0,
+            "normal send after probe must preserve remaining in-flight timestamps (got {rtt2:.1}ms)"
+        );
+
+        // Continuous 2s blackhole with intermediate 120ms probes: recovery ACK must still measure
+        // fresh live RTT (not a 400ms-old intermediate probe) and never over-reclaim in_flight!
+        let mut t = 400u64;
+        while t <= 2200 {
+            let _ = fc.try_acquire_send_at(t, true);
+            t += 120;
+        }
+        let recovery_probe_t = 2320u64;
+        assert!(fc.try_acquire_send_at(recovery_probe_t, true));
+        fc.on_frame_received_at(recovery_probe_t + 40);
+        let recovered = fc
+            .ewma_rtt_ms_at(recovery_probe_t + 40)
+            .expect("recovered EWMA RTT");
+        assert!(
+            recovered < 85.0,
+            "post-blackhole recovery ACK must measure fresh ~40ms RTT (got {recovered:.1}ms)"
+        );
+    }
 }
 

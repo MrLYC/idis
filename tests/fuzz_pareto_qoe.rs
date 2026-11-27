@@ -221,7 +221,7 @@ fn fuzz_coupled_abr_and_inflight_pareto_frontier() {
                 let _ = ifc.evaluate(&sample, tgt.fps, now);
                 let _ = abr.evaluate(&sample, now);
                 let cur_tier = abr.tier();
-                assert!(ifc.limit() >= 1 && ifc.limit() <= 4);
+                assert!(ifc.limit() >= 1 && ifc.limit() <= InFlightController::WIFI_MAX_WINDOW);
 
                 let dir = (cur_tier as i8 - prev_tier as i8).signum();
                 if dir != 0 {

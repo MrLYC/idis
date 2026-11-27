@@ -1,6 +1,7 @@
 use crate::config::CaptureMode;
 use crate::platform::{
-    latest_frame_channel, BonjourHandle, CaptureHandle, CaptureParams, CursorState,
+    bounded_frame_channel, latest_frame_channel, BonjourHandle, CaptureHandle, CaptureParams,
+    CursorState,
     DesktopWindowInfo, DisplayBackend, EncodedFrame, FrameReceiver, FrameSender, HostSystemInfo,
     StandaloneVirtualDisplayHandle, WindowMoveLayout,
 };
@@ -742,7 +743,11 @@ impl DisplayBackend for MacOsBackend {
         &self,
         params: &CaptureParams,
     ) -> Result<(Box<dyn CaptureHandle>, FrameReceiver)> {
-        let (tx, rx) = latest_frame_channel();
+        let (tx, rx) = if params.all_intra {
+            latest_frame_channel()
+        } else {
+            bounded_frame_channel(4)
+        };
         let tx_box = Box::into_raw(Box::new(tx));
         let c_name = CString::new(format!("idis ({})", params.client_name))?;
         let use_virtual = if params.mode == CaptureMode::Extend { 1 } else { 0 };

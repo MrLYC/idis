@@ -241,6 +241,7 @@
   }
   .sku-chip:disabled { opacity: 0.45; cursor: not-allowed; }
   .sku-custom { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding-top: 2px; }
+  .sku-note { color: var(--warn); font-size: 12px; line-height: 1.45; margin-top: 2px; }
   .sku-actions {
     display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between;
     gap: 10px; margin-top: 4px; padding-top: 12px; border-top: 1px solid var(--border);
@@ -578,6 +579,7 @@
           <div class="sku-label">客户端鼠标</div>
           <div class="sku-body">
             <div class="sku-chips" id="ipadCursorChips"></div>
+            <div class="sku-note hidden" id="ipadCursorWarn"></div>
           </div>
         </div>
 
@@ -859,6 +861,7 @@ let lastConfigPath = '';
 let lastTrustedSig = '';
 let lastHostStatsSig = '';
 let lastPendingSig = '';
+let lastSessions = [];
 let lastSessionsSig = '';
 let lastViewersSig = '';
 let lastIpadSkuSig = '';
@@ -1299,6 +1302,7 @@ async function refreshAdmin() {
     // Keep the newest iPad slot for each address; never let a Web slot or stale slot shadow an iPad session.
     pendingByAddr.set(p.addr, p);
   }
+  lastSessions = d.sessions || [];
   const sb = document.getElementById('sessionsBody');
   const sessionsSig = JSON.stringify((d.sessions || []).map(s => {
     const p = !s.authorized ? pendingByAddr.get(s.key) : null;
@@ -1535,6 +1539,7 @@ async function refreshAdmin() {
         renderIpadSkuForm();
       }
     }
+    updateIpadCursorWarn();
     if (!webFormDirty) {
       syncWebDraftFromServer(d);
       const webSig = JSON.stringify([webDraft, supportsWebIndependent, lastSupportsHidpi]);
@@ -2436,6 +2441,7 @@ function renderIpadSkuForm() {
       renderIpadSkuForm();
     }));
   }
+  updateIpadCursorWarn();
 
   // Unfocused half-FPS chips
   const ffEl = document.getElementById('ipadFocusFpsChips');
@@ -2464,6 +2470,19 @@ function renderIpadSkuForm() {
     const ccStr = d.clientCursor ? '客户端鼠标' : '合成鼠标';
     const ffStr = d.halfFpsUnfocused ? '失焦降帧开' : '失焦降帧关';
     prev.textContent = `当前已选：${resStr} · ${d.hidpi}x HiDPI · ${d.fps}fps / ${d.bitrate}Mbps · ${edgeStr} · ${mifStr} · ${abrStr} · ${ccStr} · ${ffStr}`;
+  }
+}
+
+function updateIpadCursorWarn() {
+  const ccWarnEl = document.getElementById('ipadCursorWarn');
+  if (!ccWarnEl) return;
+  const noUdpWifi = (lastSessions || []).some(s => s.streaming && s.transport === 'wifi' && s.udp_cursor === false);
+  if (ipadDraft && ipadDraft.clientCursor && noUdpWifi) {
+    ccWarnEl.textContent = '⚠ 当前无线 iPad 客户端未启用 UDP 光标通道，开启客户端独立绘制会回退到 Telemetry TCP 并与视频 ACK 争抢通道（旧版 iPad 建议保持「画面合成」）。';
+    ccWarnEl.classList.remove('hidden');
+  } else {
+    ccWarnEl.textContent = '';
+    ccWarnEl.classList.add('hidden');
   }
 }
 

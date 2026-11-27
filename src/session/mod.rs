@@ -115,6 +115,7 @@ pub struct SessionSnapshot {
     pub max_in_flight: u32,
     pub auto_max_in_flight: bool,
     pub dropped_frames: u64,
+    pub udp_cursor: bool,
     pub abr: Option<AbrStatusSnapshot>,
 }
 

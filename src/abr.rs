@@ -272,12 +272,10 @@ impl AbrController {
 
         let policy = AbrPolicy::for_sensitivity(self.sensitivity);
         let drop_ratio = sample.dropped_frames as f64 / total as f64;
-        // Pure high RTT with zero drops, zero socket stalls, and non-saturated in-flight window is
-        // typical of Wi-Fi 802.11 PSM wake latency during unfocused low-FPS viewing — require real
-        // delivery pressure before counting RTT as congestion.
-        let has_delivery_pressure = sample.dropped_frames > 0
-            || sample.avg_send_ms >= 15.0
-            || sample.in_flight_saturated;
+        // Pure high RTT with zero drops and fast socket writes is typical of Wi-Fi 802.11 PSM wake
+        // latency or healthy pipelining (`in_flight == limit` at steady 45-65ms decode+Wi-Fi RTT).
+        // Require real frame drops or socket send pressure before counting RTT as congestion.
+        let has_delivery_pressure = sample.dropped_frames > 0 || sample.avg_send_ms >= 15.0;
         let congested = sample.max_send_ms >= policy.max_send_ms_threshold
             || sample.avg_send_ms >= policy.avg_send_ms_threshold
             || (total >= policy.min_drop_total && drop_ratio >= policy.drop_ratio_threshold)
@@ -365,7 +363,7 @@ impl AbrController {
 /// (`queue_ms = ewma_rtt_ms - min_rtt_ms`):
 /// - When the link is clean (low queuing delay & fast socket writes) and baseline RTT requires
 ///   deeper pipelining to sustain target FPS (e.g. 60fps over Wi-Fi), smoothly expands `max_in_flight`
-///   up to `4` (USB capped at `2`) so frames are not artificially starved or misread by ABR.
+///   up to `8` (USB capped at `2`) so frames are not artificially starved or misread by ABR.
 /// - When queuing delay or send blocking rises (Bufferbloat / Wi-Fi congestion), rapidly shrinks
 ///   `max_in_flight` down to `1..=2` to drain stale buffered frames and protect low latency.
 pub struct InFlightController {
@@ -381,8 +379,8 @@ pub struct InFlightController {
 }
 
 impl InFlightController {
-    const USB_MAX_WINDOW: u32 = 2;
-    const WIFI_MAX_WINDOW: u32 = 4;
+    pub const USB_MAX_WINDOW: u32 = 2;
+    pub const WIFI_MAX_WINDOW: u32 = 8;
     const MIN_RTT_WINDOW: usize = 25;
     const SHRINK_STREAK_REQUIRED: u32 = 2;
     const EXPAND_STREAK_REQUIRED: u32 = 3;
@@ -390,6 +388,14 @@ impl InFlightController {
     const SHRINK_COOLDOWN: Duration = Duration::from_secs(3);
     const EXPAND_COOLDOWN: Duration = Duration::from_secs(4);
     const TRIM_COOLDOWN: Duration = Duration::from_secs(6);
+
+    pub const fn max_window_for_transport(is_usb: bool) -> u32 {
+        if is_usb {
+            Self::USB_MAX_WINDOW
+        } else {
+            Self::WIFI_MAX_WINDOW
+        }
+    }
 
     pub fn new(is_usb: bool, now: Instant) -> Self {
         let past = now
@@ -458,34 +464,47 @@ impl InFlightController {
         };
 
         let queue_ms = if let Some(rtt) = sample.avg_ack_rtt_ms {
-            if self.rtt_history.len() >= Self::MIN_RTT_WINDOW {
-                self.rtt_history.pop_front();
-            }
-            self.rtt_history.push_back(rtt);
             let base = self.windowed_min_rtt().unwrap_or(rtt);
             (rtt - base).max(0.0)
         } else {
             0.0
         };
 
-        // Require genuine delivery pressure before treating raw high RTT as congestion so Wi-Fi
-        // 802.11 PSM wake latency (0 drops, fast socket writes, unsaturated pipeline) never collapses
-        // `max_in_flight` to 1 and triggers a coupled false ABR downgrade.
-        let has_delivery_pressure = sample.dropped_frames > 0
-            || sample.avg_send_ms >= 15.0
-            || sample.in_flight_saturated;
+        // Require genuine delivery pressure (real frame drops or blocking socket writes) before
+        // treating high RTT as congestion. Hitting `in_flight == limit` with 0 drops and 0ms socket
+        // writes is normal pipelining (not congestion) and must never collapse `max_in_flight` to 1
+        // on a Wi-Fi 802.11 PSM wake spike.
+        let drop_ratio = sample.dropped_frames as f64 / total as f64;
+        let real_drop_pressure = sample.dropped_frames >= 3
+            || (sample.dropped_frames > 0 && total >= 4 && drop_ratio >= 0.15);
+        let has_delivery_pressure = real_drop_pressure || sample.avg_send_ms >= 15.0;
+        // Guard against positive-feedback bufferbloat when already expanded above baseline (`limit > 2`):
+        // if saturated queuing delay rises >=55ms above baseline, trim back toward floor=2 (never 1).
+        let expanded_queue_bloat = self.limit > 2 && sample.in_flight_saturated && queue_ms >= 55.0;
         // Only collapse `max_in_flight` all the way to 1 when TCP socket writes themselves are
-        // blocking or RTT is extreme under active delivery pressure — normal Wi-Fi airtime jitter
-        // (e.g. sharing Wi-Fi with Web viewers at avg_send_ms < 10ms) keeps >=2 frames in flight!
+        // blocking or sustained drop pressure coincides with extreme RTT — normal Wi-Fi airtime
+        // jitter at `avg_send_ms < 15ms` keeps >=2 frames in flight!
         let severe_congestion = (queue_ms >= 55.0 && sample.avg_send_ms >= 50.0)
             || sample.avg_send_ms >= 80.0
             || sample.max_send_ms >= 180
-            || (has_delivery_pressure && sample.avg_ack_rtt_ms.is_some_and(|r| r >= 200.0));
+            || (real_drop_pressure && sample.avg_ack_rtt_ms.is_some_and(|r| r >= 200.0));
         let congested = severe_congestion
+            || expanded_queue_bloat
             || (has_delivery_pressure && queue_ms >= 35.0)
             || sample.avg_send_ms >= 45.0
             || sample.max_send_ms >= 120
             || (has_delivery_pressure && sample.avg_ack_rtt_ms.is_some_and(|r| r >= 140.0));
+
+        // Only feed non-congested RTT samples into `rtt_history` so sustained queuing bloat never
+        // ratchets `windowed_min_rtt()` upward and triggers runaway expansion!
+        if !congested {
+            if let Some(rtt) = sample.avg_ack_rtt_ms {
+                if self.rtt_history.len() >= Self::MIN_RTT_WINDOW {
+                    self.rtt_history.pop_front();
+                }
+                self.rtt_history.push_back(rtt);
+            }
+        }
 
         if congested {
             self.expand_streak = 0;
@@ -505,7 +524,10 @@ impl InFlightController {
         }
 
         self.congested_streak = 0;
-        let clean_link = queue_ms < 12.0
+        // Allow up to 20ms natural RTT spread on Wi-Fi (16.7ms 60Hz VSync quantization + airtime
+        // variance) while keeping 12ms tight bound on USB.
+        let clean_queue_cap = if self.is_usb { 12.0 } else { 20.0 };
+        let clean_link = queue_ms < clean_queue_cap
             && sample.avg_send_ms < 18.0
             && sample.max_send_ms < 50
             && sample.sent_frames >= 3;
@@ -520,16 +542,22 @@ impl InFlightController {
             .windowed_min_rtt()
             .unwrap_or(if self.is_usb { 10.0 } else { 20.0 });
         let fps = target_fps.clamp(10, 120) as f64;
-        // Little's law pipeline depth from clean baseline RTT (+1 frame headroom for jitter),
-        // keeping healthy floor >= 2 (when max_bound >= 2) so a sub-ms LAN RTT never pins limit=1.
+        // Little's law pipeline depth from clean baseline RTT (+2 frame jitter headroom at >=45fps
+        // on Wi-Fi so 60fps at 45-65ms RTT reaches 5-6 in-flight without starving on 67ms jitter).
         let min_healthy = 2.min(max_bound);
-        let ideal = (((fps * (base_rtt_ms / 1000.0)).ceil() as u32) + 1).clamp(min_healthy, max_bound);
+        let headroom = if !self.is_usb && fps >= 45.0 { 2 } else { 1 };
+        let ideal = (((fps * (base_rtt_ms / 1000.0)).ceil() as u32) + headroom)
+            .clamp(min_healthy, max_bound);
 
         if self.limit < ideal {
             self.trim_streak = 0;
-            // Expand when pipeline is visibly needed (window saturated / drops) or below healthy baseline floor (2).
-            let needs_depth =
-                self.limit < 2 || sample.in_flight_saturated || sample.dropped_frames > 0 || fps >= 45.0;
+            // Expand when pipeline is visibly needed (saturated / drops / actively streaming >=45fps)
+            // or below healthy baseline floor (2), avoiding blind expansion on idle 60fps desktops.
+            let high_fps_active = fps >= 45.0 && sample.sent_frames >= 35;
+            let needs_depth = self.limit < 2
+                || sample.in_flight_saturated
+                || sample.dropped_frames > 0
+                || high_fps_active;
             if needs_depth {
                 self.expand_streak = self.expand_streak.saturating_add(1);
                 if self.expand_streak >= Self::EXPAND_STREAK_REQUIRED
@@ -660,7 +688,7 @@ mod tests {
         let mut wifi = InFlightController::new(false, t0);
         assert_eq!(wifi.limit(), 2);
 
-        // Clean 60fps Wi-Fi with 40ms baseline RTT: ideal = ceil(60*0.04) + 1 = 4 -> expands 2 -> 3 -> 4
+        // Clean 60fps Wi-Fi with 40ms baseline RTT: ideal = ceil(60*0.04) + 2 = 5 -> expands 2 -> 3 -> 4
         let clean_60 = AbrWindowSample {
             sent_frames: 40,
             dropped_frames: 2,
@@ -776,14 +804,67 @@ mod tests {
             avg_ack_rtt_ms: Some(65.0),
             in_flight_saturated: true,
         };
-        for s in 2..=40 {
+        for s in 2..=55 {
             let _ = wifi.evaluate(&steady_65, 60, t0 + Duration::from_secs(s));
         }
-        assert_eq!(
-            wifi.limit(),
-            4,
-            "transient 7.4ms RTT outlier must expire within 25s and restore max_in_flight=4"
+        assert!(
+            wifi.limit() >= 5 && wifi.limit() <= InFlightController::WIFI_MAX_WINDOW,
+            "transient 7.4ms RTT outlier must expire within 25s and expand 60fps@65ms RTT window >=5 (got {})",
+            wifi.limit()
         );
+    }
+
+    #[test]
+    fn in_flight_controller_ignores_saturated_wifi_psm_spike_and_expands_60fps_wifi_to_6() {
+        let t0 = Instant::now();
+        let mut wifi = InFlightController::new(false, t0);
+        let mut abr = AbrController::with_sensitivity(t0, AbrSensitivity::Balanced);
+
+        // Live-device scenario: 60fps over Wi-Fi with 48-60ms natural VSync+decode RTT jitter
+        // (12ms spread) and fast socket writes must expand above 4 (to >=5, up to 8).
+        for s in 1..=30u64 {
+            let rtt = if s % 2 == 0 { 48.0 } else { 60.0 };
+            let sample = AbrWindowSample {
+                sent_frames: 58,
+                dropped_frames: 0,
+                avg_send_ms: 0.5,
+                max_send_ms: 4,
+                avg_ack_rtt_ms: Some(rtt),
+                in_flight_saturated: true,
+            };
+            let _ = wifi.evaluate(&sample, 60, t0 + Duration::from_secs(s));
+            assert_eq!(
+                abr.evaluate(&sample, t0 + Duration::from_secs(s)),
+                None,
+                "healthy 60fps pipelining must never trigger ABR downgrade"
+            );
+        }
+        assert!(
+            wifi.limit() >= 5,
+            "60fps Wi-Fi at 48-60ms RTT must expand beyond old cap 4 (got {})",
+            wifi.limit()
+        );
+
+        // Wi-Fi PSM wakeup spike: avg_send=0.0ms, drops=0, rtt=235ms, EVEN with in_flight_saturated=true
+        // must NEVER collapse max_in_flight to 1 or trigger ABR downgrade (expanded_queue_bloat may
+        // gently trim toward floor=2, never below 2)!
+        for s in 31..=45u64 {
+            let psm = AbrWindowSample {
+                sent_frames: 25,
+                dropped_frames: 0,
+                avg_send_ms: 0.0,
+                max_send_ms: 1,
+                avg_ack_rtt_ms: Some(235.0),
+                in_flight_saturated: true,
+            };
+            let _ = wifi.evaluate(&psm, 30, t0 + Duration::from_secs(s));
+            assert_eq!(abr.evaluate(&psm, t0 + Duration::from_secs(s)), None);
+            assert!(
+                wifi.limit() >= 2,
+                "zero-drop zero-send-stall Wi-Fi PSM spike must never collapse max_in_flight below 2 (got {})",
+                wifi.limit()
+            );
+        }
     }
 
     #[test]

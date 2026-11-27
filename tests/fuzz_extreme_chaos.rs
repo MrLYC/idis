@@ -2977,7 +2977,7 @@ fn chaos_seeded_network_flap_storm_flow_abr_inflight_p2p() {
                     dropped_sec += 1;
                 }
                 assert!(
-                    fc.in_flight() <= fc.max_in_flight().max(4),
+                    fc.in_flight() <= fc.max_in_flight().max(InFlightController::WIFI_MAX_WINDOW),
                     "seed=0x{seed:x} in_flight exceeded bound"
                 );
                 let _ = tick;
@@ -3015,7 +3015,7 @@ fn chaos_seeded_network_flap_storm_flow_abr_inflight_p2p() {
                 }
             }
             assert!(
-                (1..=4).contains(&ifc.limit()),
+                (1..=InFlightController::WIFI_MAX_WINDOW).contains(&ifc.limit()),
                 "seed=0x{seed:x} invalid in_flight limit {}",
                 ifc.limit()
             );

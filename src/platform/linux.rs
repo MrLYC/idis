@@ -2,7 +2,8 @@ use crate::config::CaptureRect;
 use crate::platform::ffmpeg_capture::{FfmpegPipelineSpec, FfmpegProcess};
 use crate::platform::mdns::publish_mdns;
 use crate::platform::{
-    clamp_pixel_dimensions, latest_frame_channel, BonjourHandle, CaptureHandle, CaptureParams,
+    bounded_frame_channel, clamp_pixel_dimensions, latest_frame_channel, BonjourHandle,
+    CaptureHandle, CaptureParams,
     CursorState, DisplayBackend, FrameReceiver, FrameSender, HostSystemInfo,
 };
 use crate::protocol::messages::{
@@ -538,7 +539,11 @@ impl DisplayBackend for LinuxBackend {
             src_rect.x, src_rect.y, src_rect.width, src_rect.height, out_w, out_h
         );
 
-        let (tx, rx) = latest_frame_channel();
+        let (tx, rx) = if params.all_intra {
+            latest_frame_channel()
+        } else {
+            bounded_frame_channel(4)
+        };
         let mut handle = LinuxCaptureHandle {
             x11: x11.map(Mutex::new),
             src_rect,

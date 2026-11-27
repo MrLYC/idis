@@ -1,5 +1,6 @@
 use crate::platform::{
-    latest_frame_channel, BonjourHandle, CaptureHandle, CaptureParams, CursorState,
+    bounded_frame_channel, latest_frame_channel, BonjourHandle, CaptureHandle, CaptureParams,
+    CursorState,
     DesktopWindowInfo, DisplayBackend, EncodedFrame, FrameReceiver, FrameSender, HostSystemInfo,
     StandaloneVirtualDisplayHandle, WindowMoveLayout,
 };
@@ -413,7 +414,11 @@ impl DisplayBackend for MockBackend {
             anyhow::bail!("mock injected start_capture failure");
         }
         self.recorded_capture_modes.lock().unwrap().push(params.mode);
-        let (tx, rx) = latest_frame_channel();
+        let (tx, rx) = if params.all_intra {
+            latest_frame_channel()
+        } else {
+            bounded_frame_channel(4)
+        };
         self.frame_senders.lock().unwrap().push(tx.clone());
         let stop_flag = Arc::new(AtomicBool::new(false));
         let paused = Arc::new(AtomicBool::new(false));

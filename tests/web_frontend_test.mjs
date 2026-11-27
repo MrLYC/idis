@@ -971,6 +971,43 @@ console.log('PASS [2/5]: viewer.html approval, 4001 non-reconnect, QuotaExceeded
     wifiClosedHtml.includes('toggleWifiPort(true)') && wifiClosedHtml.includes('开启 Wi-Fi 端口'),
     `Wi-Fi card must render dynamic enable switch when closed; got: ${wifiClosedHtml}`
   );
+  // Dynamic Telemetry-TCP cursor warning regression: must react to streaming/udp_cursor transitions
+  // even when ipadSig is unchanged or videoFormDirty === true.
+  const savedSessionsForCursorTest = fakeAdminState.sessions;
+  const savedClientCursorForTest = fakeAdminState.settings.client_cursor;
+  fakeAdminState.settings.client_cursor = true;
+  fakeAdminState.sessions = [{
+    id: 1, key: '10.11.59.205', name: 'iPad', model: 'iPad', transport: 'wifi',
+    authorized: true, awaiting_confirm: false, streaming: false,
+    logical_width: 1024, logical_height: 768, width: 2048, height: 1536,
+    native_width: 2048, native_height: 1536, hidpi: 2, is_pixel_exact: true,
+    in_flight: 0, max_in_flight: 4, dropped_frames: 0, auto_max_in_flight: true,
+    udp_cursor: false,
+  }];
+  await env.ctx.refreshAdmin();
+  assert.ok(
+    env.elements.get('ipadCursorWarn').classList.contains('hidden'),
+    'ipadCursorWarn must stay hidden before streaming starts'
+  );
+  // Flip streaming -> true (ipadSig unchanged): warning must appear immediately!
+  fakeAdminState.sessions[0].streaming = true;
+  await env.ctx.refreshAdmin();
+  assert.ok(
+    !env.elements.get('ipadCursorWarn').classList.contains('hidden')
+      && env.elements.get('ipadCursorWarn').textContent.includes('Telemetry TCP'),
+    'ipadCursorWarn must show when Wi-Fi streaming session lacks UDP cursor'
+  );
+  // Even while videoFormDirty === true, switching udp_cursor -> true must hide warning immediately!
+  env.ctx.setVideoDirty(true);
+  fakeAdminState.sessions[0].udp_cursor = true;
+  await env.ctx.refreshAdmin();
+  assert.ok(
+    env.elements.get('ipadCursorWarn').classList.contains('hidden'),
+    'ipadCursorWarn must hide when session has UDP cursor even while form is dirty'
+  );
+  env.ctx.setVideoDirty(false);
+  fakeAdminState.settings.client_cursor = savedClientCursorForTest;
+  fakeAdminState.sessions = savedSessionsForCursorTest;
   // Restore low_power=true + closed viewer port for subsequent low-power tests below
   fakeAdminState.settings.low_power = true;
   fakeAdminState.settings.max_web_viewers = 0;
@@ -1335,6 +1372,12 @@ console.log('PASS [4/5]: admin.html CLI builder emits all new feature flags clea
   assert.ok(
     bridgeSrc.includes('@"is_floating": ((layer > 0) ? @YES : @NO)'),
     'macos/bridge.m must emit true JSON booleans (@YES/@NO) for is_floating'
+  );
+  // Guard: sub-60fps VSync phase-slip helper & 8s IPPP keyframe cadence must remain intact
+  assert.ok(
+    bridgeSrc.includes('id_sc_min_frame_interval(uint32_t fps)')
+      && bridgeSrc.includes('MAX(30, fpsVal * 8)'),
+    'macos/bridge.m must preserve VSync headroom helper and 8s IPPP keyframe interval'
   );
 }
 console.log('PASS [5/5]: macos/bridge.m static Objective-C selector integrity verified');

@@ -1,6 +1,7 @@
 use crate::config::{CaptureMode, CaptureRect};
 use crate::protocol::messages::InputEvent;
 use anyhow::Result;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
@@ -41,7 +42,8 @@ pub enum RecvFrameError {
 }
 
 struct FrameSlotInner {
-    latest: Option<(u64, u64, Arc<EncodedFrame>)>,
+    queue: VecDeque<(u64, u64, Arc<EncodedFrame>)>,
+    capacity: usize,
     closed: bool,
     woken: bool,
     overwritten: u64,
@@ -82,10 +84,26 @@ impl FrameSender {
         if guard.closed {
             return false;
         }
-        if guard.latest.is_some() {
-            guard.overwritten = guard.overwritten.saturating_add(1);
+        if guard.capacity <= 1 {
+            if !guard.queue.is_empty() {
+                guard.overwritten = guard.overwritten.saturating_add(guard.queue.len() as u64);
+                guard.queue.clear();
+            }
+            guard.queue.push_back((seq, tag, frame));
+        } else {
+            if guard.queue.len() >= guard.capacity {
+                if frame.is_keyframe {
+                    // Self-contained IDR supersedes queued stale frames cleanly when full.
+                    let dropped = guard.queue.len() as u64;
+                    guard.overwritten = guard.overwritten.saturating_add(dropped);
+                    guard.queue.clear();
+                } else {
+                    guard.queue.pop_front();
+                    guard.overwritten = guard.overwritten.saturating_add(1);
+                }
+            }
+            guard.queue.push_back((seq, tag, frame));
         }
-        guard.latest = Some((seq, tag, frame));
         self.slot.cvar.notify_one();
         true
     }
@@ -179,11 +197,11 @@ impl FrameReceiver {
         // Use `wait_timeout_while` so OS spurious Condvar wakeups (especially on Windows
         // `SleepConditionVariableSRW`) never return `RecvFrameError::Timeout` prematurely.
         let Ok((mut g, _)) = self.slot.cvar.wait_timeout_while(guard, timeout, |s| {
-            s.latest.is_none() && !s.closed && !s.woken
+            s.queue.is_empty() && !s.closed && !s.woken
         }) else {
             return Err(RecvFrameError::Disconnected);
         };
-        if let Some((seq, tag, frame)) = g.latest.take() {
+        if let Some((seq, tag, frame)) = g.queue.pop_front() {
             let ov = std::mem::take(&mut g.overwritten);
             g.woken = false;
             return Ok((seq, tag, frame, ov));
@@ -200,7 +218,7 @@ impl FrameReceiver {
         let Ok(mut guard) = self.slot.state.lock() else {
             return Err(RecvFrameError::Disconnected);
         };
-        if let Some((_, _, frame)) = guard.latest.take() {
+        if let Some((_, _, frame)) = guard.queue.pop_front() {
             return Ok(Arc::unwrap_or_clone(frame));
         }
         if guard.closed {
@@ -215,17 +233,23 @@ impl Drop for FrameReceiver {
     fn drop(&mut self) {
         if let Ok(mut guard) = self.slot.state.lock() {
             guard.closed = true;
-            guard.latest = None;
+            guard.queue.clear();
             self.slot.cvar.notify_all();
         }
     }
 }
 
-/// Create a latest-frame-overwrite channel pair.
-pub fn latest_frame_channel() -> (FrameSender, FrameReceiver) {
+/// Create a bounded consecutive FIFO frame channel (`capacity >= 1`).
+///
+/// - `capacity == 1` behaves as a latest-frame overwrite slot (`--all-intra` / Web fan-out).
+/// - `capacity > 1` (e.g. `6` for IPPP temporal streams) buffers brief TCP/Wi-Fi send micro-stalls
+///   in strict decode order without overwriting P-frames or triggering 200-400ms IDR resync freezes.
+pub fn bounded_frame_channel(capacity: usize) -> (FrameSender, FrameReceiver) {
+    let cap = capacity.max(1);
     let slot = Arc::new(FrameSlot {
         state: Mutex::new(FrameSlotInner {
-            latest: None,
+            queue: VecDeque::with_capacity(cap),
+            capacity: cap,
             closed: false,
             woken: false,
             overwritten: 0,
@@ -237,6 +261,11 @@ pub fn latest_frame_channel() -> (FrameSender, FrameReceiver) {
         FrameSender { slot: slot.clone() },
         FrameReceiver { slot },
     )
+}
+
+/// Create a latest-frame-overwrite channel pair (capacity = 1).
+pub fn latest_frame_channel() -> (FrameSender, FrameReceiver) {
+    bounded_frame_channel(1)
 }
 
 fn round_even(v: u64) -> u32 {
@@ -691,6 +720,52 @@ mod tests {
             rx.recv_timeout(Duration::from_millis(50)).unwrap_err(),
             RecvFrameError::Disconnected
         );
+    }
+
+    #[test]
+    fn bounded_frame_channel_preserves_ippp_fifo_and_resets_cleanly_on_full_idr() {
+        let (tx, rx) = bounded_frame_channel(4);
+        let mk = |seq: u32, idr: bool| EncodedFrame {
+            width: 1000 + seq,
+            height: 768,
+            bytes_per_row: (1000 + seq) * 4,
+            annex_b: vec![0, 0, 0, 1, if idr { 0x65 } else { 0x41 }],
+            is_keyframe: idr,
+        };
+        // Push 4 consecutive IPPP frames: zero overwrites, strict FIFO order preserved!
+        for i in 1..=4 {
+            assert!(tx.send_latest(mk(i, i == 1)));
+        }
+        for i in 1..=4 {
+            let (_seq, frame, ov) = rx.recv_timeout_shared(Duration::from_millis(50)).unwrap();
+            assert_eq!(ov, 0, "within capacity must report zero overwrites");
+            assert_eq!(frame.width, 1000 + i, "must preserve strict FIFO DPB order");
+        }
+
+        // Push 5 P-frames into cap=4: oldest (1) evicted, ov=1 reported on first take.
+        for i in 1..=5 {
+            assert!(tx.send_latest(mk(i, false)));
+        }
+        let (_seq, frame, ov) = rx.recv_timeout_shared(Duration::from_millis(50)).unwrap();
+        assert_eq!(ov, 1);
+        assert_eq!(frame.width, 1002);
+        // Drain remaining 3 frames
+        for expected in 3..=5 {
+            let (_s, f, ov2) = rx.recv_timeout_shared(Duration::from_millis(50)).unwrap();
+            assert_eq!(ov2, 0);
+            assert_eq!(f.width, 1000 + expected);
+        }
+
+        // Fill queue with 4 P-frames then push a fresh IDR: IDR supersedes all 4 cleanly.
+        for i in 1..=4 {
+            assert!(tx.send_latest(mk(i, false)));
+        }
+        assert!(tx.send_latest(mk(99, true)));
+        let (_s, idr_f, ov) = rx.recv_timeout_shared(Duration::from_millis(50)).unwrap();
+        assert_eq!(ov, 4);
+        assert!(idr_f.is_keyframe);
+        assert_eq!(idr_f.width, 1099);
+        assert_eq!(rx.try_recv().unwrap_err(), RecvFrameError::Timeout);
     }
 
     #[test]

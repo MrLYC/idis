@@ -259,11 +259,11 @@ impl SessionRegistry {
             let mut last_logged_size = (0u32, 0u32);
             // Bounded consecutive-frame pacing queue for iPad:
             // - All-intra mode keeps cap=1 (latest independent IDR only, zero lag).
-            // - IPPP mode buffers up to 4 consecutive P-frames (~66ms@60fps / ~133ms@30fps) so
-            //   normal Wi-Fi ACK latency (30-80ms, e.g. with concurrent Web viewers) does NOT
-            //   break the H.264 DPB chain and trap iPad in a 4fps giant-IDR storm (Invariant VID-1).
+            // - IPPP mode buffers up to 4 consecutive P-frames (~66ms@60fps / ~133ms@30fps),
+            //   paired with the 4-frame upstream bounded FIFO channel, absorbing brief Wi-Fi
+            //   micro-stalls cleanly without exceeding 180ms stale latency (Invariant VID-1).
             let pending_cap: usize = if all_intra_v { 1 } else { 4 };
-            const MAX_PENDING_AGE: Duration = Duration::from_millis(160);
+            const MAX_PENDING_AGE: Duration = Duration::from_millis(180);
             let mut pending_queue: VecDeque<(Instant, Arc<EncodedFrame>)> =
                 VecDeque::with_capacity(pending_cap);
             let mut last_sent_idr: Option<Arc<EncodedFrame>> = None;
@@ -322,12 +322,16 @@ impl SessionRegistry {
                                     }
                                     pending_queue.clear();
                                 }
-                                slot_awaiting_idr = true;
-                                ipad_awaiting_idr = true;
-                                if last_kf_req.elapsed() >= Duration::from_millis(250) {
-                                    last_kf_req = Instant::now();
-                                    if let Ok(hdl) = hdl_v.try_lock() {
-                                        hdl.request_keyframe();
+                                let got_fresh_idr = frame.is_keyframe
+                                    && crate::protocol::annexb::is_self_contained_idr(&frame.annex_b);
+                                if !got_fresh_idr {
+                                    slot_awaiting_idr = true;
+                                    ipad_awaiting_idr = true;
+                                    if last_kf_req.elapsed() >= Duration::from_millis(250) {
+                                        last_kf_req = Instant::now();
+                                        if let Ok(hdl) = hdl_v.try_lock() {
+                                            hdl.request_keyframe();
+                                        }
                                     }
                                 }
                             }
@@ -1102,14 +1106,19 @@ impl SessionRegistry {
                 let bind_addr = if addr.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
                 UdpSocket::bind(bind_addr).ok().map(|s| (s, addr))
             });
+            if udp_sock.is_none() {
+                udp_flag.store(false, Ordering::Release);
+            }
             let key_c = key.to_string();
             let polling_c = self.polling.clone();
             let size_c = actual_size.clone();
+            let flow_c = flow.clone();
+            let is_usb_c = is_usb;
             Some(thread::spawn(move || {
                 let mut prev: Option<CursorState> = None;
                 let mut prev_png_hash: u64 = 0;
                 let mut prev_stream_size: (u32, u32) = (0, 0);
-                let mut tick: u32 = 0;
+                let mut last_png_poll = Instant::now() - Duration::from_secs(1);
                 let mut udp_err_streak: u32 = 0;
                 let mut last_motion = Instant::now();
                 let mut was_enabled = client_cursor_c.load(Ordering::Acquire);
@@ -1158,44 +1167,55 @@ impl SessionRegistry {
                         thread::sleep(Duration::from_millis(50));
                         continue;
                     }
-                    // Brief lock for position only (~10us), keeping touch inject_input unblocked.
-                    let cur = hdl_c.lock().ok().and_then(|g| g.query_cursor());
+                    // Non-blocking lock for position (~10us) so `SCStream updateConfiguration:`
+                    // during ABR/focus shifts never blocks cursor_thread or piles up contention.
+                    let cur = match hdl_c.try_lock() {
+                        Ok(g) => g.query_cursor(),
+                        Err(_) => {
+                            thread::sleep(Duration::from_millis(4));
+                            continue;
+                        }
+                    };
                     if let Some(mut c) = cur {
                         let cur_stream_size = size_c.lock().map(|g| *g).unwrap_or((0, 0));
                         let size_changed = cur_stream_size != prev_stream_size;
                         let mut png_updated = false;
 
                         // Poll cursor PNG only when Telemetry cursor is supported, on first
-                        // visibility, stream resolution/ABR change, or every 16 ticks (~128ms).
+                        // visibility, stream resolution/ABR change, or every ~125ms wall-clock
+                        // (independent of active cursor_poll_ms so 50ms Wi-Fi fallback stays snappy).
                         if supports_tel_cursor
                             && c.visible
-                            && (prev_png_hash == 0 || size_changed || tick.is_multiple_of(16))
+                            && (prev_png_hash == 0
+                                || size_changed
+                                || last_png_poll.elapsed() >= Duration::from_millis(125))
                         {
-                            prev_stream_size = cur_stream_size;
-                            let png = hdl_c
-                                .lock()
-                                .ok()
-                                .and_then(|g| g.cursor_image_png_if_changed(&mut prev_png_hash));
-                            if let Some(img) = png {
-                                let img_len = img.len();
-                                if let Ok(bytes) = build_cursor_image_packet(img).encode() {
-                                    if tw_c.send_frame(&bytes).is_err() {
-                                        break;
+                            if let Ok(g) = hdl_c.try_lock() {
+                                prev_stream_size = cur_stream_size;
+                                last_png_poll = Instant::now();
+                                let png = g.cursor_image_png_if_changed(&mut prev_png_hash);
+                                drop(g);
+                                if let Some(img) = png {
+                                    let img_len = img.len();
+                                    if let Ok(bytes) = build_cursor_image_packet(img).encode() {
+                                        if tw_c.send_frame(&bytes).is_err() {
+                                            break;
+                                        }
                                     }
+                                    debug!(
+                                        "[{key_c}] Sent ChangeCursorImage ({img_len}B PNG, stream={}x{})",
+                                        cur_stream_size.0, cur_stream_size.1
+                                    );
+                                    png_updated = true;
+                                    // Re-query cursor position once so the hotspot offset matches the newly pushed PNG.
+                                    if let Some(fresh) =
+                                        hdl_c.try_lock().ok().and_then(|g2| g2.query_cursor())
+                                    {
+                                        c = fresh;
+                                    }
+                                } else if prev_png_hash == 0 {
+                                    debug!("[{key_c}] cursor_image_png_if_changed() returned None while cursor visible");
                                 }
-                                debug!(
-                                    "[{key_c}] Sent ChangeCursorImage ({img_len}B PNG, stream={}x{})",
-                                    cur_stream_size.0, cur_stream_size.1
-                                );
-                                png_updated = true;
-                                // Re-query cursor position once so the hotspot offset matches the newly pushed PNG.
-                                if let Some(fresh) =
-                                    hdl_c.lock().ok().and_then(|g| g.query_cursor())
-                                {
-                                    c = fresh;
-                                }
-                            } else if prev_png_hash == 0 {
-                                debug!("[{key_c}] cursor_image_png_if_changed() returned None while cursor visible");
                             }
                         }
 
@@ -1203,6 +1223,7 @@ impl SessionRegistry {
                         let pos_changed = png_updated
                             || prev.map(|p| p.x != c.x || p.y != c.y).unwrap_or(true);
 
+                        let mut pos_suppressed = false;
                         if vis_changed || (c.visible && pos_changed) {
                             last_motion = Instant::now();
                             let use_udp = udp_sock.is_some() && udp_flag.load(Ordering::Acquire);
@@ -1251,8 +1272,19 @@ impl SessionRegistry {
                                         c.visible, c.x, c.y
                                     );
                                 }
+                                // Telemetry TCP shares the exact runloop and socket that carries
+                                // video `PictureRendered` ACKs on legacy iOS clients (`udp_port=0`).
+                                // Defer intermediate position bplists while the video ACK window is
+                                // saturated so cursor traffic never starves video ACKs, preserving
+                                // `prev`'s last sent (x,y) so the final resting position flushes
+                                // immediately once ACKs drain.
+                                let flow_lim = flow_c.max_in_flight();
+                                let video_ack_saturated =
+                                    !is_usb_c && flow_lim > 0 && flow_c.in_flight() >= flow_lim;
                                 if c.visible && pos_changed {
-                                    if let Ok(bytes) =
+                                    if video_ack_saturated {
+                                        pos_suppressed = true;
+                                    } else if let Ok(bytes) =
                                         build_cursor_position_packet(c.x, c.y).encode()
                                     {
                                         if tw_c.send_frame(&bytes).is_err() {
@@ -1262,17 +1294,38 @@ impl SessionRegistry {
                                 }
                             }
                         }
-                        prev = Some(c);
+                        if pos_suppressed {
+                            let (last_x, last_y) = prev
+                                .map(|p| (p.x, p.y))
+                                .unwrap_or((u32::MAX, u32::MAX));
+                            prev = Some(CursorState {
+                                x: last_x,
+                                y: last_y,
+                                visible: c.visible,
+                            });
+                        } else {
+                            prev = Some(c);
+                        }
                     }
-                    tick = tick.wrapping_add(1);
                     let base_ms = polling_c
                         .lock()
                         .map(|p| p.cursor_poll_ms)
                         .unwrap_or(8);
-                    let sleep_ms = if last_motion.elapsed() > Duration::from_millis(500) {
-                        base_ms.max(33)
-                    } else {
+                    let using_udp = udp_sock.is_some() && udp_flag.load(Ordering::Acquire);
+                    // Wi-Fi Telemetry TCP fallback (`udp_port=0`) serializes ~600B bplists on the
+                    // same runloop as video ACKs — cap fallback polling to <=20Hz (50ms); keep USB
+                    // responsive (>=60Hz / 16ms) and native 9-byte UDP at full `base_ms` (125Hz).
+                    let active_ms = if using_udp {
                         base_ms
+                    } else if is_usb_c {
+                        base_ms.max(16)
+                    } else {
+                        base_ms.max(50)
+                    };
+                    let sleep_ms = if last_motion.elapsed() > Duration::from_millis(500) {
+                        active_ms.max(50)
+                    } else {
+                        active_ms
                     };
                     thread::sleep(Duration::from_millis(sleep_ms));
                 }

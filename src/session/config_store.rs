@@ -1604,11 +1604,11 @@ impl SessionRegistry {
     }
 
     /// Restore live sessions' `flow.max_in_flight` to `2` when returning to auto mode if previously
-    /// disabled (`0`) or above transport auto ceiling (`2` for USB, `4` for Wi-Fi; Iter-9 P2-C1).
+    /// disabled (`0`) or above transport auto ceiling (`2` for USB, `8` for Wi-Fi; Iter-9 P2-C1).
     fn reset_live_sessions_auto_in_flight(&self) {
         if let Ok(map) = self.sessions.lock() {
             for sess in map.values() {
-                let max_bound = if sess.is_usb { 2 } else { 4 };
+                let max_bound = crate::abr::InFlightController::max_window_for_transport(sess.is_usb);
                 let cur = sess.flow.max_in_flight();
                 if cur == 0 || cur > max_bound {
                     sess.flow.set_max_in_flight(2);

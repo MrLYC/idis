@@ -5,7 +5,8 @@ use crate::platform::ffmpeg_capture::{
 };
 use crate::platform::mdns::publish_mdns;
 use crate::platform::{
-    clamp_pixel_dimensions, compute_window_move_rect, latest_frame_channel, BonjourHandle,
+    bounded_frame_channel, clamp_pixel_dimensions, compute_window_move_rect, latest_frame_channel,
+    BonjourHandle,
     CaptureHandle, CaptureParams, CursorState, DesktopWindowInfo, DisplayBackend, FrameReceiver,
     FrameSender, HostSystemInfo, WindowMoveLayout,
 };
@@ -1056,7 +1057,11 @@ impl DisplayBackend for WindowsBackend {
             out_h
         );
 
-        let (tx, rx) = latest_frame_channel();
+        let (tx, rx) = if params.all_intra {
+            latest_frame_channel()
+        } else {
+            bounded_frame_channel(4)
+        };
         let mut handle = WindowsCaptureHandle {
             os_display_id: chosen_mon.display_id,
             capture_source,

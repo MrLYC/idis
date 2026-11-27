@@ -412,6 +412,9 @@ impl SessionRegistry {
                     max_in_flight: s.flow.max_in_flight(),
                     auto_max_in_flight: self.is_auto_max_in_flight(),
                     dropped_frames: s.flow.dropped_frames(),
+                    udp_cursor: !s.is_usb
+                        && s.handshake.as_ref().is_some_and(|hs| hs.udp_port > 0)
+                        && s.udp_cursor_enabled.load(Ordering::Acquire),
                     abr: s
                         .capture
                         .as_ref()
@@ -738,11 +741,15 @@ impl SessionRegistry {
                             awaiting_idr = true;
                         }
                         if ov > 0 && !all_intra_v {
-                            awaiting_idr = true;
-                            if last_kf_req.elapsed() >= Duration::from_millis(250) {
-                                last_kf_req = Instant::now();
-                                if let Ok(hdl) = hdl_v.try_lock() {
-                                    hdl.request_keyframe();
+                            let got_fresh_idr = frame.is_keyframe
+                                && crate::protocol::annexb::is_self_contained_idr(&frame.annex_b);
+                            if !got_fresh_idr {
+                                awaiting_idr = true;
+                                if last_kf_req.elapsed() >= Duration::from_millis(250) {
+                                    last_kf_req = Instant::now();
+                                    if let Ok(hdl) = hdl_v.try_lock() {
+                                        hdl.request_keyframe();
+                                    }
                                 }
                             }
                         }

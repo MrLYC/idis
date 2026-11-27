@@ -961,6 +961,16 @@ static void vt_output_callback(
 
 static void capture_power_callback(void *refCon, io_service_t service, natural_t messageType, void *messageArgument);
 
+// Give sub-60fps targets ~8% VSync phase-slip headroom so e.g. 30fps (30.67ms) locks cleanly onto
+// every 2nd 60Hz VSync (33.33ms) instead of slipping to the 3rd VSync (50ms / 20fps) during motion.
+static inline CMTime id_sc_min_frame_interval(uint32_t fps) {
+    uint32_t f = fps > 0 ? fps : 30;
+    if (f >= 60) {
+        return CMTimeMake(1, (int32_t)f);
+    }
+    return CMTimeMake(92, (int32_t)(f * 100));
+}
+
 @implementation IDCaptureController
 
 - (void)queryDisplayLogicalWidth:(uint32_t *)outLogW
@@ -1095,7 +1105,10 @@ static void capture_power_callback(void *refCon, io_service_t service, natural_t
     VTSessionSetProperty(session, kVTCompressionPropertyKey_YCbCrMatrix, kCVImageBufferYCbCrMatrix_ITU_R_709_2);
 
     int32_t fpsVal = (int32_t)(self.fps > 0 ? self.fps : 30);
-    int32_t maxKeyInterval = temporal ? (fpsVal * 2) : 1;
+    // Over reliable lossless TCP (IPPP mode), a periodic giant IDR every 2s creates 50-500x Wi-Fi
+    // airtime bursts; space periodic IDRs to 8s while keeping instant on-demand `request_keyframe()`
+    // for new Web viewers, reconnects, and DPB resyncs.
+    int32_t maxKeyInterval = temporal ? MAX(30, fpsVal * 8) : 1;
     OSStatus kiSt = noErr;
     CFNumberRef kiNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &maxKeyInterval);
     if (kiNum) {
@@ -1438,7 +1451,7 @@ static void capture_power_callback(void *refCon, io_service_t service, natural_t
                     cfg.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
                     cfg.colorSpaceName = kCGColorSpaceSRGB;
                     cfg.colorMatrix = kCVImageBufferYCbCrMatrix_ITU_R_709_2;
-                    cfg.minimumFrameInterval = CMTimeMake(1, (int32_t)fps);
+                    cfg.minimumFrameInterval = id_sc_min_frame_interval(fps);
                     cfg.queueDepth = 4;
                     BOOL wantCursor = atomic_load_explicit(&self->_atomicShowCursor, memory_order_acquire);
                     cfg.showsCursor = wantCursor;
@@ -2134,8 +2147,7 @@ static void id_unlock_keepalive_timer_cb(CFRunLoopTimerRef timer, void *info) {
     // transitions (which would otherwise force legacy iDisplay to reset its decoder and flash).
     int32_t fpsVal = (int32_t)(self.fps > 0 ? self.fps : 30);
     if (!self.allIntra) {
-        int32_t keyInterval = fpsVal * 2;
-        if (keyInterval < 10) keyInterval = 10;
+        int32_t keyInterval = MAX(30, fpsVal * 8);
         CFNumberRef kfNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &keyInterval);
         if (kfNum) {
             VTSessionSetProperty(self.vtSession, kVTCompressionPropertyKey_MaxKeyFrameInterval, kfNum);
@@ -2255,7 +2267,7 @@ static void id_unlock_keepalive_timer_cb(CFRunLoopTimerRef timer, void *info) {
                 cfg.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
                 cfg.colorSpaceName = kCGColorSpaceSRGB;
                 cfg.colorMatrix = kCVImageBufferYCbCrMatrix_ITU_R_709_2;
-                cfg.minimumFrameInterval = CMTimeMake(1, (int32_t)effFps);
+                cfg.minimumFrameInterval = id_sc_min_frame_interval(effFps);
                 cfg.queueDepth = 4;
                 cfg.showsCursor = atomic_load_explicit(&self->_atomicShowCursor, memory_order_acquire);
 

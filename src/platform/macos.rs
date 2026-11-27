@@ -148,6 +148,11 @@ extern "C" {
         out_ptr: *mut *mut u8,
         out_len: *mut usize,
     ) -> i32;
+    fn id_macos_capture_screenshot_png(
+        handle: *mut c_void,
+        out_ptr: *mut *mut u8,
+        out_len: *mut usize,
+    ) -> i32;
     fn id_macos_free_bytes(ptr: *mut u8);
     fn id_macos_helper_set_display_mode(
         display_id: u32,
@@ -553,6 +558,45 @@ impl CaptureHandle for MacCaptureHandle {
         } else {
             None
         }
+    }
+
+    fn save_screenshot_png(&self, dest: &std::path::Path) -> Result<()> {
+        if self.ptr.is_null() {
+            return Err(anyhow!("macOS capture handle is closed"));
+        }
+        let mut ptr: *mut u8 = std::ptr::null_mut();
+        let mut len: usize = 0;
+        let ok = unsafe { id_macos_capture_screenshot_png(self.ptr, &mut ptr, &mut len) };
+        if ok != 0 && !ptr.is_null() && len > 0 {
+            let bytes = unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec();
+            unsafe { id_macos_free_bytes(ptr) };
+            std::fs::write(dest, &bytes)?;
+            return Ok(());
+        }
+        // Fallback when lastPixelBuffer is empty (e.g. stream currently paused): capture target
+        // display bounds silently via macOS built-in `screencapture`.
+        let did = unsafe { id_macos_capture_display_id(self.ptr) };
+        let target_did = if did != 0 {
+            did
+        } else {
+            unsafe { id_macos_main_display_id() }
+        };
+        let (mut x, mut y, mut w, mut h) = (0i32, 0i32, 0u32, 0u32);
+        let has_bounds =
+            unsafe { id_macos_display_bounds(target_did, &mut x, &mut y, &mut w, &mut h) } != 0
+                && w > 0
+                && h > 0;
+        let mut cmd = std::process::Command::new("/usr/sbin/screencapture");
+        cmd.arg("-x").arg("-t").arg("png");
+        if has_bounds {
+            cmd.arg("-R").arg(format!("{x},{y},{w},{h}"));
+        }
+        cmd.arg(dest);
+        let status = cmd.status()?;
+        if !status.success() {
+            return Err(anyhow!("screencapture 退出状态异常: {status}"));
+        }
+        Ok(())
     }
 
     fn cursor_image_png_if_changed(&self, last_hash: &mut u64) -> Option<Vec<u8>> {

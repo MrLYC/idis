@@ -675,6 +675,33 @@ impl CaptureHandle for WindowsCaptureHandle {
         }
         self.tx.close();
     }
+
+    fn save_screenshot_png(&self, dest: &std::path::Path) -> Result<()> {
+        let status = std::process::Command::new(&self.ffmpeg_path)
+            .args([
+                "-y",
+                "-loglevel",
+                "error",
+                "-f",
+                "gdigrab",
+                "-offset_x",
+                &self.src_rect.x.to_string(),
+                "-offset_y",
+                &self.src_rect.y.to_string(),
+                "-video_size",
+                &format!("{}x{}", self.src_rect.width, self.src_rect.height),
+                "-i",
+                "desktop",
+                "-frames:v",
+                "1",
+            ])
+            .arg(dest)
+            .status()?;
+        if !status.success() {
+            return Err(anyhow::anyhow!("ffmpeg gdigrab 截屏失败: {status}"));
+        }
+        Ok(())
+    }
 }
 
 impl Drop for WindowsCaptureHandle {

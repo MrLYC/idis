@@ -251,6 +251,53 @@
     font-size: 13px; margin: 14px 0 8px; display: flex; justify-content: space-between;
     align-items: center; flex-wrap: wrap; gap: 8px; color: var(--text);
   }
+  .gesture-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 10px;
+    margin-top: 6px;
+  }
+  .gesture-slot {
+    background: #0d1117;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .gesture-slot-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    font-size: 13px;
+    font-weight: 600;
+  }
+  .gesture-slot-dir {
+    font-size: 11px;
+    color: var(--muted);
+    font-weight: 500;
+  }
+  .gesture-extra {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+  }
+  .gesture-quick-chip {
+    background: #161b22;
+    color: var(--muted);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 2px 8px;
+    font-size: 11px;
+    cursor: pointer;
+  }
+  .gesture-quick-chip:hover {
+    color: var(--text);
+    border-color: var(--accent);
+  }
   @media (max-width: 720px) {
     header { padding: 10px 12px; }
     main { margin: 10px auto; padding: 0 10px 32px; }
@@ -600,6 +647,59 @@
         </div>
       </div>
       <div id="videoMsg" class="msg"></div>
+    </div>
+
+    <div class="card" id="gesturesCard">
+      <h2>
+        <span>iPad 边缘手势</span>
+        <span class="row">
+          <span class="badge warn hidden" id="gestureDirtyBadge">待应用</span>
+          <span class="badge info" id="gestureStatusBadge">未开启</span>
+        </span>
+      </h2>
+      <div class="sku-form">
+        <div class="sku-row">
+          <div class="sku-label">边缘手势开关</div>
+          <div class="sku-body">
+            <div class="sku-chips" id="gestureEnabledChips"></div>
+            <div style="color:var(--muted);font-size:12px">在 iPad 左/右边缘上下半区向内短滑触发动作；投屏控制类动作在关闭远程触控时也可生效，快捷键与鼠标类动作需同时开启「允许远程输入」。</div>
+          </div>
+        </div>
+
+        <div class="sku-row">
+          <div class="sku-label">边缘热区宽度</div>
+          <div class="sku-body">
+            <div class="sku-chips" id="gestureEdgeZoneChips"></div>
+          </div>
+        </div>
+
+        <div class="sku-row">
+          <div class="sku-label">最短滑动距离</div>
+          <div class="sku-body">
+            <div class="sku-chips" id="gestureMinSwipeChips"></div>
+          </div>
+        </div>
+
+        <div class="sku-row">
+          <div class="sku-label">截屏保存路径</div>
+          <div class="sku-body">
+            <input id="gestureScreenshotDir" type="text" placeholder="留空使用默认路径，例如 ~/Pictures" style="width:100%;max-width:420px" oninput="onGestureScreenshotDirInput()">
+            <div id="gestureScreenshotDirHint" style="color:var(--muted);font-size:12px">自动按日期创建子目录 idis-YYYY-MM-DD</div>
+          </div>
+        </div>
+
+        <div class="gesture-grid" id="gestureSlotsGrid"></div>
+
+        <div class="sku-actions">
+          <span class="sku-preview" id="gestureLastTrigger">最近触发：暂无</span>
+          <span class="row">
+            <button class="primary" id="btnApplyGestures" onclick="applyGestureSettings()">应用设置</button>
+            <button class="hidden" id="btnDiscardGestures" onclick="discardGestureEdits()">放弃修改</button>
+            <button class="warn" onclick="resetGestureSettings()">恢复默认</button>
+          </span>
+        </div>
+      </div>
+      <div id="gestureMsg" class="msg"></div>
     </div>
 
     <div class="card">
@@ -1306,7 +1406,7 @@ async function refreshAdmin() {
   const sb = document.getElementById('sessionsBody');
   const sessionsSig = JSON.stringify((d.sessions || []).map(s => {
     const p = !s.authorized ? pendingByAddr.get(s.key) : null;
-    return [s.id, s.key, s.name, s.model, s.transport, s.fingerprint, s.authorized, s.awaiting_confirm, s.streaming,
+    return [s.id, s.key, s.name, s.model, s.transport, s.fingerprint, s.authorized, s.awaiting_confirm, s.streaming, s.stream_paused,
       s.logical_width, s.logical_height, s.width, s.height, s.hidpi, s.is_pixel_exact,
       s.in_flight, s.max_in_flight, s.dropped_frames, s.auto_max_in_flight,
       s.abr && s.abr.enabled, s.abr && s.abr.tier, s.abr && s.abr.scale_pct, s.abr && s.abr.target_bitrate_mbps, s.abr && s.abr.rtt_ms, s.abr && s.abr.unfocused_fps_halved, s.abr && s.abr.target_fps,
@@ -1319,7 +1419,9 @@ async function refreshAdmin() {
       const dispName = s.name || (p ? p.name : '等待客户端握手');
       const dispModel = s.model || (p ? p.model : '');
       const statusBadge = s.streaming
-        ? '<span class="badge ok">推流中</span>'
+        ? (s.stream_paused
+            ? '<span class="badge warn">已暂停</span>'
+            : '<span class="badge ok">推流中</span>')
         : (s.authorized
             ? '<span class="badge info">已认证</span>'
             : (s.awaiting_confirm || p
@@ -1551,6 +1653,7 @@ async function refreshAdmin() {
   }
 
   // Viewers & LAN P2P relay summary
+  syncGesturesFromServer(d);
   renderVirtualDisplaysAndRules(d);
   const p2pInfo = d.web_p2p || {};
   const p2pBadge = document.getElementById('p2pSummaryBadge');
@@ -3585,6 +3688,365 @@ async function applyWindowRulesNow() {
     if (msg) { msg.className = 'msg err'; msg.textContent = err; }
     showToast(err, 'err');
   }
+}
+
+// ==================== IPAD EDGE GESTURES ====================
+const GESTURE_SLOTS = [
+  { key: 'left_top_swipe_right', title: '左边缘上半', dir: '向右短滑 →' },
+  { key: 'right_top_swipe_left', title: '右边缘上半', dir: '← 向左短滑' },
+  { key: 'left_bottom_swipe_right', title: '左边缘下半', dir: '向右短滑 →' },
+  { key: 'right_bottom_swipe_left', title: '右边缘下半', dir: '← 向左短滑' },
+];
+
+const GESTURE_ACTION_OPTIONS = [
+  { kind: 'none', label: '无动作' },
+  { kind: 'toggle_pause', label: '暂停或恢复投屏' },
+  { kind: 'disconnect', label: '彻底断开投屏' },
+  { kind: 'toggle_input', label: '开关远程触控' },
+  { kind: 'toggle_low_power', label: '开关低电量模式' },
+  { kind: 'cycle_preset', label: '循环切换预设' },
+  { kind: 'apply_preset', label: '应用指定预设' },
+  { kind: 'request_keyframe', label: '刷新清晰关键帧' },
+  { kind: 'screenshot', label: '截屏并保存' },
+  { kind: 'hotkey', label: '触发自定义快捷键' },
+  { kind: 'right_click', label: '模拟鼠标右键' },
+  { kind: 'scroll', label: '垂直滚轮滚动' },
+];
+
+const GESTURE_HOTKEY_PRESETS = [
+  { label: '切左桌面', keys: 'ctrl+left' },
+  { label: '切右桌面', keys: 'ctrl+right' },
+  { label: '调度中心', keys: 'ctrl+up' },
+  { label: '切换应用', keys: 'cmd+tab' },
+  { label: '关闭窗口', keys: 'cmd+w' },
+  { label: '空格', keys: 'space' },
+  { label: 'Esc', keys: 'esc' },
+];
+
+function defaultGesturesDraft() {
+  return {
+    enabled: false,
+    edge_zone_pct: 8,
+    min_swipe_pct: 6,
+    screenshot_dir: '',
+    left_top_swipe_right: { kind: 'hotkey', keys: 'ctrl+left' },
+    left_bottom_swipe_right: { kind: 'hotkey', keys: 'cmd+tab' },
+    right_top_swipe_left: { kind: 'toggle_pause' },
+    right_bottom_swipe_left: { kind: 'toggle_input' },
+  };
+}
+
+function cloneGesturesConfig(g) {
+  const base = defaultGesturesDraft();
+  if (!g || typeof g !== 'object') return base;
+  const copyAction = (a, fallback) => {
+    if (!a || typeof a !== 'object' || !a.kind) return { ...fallback };
+    if (a.kind === 'hotkey') return { kind: 'hotkey', keys: String(a.keys || '') };
+    if (a.kind === 'apply_preset') return { kind: 'apply_preset', preset: String(a.preset || '') };
+    if (a.kind === 'scroll') return { kind: 'scroll', delta: Number(a.delta || -120) };
+    return { kind: String(a.kind) };
+  };
+  return {
+    enabled: Boolean(g.enabled),
+    edge_zone_pct: Number(g.edge_zone_pct || base.edge_zone_pct),
+    min_swipe_pct: Number(g.min_swipe_pct || base.min_swipe_pct),
+    screenshot_dir: String(g.screenshot_dir || ''),
+    left_top_swipe_right: copyAction(g.left_top_swipe_right, base.left_top_swipe_right),
+    left_bottom_swipe_right: copyAction(g.left_bottom_swipe_right, base.left_bottom_swipe_right),
+    right_top_swipe_left: copyAction(g.right_top_swipe_left, base.right_top_swipe_left),
+    right_bottom_swipe_left: copyAction(g.right_bottom_swipe_left, base.right_bottom_swipe_left),
+  };
+}
+
+let gestureServerCfg = defaultGesturesDraft();
+let gestureDraft = defaultGesturesDraft();
+let gestureFormDirty = false;
+let lastGesturesSig = '';
+let lastGesturePresetNames = [];
+let lastDefaultScreenshotDir = '';
+
+function updateGestureScreenshotHint() {
+  const hint = document.getElementById('gestureScreenshotDirHint');
+  const inp = document.getElementById('gestureScreenshotDir');
+  if (inp && lastDefaultScreenshotDir) {
+    inp.placeholder = `留空默认：${lastDefaultScreenshotDir}`;
+  }
+  if (!hint) return;
+  const rawBase = (gestureDraft.screenshot_dir || '').trim() || lastDefaultScreenshotDir || '~/Pictures';
+  const cleanBase = rawBase.replace(/[\\/]+$/, '');
+  const now = new Date();
+  const y = now.getFullYear();
+  const m = String(now.getMonth() + 1).padStart(2, '0');
+  const day = String(now.getDate()).padStart(2, '0');
+  hint.textContent = `截屏将按日期保存在：${cleanBase}/idis-${y}-${m}-${day}/`;
+}
+
+function onGestureScreenshotDirInput() {
+  const inp = document.getElementById('gestureScreenshotDir');
+  gestureDraft.screenshot_dir = inp ? inp.value : '';
+  gestureFormDirty = true;
+  updateGestureDirtyUI();
+  updateGestureScreenshotHint();
+}
+
+function updateGestureDirtyUI() {
+  const dirtyBadge = document.getElementById('gestureDirtyBadge');
+  const discardBtn = document.getElementById('btnDiscardGestures');
+  if (dirtyBadge) dirtyBadge.classList.toggle('hidden', !gestureFormDirty);
+  if (discardBtn) discardBtn.classList.toggle('hidden', !gestureFormDirty);
+}
+
+function defaultActionForKind(kind) {
+  if (kind === 'hotkey') return { kind: 'hotkey', keys: 'ctrl+left' };
+  if (kind === 'apply_preset') {
+    return { kind: 'apply_preset', preset: lastGesturePresetNames[0] || '日常均衡' };
+  }
+  if (kind === 'scroll') return { kind: 'scroll', delta: -180 };
+  return { kind };
+}
+
+function syncGesturesFromServer(d) {
+  const customList = d.presets || [];
+  const customNames = new Set(customList.map(p => p.name));
+  lastGesturePresetNames = [
+    ...customList.map(p => p.name),
+    ...(d.builtin_presets || []).filter(p => !customNames.has(p.name)).map(p => p.name),
+  ];
+
+  const srv = cloneGesturesConfig(d.settings && d.settings.gestures);
+  gestureServerCfg = srv;
+  lastDefaultScreenshotDir = (d.settings && d.settings.default_screenshot_dir) || '';
+
+  const badge = document.getElementById('gestureStatusBadge');
+  if (badge) {
+    const activeCount = GESTURE_SLOTS.filter(s => srv[s.key] && srv[s.key].kind !== 'none').length;
+    badge.className = 'badge ' + (srv.enabled ? 'ok' : 'info');
+    badge.textContent = srv.enabled
+      ? `已开启 · ${activeCount}/4 已绑定 · 热区 ${srv.edge_zone_pct}%`
+      : '未开启';
+  }
+
+  const lastEl = document.getElementById('gestureLastTrigger');
+  if (lastEl) {
+    const lg = d.settings && d.settings.last_gesture;
+    const total = (d.settings && d.settings.input_stats && d.settings.input_stats.gestures_triggered) || 0;
+    if (lg) {
+      const t = lg.triggered_at_unix_ms ? new Date(lg.triggered_at_unix_ms).toLocaleTimeString() : '';
+      const detail = lg.detail ? ` · ${lg.detail}` : '';
+      const blocked = lg.blocked_reason ? ` · 已拦截：${lg.blocked_reason}` : '';
+      lastEl.textContent = `最近触发：${lg.slot_label || lg.slot} → ${lg.action}${detail}${blocked}${t ? ' · ' + t : ''} · 累计 ${total} 次`;
+    } else {
+      lastEl.textContent = `最近触发：暂无 · 累计 ${total} 次`;
+    }
+  }
+
+  if (!gestureFormDirty) {
+    gestureDraft = cloneGesturesConfig(srv);
+    const sig = JSON.stringify([gestureDraft, lastGesturePresetNames, lastDefaultScreenshotDir]);
+    if (sig !== lastGesturesSig) {
+      lastGesturesSig = sig;
+      renderGesturesForm();
+    }
+  }
+}
+
+function renderGesturesForm() {
+  const enBox = document.getElementById('gestureEnabledChips');
+  if (enBox) {
+    enBox.innerHTML = [
+      { v: true, label: '开启' },
+      { v: false, label: '关闭' },
+    ].map(it => `<button type="button" class="sku-chip${gestureDraft.enabled === it.v ? ' active' : ''}" data-gesture-enabled="${it.v ? '1' : '0'}">${it.label}</button>`).join('');
+    enBox.querySelectorAll('[data-gesture-enabled]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        gestureDraft.enabled = btn.dataset.gestureEnabled === '1';
+        gestureFormDirty = true;
+        updateGestureDirtyUI();
+        renderGesturesForm();
+      });
+    });
+  }
+
+  const ezBox = document.getElementById('gestureEdgeZoneChips');
+  if (ezBox) {
+    const opts = [5, 8, 12, 15];
+    if (!opts.includes(gestureDraft.edge_zone_pct)) opts.push(gestureDraft.edge_zone_pct);
+    opts.sort((a, b) => a - b);
+    ezBox.innerHTML = opts.map(v => `<button type="button" class="sku-chip${gestureDraft.edge_zone_pct === v ? ' active' : ''}" data-gesture-ez="${v}">${v}%</button>`).join('');
+    ezBox.querySelectorAll('[data-gesture-ez]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        gestureDraft.edge_zone_pct = Number(btn.dataset.gestureEz);
+        gestureFormDirty = true;
+        updateGestureDirtyUI();
+        renderGesturesForm();
+      });
+    });
+  }
+
+  const msBox = document.getElementById('gestureMinSwipeChips');
+  if (msBox) {
+    const opts = [4, 6, 10, 15];
+    if (!opts.includes(gestureDraft.min_swipe_pct)) opts.push(gestureDraft.min_swipe_pct);
+    opts.sort((a, b) => a - b);
+    msBox.innerHTML = opts.map(v => `<button type="button" class="sku-chip${gestureDraft.min_swipe_pct === v ? ' active' : ''}" data-gesture-ms="${v}">${v}%</button>`).join('');
+    msBox.querySelectorAll('[data-gesture-ms]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        gestureDraft.min_swipe_pct = Number(btn.dataset.gestureMs);
+        gestureFormDirty = true;
+        updateGestureDirtyUI();
+        renderGesturesForm();
+      });
+    });
+  }
+
+  const dirInp = document.getElementById('gestureScreenshotDir');
+  if (dirInp && document.activeElement !== dirInp) {
+    dirInp.value = gestureDraft.screenshot_dir || '';
+  }
+  updateGestureScreenshotHint();
+
+  const grid = document.getElementById('gestureSlotsGrid');
+  if (grid) {
+    grid.innerHTML = GESTURE_SLOTS.map(slot => {
+      const act = gestureDraft[slot.key] || { kind: 'none' };
+      const optionsHtml = GESTURE_ACTION_OPTIONS.map(o =>
+        `<option value="${esc(o.kind)}"${act.kind === o.kind ? ' selected' : ''}>${esc(o.label)}</option>`
+      ).join('');
+
+      let extraHtml = '';
+      if (act.kind === 'hotkey') {
+        const chipsHtml = GESTURE_HOTKEY_PRESETS.map(hp =>
+          `<button type="button" class="gesture-quick-chip" data-gesture-hk-chip="${esc(slot.key)}" data-keys="${esc(hp.keys)}">${esc(hp.label)}</button>`
+        ).join('');
+        extraHtml = `
+          <div class="gesture-extra">
+            <input type="text" class="gesture-hotkey-input" data-gesture-hk="${esc(slot.key)}" value="${esc(act.keys || '')}" placeholder="例如 ctrl+left、cmd+tab、space" style="flex:1;min-width:160px">
+          </div>
+          <div class="gesture-extra">${chipsHtml}</div>
+        `;
+      } else if (act.kind === 'apply_preset') {
+        const names = [...lastGesturePresetNames];
+        if (act.preset && !names.includes(act.preset)) names.unshift(act.preset);
+        if (!names.length) names.push('日常均衡');
+        const pOpts = names.map(n =>
+          `<option value="${esc(n)}"${act.preset === n ? ' selected' : ''}>${esc(n)}</option>`
+        ).join('');
+        extraHtml = `
+          <div class="gesture-extra">
+            <select class="gesture-preset-select" data-gesture-preset="${esc(slot.key)}" style="flex:1;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:6px 10px;font-size:13px">${pOpts}</select>
+          </div>
+        `;
+      } else if (act.kind === 'scroll') {
+        const val = Number(act.delta || -180);
+        extraHtml = `
+          <div class="gesture-extra">
+            <input type="number" class="gesture-scroll-input" data-gesture-scroll="${esc(slot.key)}" value="${val}" min="-1000" max="1000" step="20" style="width:96px">
+            <button type="button" class="gesture-quick-chip" data-gesture-sc-chip="${esc(slot.key)}" data-delta="180">向上滚</button>
+            <button type="button" class="gesture-quick-chip" data-gesture-sc-chip="${esc(slot.key)}" data-delta="-180">向下滚</button>
+          </div>
+        `;
+      }
+
+      return `
+        <div class="gesture-slot">
+          <div class="gesture-slot-head">
+            <span>${esc(slot.title)}</span>
+            <span class="gesture-slot-dir">${esc(slot.dir)}</span>
+          </div>
+          <select class="gesture-kind-select" data-gesture-slot="${esc(slot.key)}" style="width:100%;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:6px 10px;font-size:13px">${optionsHtml}</select>
+          ${extraHtml}
+        </div>
+      `;
+    }).join('');
+
+    grid.querySelectorAll('[data-gesture-slot]').forEach(sel => {
+      sel.addEventListener('change', () => {
+        const k = sel.dataset.gestureSlot;
+        gestureDraft[k] = defaultActionForKind(sel.value);
+        gestureFormDirty = true;
+        updateGestureDirtyUI();
+        renderGesturesForm();
+      });
+    });
+    grid.querySelectorAll('[data-gesture-hk]').forEach(inp => {
+      inp.addEventListener('input', () => {
+        const k = inp.dataset.gestureHk;
+        gestureDraft[k] = { kind: 'hotkey', keys: inp.value };
+        gestureFormDirty = true;
+        updateGestureDirtyUI();
+      });
+    });
+    grid.querySelectorAll('[data-gesture-hk-chip]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const k = btn.dataset.gestureHkChip;
+        gestureDraft[k] = { kind: 'hotkey', keys: btn.dataset.keys };
+        gestureFormDirty = true;
+        updateGestureDirtyUI();
+        renderGesturesForm();
+      });
+    });
+    grid.querySelectorAll('[data-gesture-preset]').forEach(sel => {
+      sel.addEventListener('change', () => {
+        const k = sel.dataset.gesturePreset;
+        gestureDraft[k] = { kind: 'apply_preset', preset: sel.value };
+        gestureFormDirty = true;
+        updateGestureDirtyUI();
+      });
+    });
+    grid.querySelectorAll('[data-gesture-scroll]').forEach(inp => {
+      inp.addEventListener('input', () => {
+        const k = inp.dataset.gestureScroll;
+        gestureDraft[k] = { kind: 'scroll', delta: Number(inp.value) || -180 };
+        gestureFormDirty = true;
+        updateGestureDirtyUI();
+      });
+    });
+    grid.querySelectorAll('[data-gesture-sc-chip]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const k = btn.dataset.gestureScChip;
+        gestureDraft[k] = { kind: 'scroll', delta: Number(btn.dataset.delta) };
+        gestureFormDirty = true;
+        updateGestureDirtyUI();
+        renderGesturesForm();
+      });
+    });
+  }
+  updateGestureDirtyUI();
+}
+
+async function applyGestureSettings() {
+  const msg = document.getElementById('gestureMsg');
+  const r = await api('/api/admin/settings', {
+    method: 'POST',
+    body: JSON.stringify({ gestures: gestureDraft }),
+  });
+  if (r.ok) {
+    gestureFormDirty = false;
+    lastGesturesSig = '';
+    if (msg) { msg.className = 'msg ok'; msg.textContent = '边缘手势配置已保存并立即生效。'; }
+    showToast('边缘手势配置已保存', 'ok');
+    refreshAdmin();
+  } else {
+    const err = (r.data && r.data.error) || '保存边缘手势配置失败';
+    if (msg) { msg.className = 'msg err'; msg.textContent = err; }
+    showToast(err, 'err');
+  }
+}
+
+function discardGestureEdits() {
+  gestureDraft = cloneGesturesConfig(gestureServerCfg);
+  gestureFormDirty = false;
+  lastGesturesSig = '';
+  const msg = document.getElementById('gestureMsg');
+  if (msg) msg.textContent = '';
+  renderGesturesForm();
+}
+
+async function resetGestureSettings() {
+  gestureDraft = defaultGesturesDraft();
+  gestureFormDirty = true;
+  renderGesturesForm();
+  await applyGestureSettings();
 }
 
 checkAuth();

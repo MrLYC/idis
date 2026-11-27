@@ -423,6 +423,30 @@ impl CaptureHandle for LinuxCaptureHandle {
         x11.query_cursor(self.src_rect, self.out_w, self.out_h)
     }
 
+    fn save_screenshot_png(&self, dest: &std::path::Path) -> Result<()> {
+        let input = format!("{}+{},{}", self.display_env, self.src_rect.x, self.src_rect.y);
+        let status = std::process::Command::new(&self.ffmpeg_path)
+            .args([
+                "-y",
+                "-loglevel",
+                "error",
+                "-f",
+                "x11grab",
+                "-video_size",
+                &format!("{}x{}", self.src_rect.width, self.src_rect.height),
+                "-i",
+                &input,
+                "-frames:v",
+                "1",
+            ])
+            .arg(dest)
+            .status()?;
+        if !status.success() {
+            return Err(anyhow::anyhow!("ffmpeg x11grab 截屏失败: {status}"));
+        }
+        Ok(())
+    }
+
     fn stop(&mut self) {
         if let Some(mut p) = self.proc.take() {
             p.stop();

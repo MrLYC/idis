@@ -181,6 +181,7 @@ impl SessionRegistry {
             active_preset: self.active_preset.lock().unwrap().clone(),
             presets: self.presets.lock().unwrap().clone(),
             window_rules: self.window_rules.lock().unwrap().clone(),
+            gestures: self.gestures_config(),
             trusted_devices: self.trust_store.list(),
         }
     }
@@ -410,6 +411,7 @@ impl SessionRegistry {
         *self.active_preset.lock().unwrap() = eff_cfg.active_preset.clone();
         *self.presets.lock().unwrap() = eff_cfg.presets.clone();
         *self.window_rules.lock().unwrap() = eff_cfg.window_rules.clone();
+        *self.gestures.lock().unwrap() = eff_cfg.gestures.clone();
         self.applied_window_moves.lock().unwrap().clear();
         self.max_extended_screens
             .store(eff_cfg.max_extended_screens.min(32), Ordering::Release);
@@ -1487,6 +1489,30 @@ impl SessionRegistry {
         {
             self.persist_config_patch(|c| c.web_require_approval = enabled);
         }
+    }
+
+    pub fn gestures_config(&self) -> crate::user_config::EdgeGesturesConfig {
+        self.gestures.lock().unwrap().clone()
+    }
+
+    pub fn set_gestures_config(
+        &self,
+        mut cfg: crate::user_config::EdgeGesturesConfig,
+    ) -> Result<crate::user_config::EdgeGesturesConfig> {
+        cfg.validate_and_normalize()?;
+        *self.gestures.lock().unwrap() = cfg.clone();
+        if let Ok(mut map) = self.sessions.lock() {
+            for sess in map.values_mut() {
+                sess.edge_gesture.reset();
+            }
+        }
+        let persisted = cfg.clone();
+        self.persist_config_patch(|c| c.gestures = persisted);
+        info!(
+            "Runtime setting updated: gestures.enabled={} edge_zone={}% min_swipe={}%",
+            cfg.enabled, cfg.edge_zone_pct, cfg.min_swipe_pct
+        );
+        Ok(cfg)
     }
 
     pub fn set_input_allowed(&self, allowed: bool) {

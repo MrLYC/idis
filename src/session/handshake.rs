@@ -179,6 +179,7 @@ impl SessionRegistry {
                     stream_paused: Arc::new(AtomicBool::new(false)),
                     mouse_left_down: None,
                     suppress_right_click_tail: false,
+                    edge_gesture: super::gestures::EdgeGestureTracker::default(),
                     capture: None,
                 },
             );
@@ -231,6 +232,7 @@ impl SessionRegistry {
                     stream_paused: Arc::new(AtomicBool::new(false)),
                     mouse_left_down: None,
                     suppress_right_click_tail: false,
+                    edge_gesture: super::gestures::EdgeGestureTracker::default(),
                     capture: None,
                 },
             );

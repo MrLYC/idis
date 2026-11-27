@@ -3443,6 +3443,41 @@ int32_t id_macos_cursor_png(void *handle, uint32_t video_w, uint32_t video_h, ui
     return id_macos_cursor_png_if_changed(handle, video_w, video_h, NULL, out_ptr, out_len) == 1 ? 1 : 0;
 }
 
+int32_t id_macos_capture_screenshot_png(void *handle, uint8_t **out_ptr, size_t *out_len) {
+    @autoreleasepool {
+        if (!handle || !out_ptr || !out_len) return 0;
+        *out_ptr = NULL;
+        *out_len = 0;
+        IDCaptureController *ctrl = (__bridge IDCaptureController *)handle;
+        if (!ctrl.queue) return 0;
+        __block CVPixelBufferRef pb = NULL;
+        dispatch_sync(ctrl.queue, ^{
+            if (!atomic_load_explicit(&ctrl->_stopped, memory_order_acquire) && ctrl.lastPixelBuffer) {
+                pb = CVPixelBufferRetain(ctrl.lastPixelBuffer);
+            }
+        });
+        if (!pb) return 0;
+        CGImageRef cgImg = NULL;
+        OSStatus st = VTCreateCGImageFromCVPixelBuffer(pb, NULL, &cgImg);
+        CVPixelBufferRelease(pb);
+        if (st != noErr || !cgImg) {
+            if (cgImg) CGImageRelease(cgImg);
+            return 0;
+        }
+        NSBitmapImageRep *rep = [[NSBitmapImageRep alloc] initWithCGImage:cgImg];
+        CGImageRelease(cgImg);
+        if (!rep) return 0;
+        NSData *png = [rep representationUsingType:NSBitmapImageFileTypePNG properties:@{}];
+        if (!png || png.length == 0) return 0;
+        uint8_t *buf = (uint8_t *)malloc(png.length);
+        if (!buf) return 0;
+        memcpy(buf, png.bytes, png.length);
+        *out_ptr = buf;
+        *out_len = png.length;
+        return 1;
+    }
+}
+
 void id_macos_free_bytes(uint8_t *ptr) {
     if (ptr) free(ptr);
 }

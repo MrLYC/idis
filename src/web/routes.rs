@@ -9,7 +9,7 @@ use crate::config::{AbrSensitivity, LockAction, QualityPreset, WebScreenMode};
 use crate::platform::WindowMoveLayout;
 use crate::session::{ConfirmDecision, PendingDevice, PollingPatch, VideoSettingsPatch};
 use crate::trust::{compute_web_viewer_fingerprint, parse_web_client_label};
-use crate::user_config::WindowRule;
+use crate::user_config::{EdgeGesturesConfig, WindowRule};
 use anyhow::Result;
 use serde::Deserialize;
 use std::net::{Shutdown, SocketAddr, TcpStream};
@@ -161,6 +161,7 @@ struct UpdateSettingsReq {
     usb_retry_ms: Option<u64>,
     admin_poll_ms: Option<u64>,
     reset_polling: Option<bool>,
+    gestures: Option<EdgeGesturesConfig>,
 }
 
 pub(super) fn handle_connection(
@@ -1494,6 +1495,9 @@ fn handle_admin_state(stream: &mut TcpStream, state: &WebState) -> Result<()> {
         "allow_input": state.registry.is_input_allowed(),
         "client_cursor": state.registry.is_client_cursor(),
         "input_stats": state.registry.input_stats(),
+        "gestures": state.registry.gestures_config(),
+        "default_screenshot_dir": crate::user_config::default_screenshot_base_dir().to_string_lossy().into_owned(),
+        "last_gesture": state.registry.last_gesture(),
         "wifi_enabled": wifi_addrs.is_some(),
         "port_idle_close_secs": state.registry.port_idle_close_secs(),
         "max_extended_screens": state.registry.max_extended_screens(),
@@ -1652,6 +1656,16 @@ fn handle_admin_settings(
 
     if let Some(allow) = payload.allow_input {
         state.registry.set_input_allowed(allow);
+    }
+    if let Some(gestures) = payload.gestures {
+        if let Err(e) = state.registry.set_gestures_config(gestures) {
+            return send_json(
+                stream,
+                "400 Bad Request",
+                &[],
+                &serde_json::json!({ "error": format!("{e:#}") }),
+            );
+        }
     }
     if let Some(cc) = payload.client_cursor {
         state.registry.set_client_cursor(cc);

@@ -3,6 +3,9 @@
 
 use crate::config::{AbrSensitivity, LockAction, WebScreenMode};
 use crate::platform::WindowMoveLayout;
+use crate::protocol::messages::{
+    InputEvent, KEY_MOD_ALT, KEY_MOD_CTRL, KEY_MOD_META, KEY_MOD_SHIFT,
+};
 use crate::trust::{normalize_fingerprint, TrustedDevice};
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -113,6 +116,442 @@ impl PollingConfigSection {
 
 pub const MAX_CUSTOM_PRESETS: usize = 32;
 pub const MAX_WINDOW_RULES: usize = 64;
+
+fn default_gesture_edge_zone_pct() -> u8 {
+    8
+}
+
+fn default_gesture_min_swipe_pct() -> u8 {
+    6
+}
+
+fn default_left_top_action() -> GestureAction {
+    GestureAction::Hotkey {
+        keys: "ctrl+left".to_string(),
+    }
+}
+
+fn default_left_bottom_action() -> GestureAction {
+    GestureAction::Hotkey {
+        keys: "cmd+tab".to_string(),
+    }
+}
+
+fn default_right_top_action() -> GestureAction {
+    GestureAction::TogglePause
+}
+
+fn default_right_bottom_action() -> GestureAction {
+    GestureAction::ToggleInput
+}
+
+/// The 4 supported iPad screen edge-swipe gesture slots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EdgeGestureSlot {
+    LeftTopSwipeRight,
+    LeftBottomSwipeRight,
+    RightTopSwipeLeft,
+    RightBottomSwipeLeft,
+}
+
+impl EdgeGestureSlot {
+    pub const ALL: [Self; 4] = [
+        Self::LeftTopSwipeRight,
+        Self::LeftBottomSwipeRight,
+        Self::RightTopSwipeLeft,
+        Self::RightBottomSwipeLeft,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::LeftTopSwipeRight => "left_top_swipe_right",
+            Self::LeftBottomSwipeRight => "left_bottom_swipe_right",
+            Self::RightTopSwipeLeft => "right_top_swipe_left",
+            Self::RightBottomSwipeLeft => "right_bottom_swipe_left",
+        }
+    }
+
+    pub fn label_zh(self) -> &'static str {
+        match self {
+            Self::LeftTopSwipeRight => "左边缘上半向右短滑",
+            Self::LeftBottomSwipeRight => "左边缘下半向右短滑",
+            Self::RightTopSwipeLeft => "右边缘上半向左短滑",
+            Self::RightBottomSwipeLeft => "右边缘下半向左短滑",
+        }
+    }
+
+    pub fn is_left_edge(self) -> bool {
+        matches!(self, Self::LeftTopSwipeRight | Self::LeftBottomSwipeRight)
+    }
+}
+
+/// Parsed cross-platform keyboard shortcut ready for `CaptureHandle::inject_input`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedHotkey {
+    pub canonical: String,
+    pub key_code: Option<u16>,
+    pub ch: Option<u16>,
+    pub modifiers: u8,
+}
+
+impl ParsedHotkey {
+    pub fn to_input_event(&self) -> InputEvent {
+        if self.modifiers != 0 {
+            InputEvent::KeyModified {
+                key_code: self.key_code,
+                ch: self.ch,
+                modifiers: self.modifiers,
+            }
+        } else if let Some(key_code) = self.key_code {
+            InputEvent::KeySpecial { key_code }
+        } else {
+            InputEvent::KeyUnicode {
+                ch: self.ch.unwrap_or(b' ' as u16),
+            }
+        }
+    }
+}
+
+/// Parse and canonicalize a hotkey string such as `"ctrl+left"`, `"cmd+shift+4"`, `"cmd+tab"`, or `"space"`.
+pub fn parse_hotkey_spec(raw: &str) -> Result<ParsedHotkey> {
+    let cleaned: String = raw
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect::<String>()
+        .trim()
+        .to_string();
+    if cleaned.is_empty() {
+        return Err(anyhow!("快捷键不能为空（例如 ctrl+left、cmd+tab、space）"));
+    }
+    if cleaned.len() > 64 {
+        return Err(anyhow!("快捷键长度不能超过 64 个字符"));
+    }
+
+    let mut modifiers = 0u8;
+    let mut key_code: Option<u16> = None;
+    let mut ch: Option<u16> = None;
+    let mut canonical_key: Option<String> = None;
+
+    for raw_part in cleaned.split('+') {
+        let part = raw_part.trim().to_ascii_lowercase();
+        if part.is_empty() {
+            return Err(anyhow!("快捷键格式无效: {cleaned:?}（存在多余的 + 号）"));
+        }
+        match part.as_str() {
+            "ctrl" | "control" => modifiers |= KEY_MOD_CTRL,
+            "alt" | "opt" | "option" => modifiers |= KEY_MOD_ALT,
+            "shift" => modifiers |= KEY_MOD_SHIFT,
+            "cmd" | "command" | "meta" | "super" | "win" => modifiers |= KEY_MOD_META,
+            other => {
+                if canonical_key.is_some() {
+                    return Err(anyhow!(
+                        "快捷键只能包含一个主键，发现多个非修饰键: {cleaned:?}"
+                    ));
+                }
+                let (kc, ch_val, name): (Option<u16>, Option<u16>, String) = match other {
+                    "backspace" | "bs" => (Some(0x33), None, "backspace".to_string()),
+                    "return" | "enter" => (Some(0x24), None, "return".to_string()),
+                    "tab" => (Some(0x30), None, "tab".to_string()),
+                    "esc" | "escape" => (Some(0x35), None, "esc".to_string()),
+                    "delete" | "del" | "forwarddelete" => (Some(0x75), None, "delete".to_string()),
+                    "up" | "arrowup" => (Some(0x7E), None, "up".to_string()),
+                    "down" | "arrowdown" => (Some(0x7D), None, "down".to_string()),
+                    "left" | "arrowleft" => (Some(0x7B), None, "left".to_string()),
+                    "right" | "arrowright" => (Some(0x7C), None, "right".to_string()),
+                    "home" => (Some(0x73), None, "home".to_string()),
+                    "end" => (Some(0x77), None, "end".to_string()),
+                    "pageup" | "pgup" => (Some(0x74), None, "pageup".to_string()),
+                    "pagedown" | "pgdn" => (Some(0x79), None, "pagedown".to_string()),
+                    "space" => (None, Some(b' ' as u16), "space".to_string()),
+                    s if s.len() == 1 => {
+                        let b = s.as_bytes()[0];
+                        let supported = b.is_ascii_lowercase()
+                            || b.is_ascii_digit()
+                            || matches!(
+                                b,
+                                b'-' | b'='
+                                    | b'['
+                                    | b']'
+                                    | b';'
+                                    | b'\''
+                                    | b','
+                                    | b'.'
+                                    | b'/'
+                                    | b'\\'
+                                    | b'`'
+                            );
+                        if !supported {
+                            return Err(anyhow!("不支持的快捷键字符: {other:?}"));
+                        }
+                        (None, Some(b as u16), (b as char).to_string())
+                    }
+                    _ => {
+                        return Err(anyhow!(
+                            "不支持的按键名称: {other:?}（支持字母、数字、方向键 left/right/up/down、tab、space、esc、return、backspace、delete、home、end、pageup、pagedown）"
+                        ));
+                    }
+                };
+                key_code = kc;
+                ch = ch_val;
+                canonical_key = Some(name);
+            }
+        }
+    }
+
+    let Some(key_name) = canonical_key else {
+        return Err(anyhow!("快捷键缺少主键（不能只有修饰键）: {cleaned:?}"));
+    };
+
+    let mut parts: Vec<&str> = Vec::with_capacity(5);
+    if (modifiers & KEY_MOD_CTRL) != 0 {
+        parts.push("ctrl");
+    }
+    if (modifiers & KEY_MOD_ALT) != 0 {
+        parts.push("alt");
+    }
+    if (modifiers & KEY_MOD_SHIFT) != 0 {
+        parts.push("shift");
+    }
+    if (modifiers & KEY_MOD_META) != 0 {
+        parts.push("cmd");
+    }
+    parts.push(&key_name);
+
+    Ok(ParsedHotkey {
+        canonical: parts.join("+"),
+        key_code,
+        ch,
+        modifiers,
+    })
+}
+
+/// Action triggered by an iPad edge-swipe gesture.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum GestureAction {
+    /// Disabled; touches pass through directly as normal mouse input.
+    #[default]
+    None,
+    /// Soft-toggle streaming pause/resume while keeping the session and virtual display alive.
+    TogglePause,
+    /// Completely disconnect the current iPad session and release its virtual display.
+    Disconnect,
+    /// Toggle remote touch/keyboard input (`allow_input`, acting as a touch-lock switch).
+    ToggleInput,
+    /// Toggle global low-power mode.
+    ToggleLowPower,
+    /// Cycle through available presets (built-in and custom).
+    CyclePreset,
+    /// Apply a specific named preset.
+    ApplyPreset { preset: String },
+    /// Request an immediate IDR keyframe refresh.
+    RequestKeyframe,
+    /// Capture a PNG screenshot of the iPad screen into `<screenshot_dir>/idis-YYYY-MM-DD/`.
+    Screenshot,
+    /// Inject a custom keyboard shortcut (e.g. `ctrl+left`, `cmd+tab`, `ctrl+up`).
+    Hotkey { keys: String },
+    /// Inject a mouse right-click at the swipe start location.
+    RightClick,
+    /// Inject a vertical mouse wheel scroll (`delta` clamped to `-1000..=1000`, non-zero).
+    Scroll { delta: i32 },
+}
+
+impl GestureAction {
+    pub fn is_none(&self) -> bool {
+        matches!(self, Self::None)
+    }
+
+    /// Whether executing this action injects OS-level keyboard/mouse input (requires `allow_input`
+    /// and OS Accessibility permission). Session-control actions (`TogglePause`, `Disconnect`,
+    /// `ToggleInput`, `ToggleLowPower`, `CyclePreset`, `ApplyPreset`, `RequestKeyframe`) do not
+    /// inject OS input and can operate even when touch-locked (`allow_input == false`).
+    pub fn requires_host_input(&self) -> bool {
+        matches!(
+            self,
+            Self::Hotkey { .. } | Self::RightClick | Self::Scroll { .. }
+        )
+    }
+
+    pub fn validate_and_normalize(&mut self) -> Result<()> {
+        match self {
+            Self::ApplyPreset { preset } => {
+                *preset = ConfigPreset::sanitize_name(preset)?;
+            }
+            Self::Hotkey { keys } => {
+                let parsed = parse_hotkey_spec(keys)?;
+                *keys = parsed.canonical;
+            }
+            Self::Scroll { delta } => {
+                *delta = (*delta).clamp(-1000, 1000);
+                if *delta == 0 {
+                    *delta = -120;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    pub fn describe(&self) -> String {
+        match self {
+            Self::None => "无动作".to_string(),
+            Self::TogglePause => "暂停/恢复投屏".to_string(),
+            Self::Disconnect => "断开投屏".to_string(),
+            Self::ToggleInput => "开关远程触控".to_string(),
+            Self::ToggleLowPower => "开关省电模式".to_string(),
+            Self::CyclePreset => "循环切换预设".to_string(),
+            Self::ApplyPreset { preset } => format!("应用预设: {preset}"),
+            Self::RequestKeyframe => "刷新关键帧".to_string(),
+            Self::Screenshot => "截屏并保存".to_string(),
+            Self::Hotkey { keys } => format!("快捷键: {keys}"),
+            Self::RightClick => "模拟鼠标右键".to_string(),
+            Self::Scroll { delta } => {
+                if *delta > 0 {
+                    format!("向上滚动 ({delta})")
+                } else {
+                    format!("向下滚动 ({delta})")
+                }
+            }
+        }
+    }
+}
+
+/// Persistent iPad edge-swipe gesture mapping configuration saved in `~/.config/idis.yaml`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EdgeGesturesConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Edge trigger zone width as a percentage of display width (`3..=25`, default `8`).
+    #[serde(default = "default_gesture_edge_zone_pct")]
+    pub edge_zone_pct: u8,
+    /// Minimum inward horizontal swipe distance as a percentage of display width (`3..=30`, default `6`).
+    #[serde(default = "default_gesture_min_swipe_pct")]
+    pub min_swipe_pct: u8,
+    /// Base directory where screenshot gestures save `idis-YYYY-MM-DD/` folders (empty = `~/Pictures`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub screenshot_dir: String,
+    /// Left edge upper half -> swipe right.
+    #[serde(default = "default_left_top_action")]
+    pub left_top_swipe_right: GestureAction,
+    /// Left edge lower half -> swipe right.
+    #[serde(default = "default_left_bottom_action")]
+    pub left_bottom_swipe_right: GestureAction,
+    /// Right edge upper half -> swipe left.
+    #[serde(default = "default_right_top_action")]
+    pub right_top_swipe_left: GestureAction,
+    /// Right edge lower half -> swipe left.
+    #[serde(default = "default_right_bottom_action")]
+    pub right_bottom_swipe_left: GestureAction,
+}
+
+impl Default for EdgeGesturesConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            edge_zone_pct: default_gesture_edge_zone_pct(),
+            min_swipe_pct: default_gesture_min_swipe_pct(),
+            screenshot_dir: String::new(),
+            left_top_swipe_right: default_left_top_action(),
+            left_bottom_swipe_right: default_left_bottom_action(),
+            right_top_swipe_left: default_right_top_action(),
+            right_bottom_swipe_left: default_right_bottom_action(),
+        }
+    }
+}
+
+impl EdgeGesturesConfig {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    pub fn action_for(&self, slot: EdgeGestureSlot) -> &GestureAction {
+        match slot {
+            EdgeGestureSlot::LeftTopSwipeRight => &self.left_top_swipe_right,
+            EdgeGestureSlot::LeftBottomSwipeRight => &self.left_bottom_swipe_right,
+            EdgeGestureSlot::RightTopSwipeLeft => &self.right_top_swipe_left,
+            EdgeGestureSlot::RightBottomSwipeLeft => &self.right_bottom_swipe_left,
+        }
+    }
+
+    pub fn has_any_active_action(&self) -> bool {
+        self.enabled
+            && EdgeGestureSlot::ALL
+                .iter()
+                .any(|&slot| !self.action_for(slot).is_none())
+    }
+
+    pub fn has_any_session_control_action(&self) -> bool {
+        self.enabled
+            && EdgeGestureSlot::ALL.iter().any(|&slot| {
+                let a = self.action_for(slot);
+                !a.is_none() && !a.requires_host_input()
+            })
+    }
+
+    pub fn validate_and_normalize(&mut self) -> Result<()> {
+        self.edge_zone_pct = self.edge_zone_pct.clamp(3, 25);
+        self.min_swipe_pct = self.min_swipe_pct.clamp(3, 30);
+        self.screenshot_dir = self
+            .screenshot_dir
+            .chars()
+            .filter(|c| !c.is_control())
+            .collect::<String>()
+            .trim()
+            .chars()
+            .take(512)
+            .collect();
+        self.left_top_swipe_right
+            .validate_and_normalize()
+            .context("gestures.left_top_swipe_right 配置无效")?;
+        self.left_bottom_swipe_right
+            .validate_and_normalize()
+            .context("gestures.left_bottom_swipe_right 配置无效")?;
+        self.right_top_swipe_left
+            .validate_and_normalize()
+            .context("gestures.right_top_swipe_left 配置无效")?;
+        self.right_bottom_swipe_left
+            .validate_and_normalize()
+            .context("gestures.right_bottom_swipe_left 配置无效")?;
+        Ok(())
+    }
+}
+
+/// Resolve the default base directory for saved screenshots (`~/Pictures`, or home/current dir fallback).
+pub fn default_screenshot_base_dir() -> PathBuf {
+    if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
+        let home_path = PathBuf::from(home);
+        if !home_path.as_os_str().is_empty() {
+            return home_path.join("Pictures");
+        }
+    }
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+/// Resolve a user-configured screenshot base directory (empty -> default, leading `~` expanded).
+pub fn resolve_screenshot_base_dir(configured: &str) -> PathBuf {
+    let trimmed = configured.trim();
+    if trimmed.is_empty() {
+        return default_screenshot_base_dir();
+    }
+    if trimmed == "~" {
+        if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
+            if !home.is_empty() {
+                return PathBuf::from(home);
+            }
+        }
+    } else if let Some(rest) = trimmed
+        .strip_prefix("~/")
+        .or_else(|| trimmed.strip_prefix("~\\"))
+    {
+        if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
+            if !home.is_empty() {
+                return PathBuf::from(home).join(rest);
+            }
+        }
+    }
+    PathBuf::from(trimmed)
+}
 
 /// Target screen selector for an automatic window routing rule persisted in `~/.config/idis.yaml`.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -498,6 +937,8 @@ pub struct UserConfigFile {
     pub presets: Vec<ConfigPreset>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub window_rules: Vec<WindowRule>,
+    #[serde(default, skip_serializing_if = "EdgeGesturesConfig::is_default")]
+    pub gestures: EdgeGesturesConfig,
     #[serde(default)]
     pub trusted_devices: Vec<TrustedDevice>,
 }
@@ -526,6 +967,7 @@ impl Default for UserConfigFile {
             active_preset: None,
             presets: Vec::new(),
             window_rules: Vec::new(),
+            gestures: EdgeGesturesConfig::default(),
             trusted_devices: Vec::new(),
         }
     }
@@ -698,6 +1140,7 @@ impl UserConfigFile {
             normalized_rules.push(rule);
         }
         self.window_rules = normalized_rules;
+        self.gestures.validate_and_normalize()?;
 
         let raw_devices = std::mem::take(&mut self.trusted_devices);
         let mut normalized: Vec<TrustedDevice> =
@@ -983,5 +1426,79 @@ trusted_devices:
             migrated.trusted_devices[0].fingerprint,
             "fp:a1b2c3d4e5f60718293a4b5c"
         );
+    }
+
+    #[test]
+    fn edge_gestures_yaml_and_hotkey_validation_roundtrip() {
+        let hk = parse_hotkey_spec("  Cmd + Shift + ArrowLeft ").unwrap();
+        assert_eq!(hk.canonical, "shift+cmd+left");
+        assert_eq!(hk.key_code, Some(0x7B));
+        assert_eq!(hk.modifiers, KEY_MOD_SHIFT | KEY_MOD_META);
+
+        assert!(parse_hotkey_spec("").is_err());
+        assert!(parse_hotkey_spec("cmd+ctrl").is_err());
+        assert!(parse_hotkey_spec("cmd+unknownkey").is_err());
+        assert!(parse_hotkey_spec("cmd+a+b").is_err());
+
+        // Default config omits `gestures:` to stay clean and backward-compatible.
+        let default_yaml = UserConfigFile::default().to_yaml_string().unwrap();
+        assert!(!default_yaml.contains("gestures:"));
+
+        // Custom 4-slot config roundtrips and clamps percentages.
+        let yaml = "\
+gestures:
+  enabled: true
+  edge_zone_pct: 99
+  min_swipe_pct: 1
+  screenshot_dir: ~/Pictures/MyShots
+  left_top_swipe_right:
+    kind: hotkey
+    keys: Command+Tab
+  left_bottom_swipe_right:
+    kind: screenshot
+  right_top_swipe_left:
+    kind: toggle_pause
+  right_bottom_swipe_left:
+    kind: disconnect
+";
+        let parsed = UserConfigFile::from_yaml_str(yaml).unwrap();
+        assert!(parsed.gestures.enabled);
+        assert_eq!(parsed.gestures.edge_zone_pct, 25);
+        assert_eq!(parsed.gestures.min_swipe_pct, 3);
+        assert_eq!(parsed.gestures.screenshot_dir, "~/Pictures/MyShots");
+        assert_eq!(
+            parsed.gestures.left_top_swipe_right,
+            GestureAction::Hotkey {
+                keys: "cmd+tab".to_string()
+            }
+        );
+        assert_eq!(
+            parsed.gestures.left_bottom_swipe_right,
+            GestureAction::Screenshot
+        );
+        assert!(resolve_screenshot_base_dir("/tmp/custom-shots").ends_with("custom-shots"));
+        assert!(resolve_screenshot_base_dir("~/Pictures/MyShots").ends_with("Pictures/MyShots"));
+        assert_eq!(
+            parsed.gestures.right_top_swipe_left,
+            GestureAction::TogglePause
+        );
+        assert_eq!(
+            parsed.gestures.right_bottom_swipe_left,
+            GestureAction::Disconnect
+        );
+
+        let re_yaml = parsed.to_yaml_string().unwrap();
+        assert!(re_yaml.contains("gestures:"));
+        let re_parsed = UserConfigFile::from_yaml_str(&re_yaml).unwrap();
+        assert_eq!(re_parsed.gestures, parsed.gestures);
+
+        let bad_hotkey_yaml = "\
+gestures:
+  enabled: true
+  left_top_swipe_right:
+    kind: hotkey
+    keys: ctrl+notakey
+";
+        assert!(UserConfigFile::from_yaml_str(bad_hotkey_yaml).is_err());
     }
 }

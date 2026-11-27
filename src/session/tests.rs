@@ -574,6 +574,231 @@ use std::time::Duration;
     }
 
     #[test]
+    fn edge_gestures_trigger_custom_actions_pause_toggle_input_and_disconnect() {
+        use crate::protocol::keyed_archive::{archive, ArchivedValue};
+        use crate::protocol::messages::{InputEvent, KEY_MOD_CTRL};
+        use crate::user_config::{EdgeGestureSlot, EdgeGesturesConfig, GestureAction};
+        use clap::Parser;
+        use std::collections::BTreeMap;
+
+        let mut cfg =
+            AppConfig::try_parse_from(["idis", "--auto-accept", "--allow-input", "--config", "none"])
+                .unwrap();
+        cfg.allow_input = true;
+        let backend = Arc::new(crate::platform::mock::MockBackend::new());
+        let reg = SessionRegistry::new(cfg, backend.clone());
+
+        struct DummyWriter;
+        impl crate::transport::FrameWriter for DummyWriter {
+            fn send_frame(&self, _payload: &[u8]) -> anyhow::Result<()> {
+                Ok(())
+            }
+            fn close(&self) {}
+        }
+
+        let encode_touch = |phase: i64, x: f64, y: f64| -> Vec<u8> {
+            let mut touch_fields = BTreeMap::new();
+            touch_fields.insert("_phase".to_string(), ArchivedValue::Int(phase));
+            touch_fields.insert("_tapCount".to_string(), ArchivedValue::Int(1));
+            touch_fields.insert("_location.x".to_string(), ArchivedValue::Real(x));
+            touch_fields.insert("_location.y".to_string(), ArchivedValue::Real(y));
+            let touch = ArchivedValue::Object {
+                class_name: "MSMTouch".to_string(),
+                classes: vec!["MSMTouch".to_string(), "NSObject".to_string()],
+                fields: touch_fields,
+            };
+            let mut ev_fields = BTreeMap::new();
+            ev_fields.insert("_subtype".to_string(), ArchivedValue::Int(0));
+            ev_fields.insert("_allTouches".to_string(), ArchivedValue::Set(vec![touch]));
+            archive(&ArchivedValue::Object {
+                class_name: "MSMTouchEvent".to_string(),
+                classes: vec![
+                    "MSMTouchEvent".to_string(),
+                    "MSMEvent".to_string(),
+                    "NSObject".to_string(),
+                ],
+                fields: ev_fields,
+            })
+            .unwrap()
+        };
+
+        let key = "127.0.0.1";
+        let sid = reg
+            .register_telemetry(key.to_string(), Arc::new(DummyWriter), 56846, false)
+            .unwrap();
+        let mut hdict = BTreeMap::new();
+        hdict.insert(
+            "uniqueIdentifier".to_string(),
+            ArchivedValue::String("ipad-gesture-1".to_string()),
+        );
+        hdict.insert("name".to_string(), ArchivedValue::String("iPad".to_string()));
+        hdict.insert("width".to_string(), ArchivedValue::Int(1024));
+        hdict.insert("height".to_string(), ArchivedValue::Int(768));
+        let hs = crate::protocol::messages::MessagePacket::new_send(
+            "Handshake",
+            ArchivedValue::Dict(hdict),
+        );
+        reg.handle_telemetry_bytes_for_session(key, Some(sid), &hs.encode().unwrap())
+            .unwrap();
+        let (_sid, dgen) = reg
+            .attach_data_channel_checked(key, Some(sid), Arc::new(DummyWriter))
+            .unwrap();
+
+        let (sw, sh) = {
+            let map = reg.sessions.lock().unwrap();
+            let sz = *map
+                .get(key)
+                .unwrap()
+                .capture
+                .as_ref()
+                .unwrap()
+                .actual_size
+                .lock()
+                .unwrap();
+            sz
+        };
+        assert!(sw >= 320 && sh >= 240);
+
+        reg.set_gestures_config(EdgeGesturesConfig {
+            enabled: true,
+            edge_zone_pct: 10,
+            min_swipe_pct: 8,
+            screenshot_dir: String::new(),
+            left_top_swipe_right: GestureAction::Hotkey {
+                keys: "ctrl+left".to_string(),
+            },
+            left_bottom_swipe_right: GestureAction::RightClick,
+            right_top_swipe_left: GestureAction::TogglePause,
+            right_bottom_swipe_left: GestureAction::ToggleInput,
+        })
+        .unwrap();
+
+        let send_swipe = |sx: f64, sy: f64, ex: f64, ey: f64| {
+            reg.handle_data_bytes_for_session(key, Some(sid), Some(dgen), &encode_touch(0, sx, sy))
+                .unwrap();
+            reg.handle_data_bytes_for_session(key, Some(sid), Some(dgen), &encode_touch(1, ex, ey))
+                .unwrap();
+            reg.handle_data_bytes_for_session(key, Some(sid), Some(dgen), &encode_touch(3, ex, ey))
+                .unwrap();
+        };
+
+        // 1) Left-top swipe right -> injects ctrl+left hotkey without leaking MouseDown/MouseUp.
+        send_swipe(12.0, sh as f64 * 0.2, sw as f64 * 0.25, sh as f64 * 0.21);
+        {
+            let rec = backend.recorded_inputs.lock().unwrap();
+            assert_eq!(
+                *rec,
+                vec![InputEvent::KeyModified {
+                    key_code: Some(0x7B),
+                    ch: None,
+                    modifiers: KEY_MOD_CTRL,
+                }]
+            );
+        }
+        assert_eq!(
+            reg.last_gesture().unwrap().slot,
+            EdgeGestureSlot::LeftTopSwipeRight
+        );
+        backend.recorded_inputs.lock().unwrap().clear();
+
+        // 2) Edge tap near left-top replays normal MouseDown + MouseUp (never breaks edge buttons).
+        reg.handle_data_bytes_for_session(key, Some(sid), Some(dgen), &encode_touch(0, 14.0, 30.0))
+            .unwrap();
+        reg.handle_data_bytes_for_session(key, Some(sid), Some(dgen), &encode_touch(3, 16.0, 31.0))
+            .unwrap();
+        {
+            let rec = backend.recorded_inputs.lock().unwrap();
+            assert_eq!(rec.len(), 2);
+            assert!(matches!(rec[0], InputEvent::MouseDown { .. }));
+            assert!(matches!(rec[1], InputEvent::MouseUp { .. }));
+        }
+        backend.recorded_inputs.lock().unwrap().clear();
+
+        // 3) Right-top swipe left -> toggles stream_paused ON then OFF while preserving session.
+        send_swipe(
+            sw as f64 - 12.0,
+            sh as f64 * 0.2,
+            sw as f64 * 0.75,
+            sh as f64 * 0.21,
+        );
+        assert!(reg.list_sessions()[0].stream_paused);
+        send_swipe(
+            sw as f64 - 12.0,
+            sh as f64 * 0.2,
+            sw as f64 * 0.75,
+            sh as f64 * 0.21,
+        );
+        assert!(!reg.list_sessions()[0].stream_paused);
+
+        // 4) Right-bottom swipe left -> toggles allow_input OFF; hotkey gesture is blocked while
+        //    view-only, yet right-bottom swipe left still re-enables allow_input!
+        send_swipe(
+            sw as f64 - 12.0,
+            sh as f64 * 0.8,
+            sw as f64 * 0.75,
+            sh as f64 * 0.81,
+        );
+        assert!(!reg.is_input_allowed());
+        send_swipe(12.0, sh as f64 * 0.2, sw as f64 * 0.25, sh as f64 * 0.21);
+        assert!(backend.recorded_inputs.lock().unwrap().is_empty());
+        assert!(reg.last_gesture().unwrap().blocked_reason.is_some());
+        send_swipe(
+            sw as f64 - 12.0,
+            sh as f64 * 0.8,
+            sw as f64 * 0.75,
+            sh as f64 * 0.81,
+        );
+        assert!(reg.is_input_allowed());
+
+        // 4.5) Rebind left-bottom swipe right to Screenshot into a custom temp directory ->
+        //      creates `<dir>/idis-YYYY-MM-DD/*.png` with valid PNG header even when view-only.
+        let shot_tmp = std::env::temp_dir().join(format!(
+            "idis-shot-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut scfg = reg.gestures_config();
+        scfg.screenshot_dir = shot_tmp.to_string_lossy().into_owned();
+        scfg.left_bottom_swipe_right = GestureAction::Screenshot;
+        reg.set_gestures_config(scfg).unwrap();
+        reg.set_input_allowed(false);
+        send_swipe(12.0, sh as f64 * 0.8, sw as f64 * 0.25, sh as f64 * 0.81);
+        let lg = reg.last_gesture().unwrap();
+        assert_eq!(lg.slot, EdgeGestureSlot::LeftBottomSwipeRight);
+        assert!(lg.blocked_reason.is_none());
+        let saved_path = std::path::PathBuf::from(lg.detail.expect("screenshot saved path"));
+        assert!(saved_path.is_file());
+        let parent_name = saved_path
+            .parent()
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_string_lossy();
+        assert!(
+            parent_name.starts_with("idis-") && parent_name.len() == "idis-YYYY-MM-DD".len(),
+            "unexpected dated folder name: {parent_name}"
+        );
+        let png_bytes = std::fs::read(&saved_path).unwrap();
+        assert!(png_bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]));
+        let _ = std::fs::remove_dir_all(&shot_tmp);
+        reg.set_input_allowed(true);
+
+        // 5) Rebind right-top swipe left to Disconnect -> closes the session cleanly.
+        let mut gcfg = reg.gestures_config();
+        gcfg.right_top_swipe_left = GestureAction::Disconnect;
+        reg.set_gestures_config(gcfg).unwrap();
+        send_swipe(
+            sw as f64 - 12.0,
+            sh as f64 * 0.2,
+            sw as f64 * 0.75,
+            sh as f64 * 0.21,
+        );
+        assert!(reg.list_sessions().is_empty());
+    }
+
+    #[test]
     fn usb_input_handles_be_prefix_coalesced_blocks_and_telemetry_channel() {
         use clap::Parser;
         let mut cfg =

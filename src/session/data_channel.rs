@@ -1421,6 +1421,7 @@ impl SessionRegistry {
             let mut out = Vec::new();
             for sess in map.values_mut() {
                 sess.suppress_right_click_tail = false;
+                sess.edge_gesture.reset();
                 if let Some(pos) = sess.mouse_left_down.take() {
                     if let Some(ref cap) = sess.capture {
                         out.push((cap.handle.clone(), pos));
@@ -1445,6 +1446,7 @@ impl SessionRegistry {
             {
                 sess.data_detached_at = Some(Instant::now());
                 sess.suppress_right_click_tail = false;
+                sess.edge_gesture.reset();
                 (
                     sess.capture.take(),
                     sess.data_writer.take(),
@@ -1508,7 +1510,7 @@ impl SessionRegistry {
         expected_data_gen: Option<u64>,
         bytes: &[u8],
     ) -> Result<()> {
-        let handle_opt = {
+        let (handle_opt, actual_session_id, stream_size) = {
             let mut map = self.sessions.lock().unwrap();
             let Some(sess) = map.get_mut(key).filter(|s| {
                 expected_session_id.is_none_or(|eid| s.id == eid)
@@ -1517,7 +1519,12 @@ impl SessionRegistry {
                 return Ok(());
             };
             sess.last_activity = Instant::now();
-            sess.capture.as_ref().map(|c| c.handle.clone())
+            let sz = sess
+                .capture
+                .as_ref()
+                .and_then(|c| c.actual_size.lock().ok().map(|g| *g))
+                .unwrap_or((0, 0));
+            (sess.capture.as_ref().map(|c| c.handle.clone()), sess.id, sz)
         };
         if handle_opt.is_none() {
             return Ok(());
@@ -1531,7 +1538,9 @@ impl SessionRegistry {
                 .fetch_add(1, Ordering::Relaxed);
             return Ok(());
         }
-        if !self.is_input_allowed() {
+        let gestures_cfg = self.gestures_config();
+        let input_allowed = self.is_input_allowed();
+        if !input_allowed && !gestures_cfg.has_any_active_action() {
             let n = self
                 .input_counters
                 .dropped_view_only
@@ -1549,7 +1558,9 @@ impl SessionRegistry {
             return Ok(());
         }
         let caps = self.backend.capabilities();
-        if caps.accessibility_permission_required && !caps.accessibility_granted {
+        let has_accessibility =
+            !caps.accessibility_permission_required || caps.accessibility_granted;
+        if input_allowed && !has_accessibility && !gestures_cfg.has_any_session_control_action() {
             let n = self
                 .input_counters
                 .dropped_no_permission
@@ -1624,63 +1635,122 @@ impl SessionRegistry {
                     continue;
                 }
             };
-            let should_inject = {
+
+            let decision = {
                 let mut map = self.sessions.lock().unwrap();
-                if !self.is_input_allowed()
-                    || self.host_lock_paused_ipad.load(Ordering::Acquire)
+                if self.host_lock_paused_ipad.load(Ordering::Acquire)
                     || self.is_ipad_lock_disconnect_blocking()
                 {
-                    false
+                    super::gestures::GestureDecision::Swallow
                 } else if let Some(sess) = map.get_mut(key).filter(|s| {
                     expected_session_id.is_none_or(|eid| s.id == eid)
                         && expected_data_gen.is_none_or(|dg| s.data_generation == dg)
                 }) {
-                    match &event {
-                        crate::protocol::messages::InputEvent::MouseDown {
-                            x,
-                            y,
-                            right_click,
-                            ..
-                        } => {
-                            if *right_click {
-                                sess.suppress_right_click_tail = true;
-                                sess.mouse_left_down = None;
-                            } else {
-                                sess.suppress_right_click_tail = false;
-                                sess.mouse_left_down = Some((*x, *y));
-                            }
-                            true
-                        }
-                        crate::protocol::messages::InputEvent::MouseDragged { x, y } => {
-                            if sess.suppress_right_click_tail {
-                                false
-                            } else {
-                                if sess.mouse_left_down.is_some() {
+                    sess.edge_gesture
+                        .on_event(&event, stream_size, &gestures_cfg, Instant::now())
+                } else {
+                    super::gestures::GestureDecision::Swallow
+                }
+            };
+
+            let events_to_inject: Vec<crate::protocol::messages::InputEvent> = match decision {
+                super::gestures::GestureDecision::Swallow => continue,
+                super::gestures::GestureDecision::Trigger {
+                    slot,
+                    action,
+                    start_x,
+                    start_y,
+                } => {
+                    let disconnected = self.execute_edge_gesture(
+                        key,
+                        actual_session_id,
+                        &handle_opt,
+                        slot,
+                        action,
+                        start_x,
+                        start_y,
+                        has_accessibility,
+                    )?;
+                    if disconnected {
+                        break;
+                    }
+                    continue;
+                }
+                super::gestures::GestureDecision::Passthrough => vec![event],
+                super::gestures::GestureDecision::Replay(evts) => evts,
+            };
+
+            for ev in events_to_inject {
+                if !self.is_input_allowed() {
+                    self.input_counters
+                        .dropped_view_only
+                        .fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                if !has_accessibility {
+                    self.input_counters
+                        .dropped_no_permission
+                        .fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                let should_inject = {
+                    let mut map = self.sessions.lock().unwrap();
+                    if !self.is_input_allowed()
+                        || self.host_lock_paused_ipad.load(Ordering::Acquire)
+                        || self.is_ipad_lock_disconnect_blocking()
+                    {
+                        false
+                    } else if let Some(sess) = map.get_mut(key).filter(|s| {
+                        expected_session_id.is_none_or(|eid| s.id == eid)
+                            && expected_data_gen.is_none_or(|dg| s.data_generation == dg)
+                    }) {
+                        match &ev {
+                            crate::protocol::messages::InputEvent::MouseDown {
+                                x,
+                                y,
+                                right_click,
+                                ..
+                            } => {
+                                if *right_click {
+                                    sess.suppress_right_click_tail = true;
+                                    sess.mouse_left_down = None;
+                                } else {
+                                    sess.suppress_right_click_tail = false;
                                     sess.mouse_left_down = Some((*x, *y));
                                 }
                                 true
                             }
-                        }
-                        crate::protocol::messages::InputEvent::MouseUp { .. } => {
-                            if sess.suppress_right_click_tail {
-                                sess.suppress_right_click_tail = false;
-                                false
-                            } else {
-                                sess.mouse_left_down = None;
-                                true
+                            crate::protocol::messages::InputEvent::MouseDragged { x, y } => {
+                                if sess.suppress_right_click_tail {
+                                    false
+                                } else {
+                                    if sess.mouse_left_down.is_some() {
+                                        sess.mouse_left_down = Some((*x, *y));
+                                    }
+                                    true
+                                }
                             }
+                            crate::protocol::messages::InputEvent::MouseUp { .. } => {
+                                if sess.suppress_right_click_tail {
+                                    sess.suppress_right_click_tail = false;
+                                    false
+                                } else {
+                                    sess.mouse_left_down = None;
+                                    true
+                                }
+                            }
+                            _ => true,
                         }
-                        _ => true,
+                    } else {
+                        false
                     }
-                } else {
-                    false
-                }
-            };
-            if should_inject {
-                if let Some(ref hdl) = handle_opt {
-                    if let Ok(g) = hdl.lock() {
-                        g.inject_input(&event)?;
-                        self.input_counters.injected.fetch_add(1, Ordering::Relaxed);
+                };
+                if should_inject {
+                    if let Some(ref hdl) = handle_opt {
+                        if let Ok(g) = hdl.lock() {
+                            g.inject_input(&ev)?;
+                            self.input_counters.injected.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 }
             }
@@ -1689,6 +1759,233 @@ impl SessionRegistry {
             return Err(e);
         }
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_edge_gesture(
+        &self,
+        key: &str,
+        session_id: u64,
+        handle_opt: &Option<super::flow_control::SharedCaptureHandle>,
+        slot: crate::user_config::EdgeGestureSlot,
+        action: crate::user_config::GestureAction,
+        start_x: f64,
+        start_y: f64,
+        has_accessibility: bool,
+    ) -> Result<bool> {
+        use crate::user_config::{parse_hotkey_spec, GestureAction};
+
+        if action.is_none() {
+            return Ok(false);
+        }
+        if action.requires_host_input() {
+            if !self.is_input_allowed() {
+                self.input_counters
+                    .dropped_view_only
+                    .fetch_add(1, Ordering::Relaxed);
+                *self.last_gesture.lock().unwrap() = Some(super::gestures::LastGestureSnapshot::now(
+                    slot,
+                    &action,
+                    key,
+                    None,
+                    Some("已关闭远程触控".to_string()),
+                ));
+                return Ok(false);
+            }
+            if !has_accessibility {
+                self.input_counters
+                    .dropped_no_permission
+                    .fetch_add(1, Ordering::Relaxed);
+                *self.last_gesture.lock().unwrap() = Some(super::gestures::LastGestureSnapshot::now(
+                    slot,
+                    &action,
+                    key,
+                    None,
+                    Some("缺少系统辅助功能权限".to_string()),
+                ));
+                return Ok(false);
+            }
+        }
+
+        self.input_counters
+            .gestures_triggered
+            .fetch_add(1, Ordering::Relaxed);
+        info!(
+            "[{key}] Edge gesture triggered: {} -> {}",
+            slot.as_str(),
+            action.describe()
+        );
+        crate::debug_trace::record(
+            "gesture",
+            "triggered",
+            serde_json::json!({
+                "key": key,
+                "slot": slot.as_str(),
+                "action": action.describe(),
+            }),
+        );
+
+        let mut detail: Option<String> = None;
+        let mut blocked_reason: Option<String> = None;
+        let mut disconnected = false;
+        match &action {
+            GestureAction::None => {}
+            GestureAction::TogglePause => {
+                let toggled = {
+                    let map = self.sessions.lock().unwrap();
+                    if let Some(sess) = map.get(key).filter(|s| s.id == session_id) {
+                        let next = !sess.stream_paused.load(Ordering::Acquire);
+                        sess.stream_paused.store(next, Ordering::Release);
+                        if !next {
+                            sess.flow.reset_in_flight();
+                        }
+                        Some(next)
+                    } else {
+                        None
+                    }
+                };
+                if let Some(paused) = toggled {
+                    info!("[{key}] Gesture TogglePause -> stream_paused={paused}");
+                    self.sync_capture_pause_states();
+                }
+            }
+            GestureAction::Disconnect => {
+                info!("[{key}] Gesture Disconnect -> closing iPad session");
+                self.close_session_if_id(key, session_id);
+                disconnected = true;
+            }
+            GestureAction::ToggleInput => {
+                let next = !self.is_input_allowed();
+                self.set_input_allowed(next);
+            }
+            GestureAction::ToggleLowPower => {
+                let next = !self.is_low_power();
+                self.set_low_power(next);
+            }
+            GestureAction::CyclePreset => {
+                let (active, presets) = self.list_presets();
+                if let Some(next_name) = if presets.is_empty() {
+                    None
+                } else {
+                    let next_idx = active
+                        .as_deref()
+                        .and_then(|cur| presets.iter().position(|p| p.name == cur))
+                        .map(|i| (i + 1) % presets.len())
+                        .unwrap_or(0);
+                    Some(presets[next_idx].name.clone())
+                } {
+                    if let Err(e) = self.apply_preset(&next_name) {
+                        warn!("[{key}] Gesture CyclePreset({next_name}) failed: {e:#}");
+                        blocked_reason = Some(format!("切换预设失败: {e}"));
+                    }
+                }
+            }
+            GestureAction::ApplyPreset { preset } => {
+                if let Err(e) = self.apply_preset(preset) {
+                    warn!("[{key}] Gesture ApplyPreset({preset}) failed: {e:#}");
+                    blocked_reason = Some(format!("应用预设失败: {e}"));
+                }
+            }
+            GestureAction::RequestKeyframe => {
+                if let Some(ref hdl) = handle_opt {
+                    if let Ok(g) = hdl.lock() {
+                        g.request_keyframe();
+                    }
+                }
+            }
+            GestureAction::Screenshot => {
+                let base_dir = crate::user_config::resolve_screenshot_base_dir(
+                    &self.gestures_config().screenshot_dir,
+                );
+                let parts = super::gestures::local_date_time_now();
+                let mut seq = 0u64;
+                let (dated_dir, mut dest_path) =
+                    super::gestures::build_screenshot_target_path(&base_dir, parts, seq);
+                while dest_path.exists() && seq < 1000 {
+                    seq += 1;
+                    dest_path =
+                        super::gestures::build_screenshot_target_path(&base_dir, parts, seq).1;
+                }
+                match std::fs::create_dir_all(&dated_dir) {
+                    Ok(()) => {
+                        if let Some(ref hdl) = handle_opt {
+                            match hdl.lock() {
+                                Ok(g) => match g.save_screenshot_png(&dest_path) {
+                                    Ok(()) => {
+                                        let saved = dest_path.to_string_lossy().into_owned();
+                                        info!("[{key}] Gesture Screenshot saved to {saved}");
+                                        detail = Some(saved);
+                                    }
+                                    Err(e) => {
+                                        warn!("[{key}] Gesture Screenshot failed: {e:#}");
+                                        blocked_reason = Some(format!("截屏保存失败: {e}"));
+                                    }
+                                },
+                                Err(_) => {
+                                    blocked_reason = Some("采集句柄不可用".to_string());
+                                }
+                            }
+                        } else {
+                            blocked_reason = Some("当前无活跃画面采集".to_string());
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            "[{key}] Gesture Screenshot failed to create directory {}: {e:#}",
+                            dated_dir.display()
+                        );
+                        blocked_reason = Some(format!("创建目录失败: {e}"));
+                    }
+                }
+            }
+            GestureAction::Hotkey { keys } => match parse_hotkey_spec(keys) {
+                Ok(parsed) => {
+                    if let Some(ref hdl) = handle_opt {
+                        if let Ok(g) = hdl.lock() {
+                            g.inject_input(&parsed.to_input_event())?;
+                            self.input_counters.injected.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("[{key}] Gesture Hotkey({keys}) invalid: {e:#}");
+                    blocked_reason = Some(format!("快捷键无效: {e}"));
+                }
+            },
+            GestureAction::RightClick => {
+                if let Some(ref hdl) = handle_opt {
+                    if let Ok(g) = hdl.lock() {
+                        g.inject_input(&crate::protocol::messages::InputEvent::MouseDown {
+                            x: start_x,
+                            y: start_y,
+                            right_click: true,
+                            tap_count: 1,
+                        })?;
+                        self.input_counters.injected.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+            GestureAction::Scroll { delta } => {
+                if let Some(ref hdl) = handle_opt {
+                    if let Ok(g) = hdl.lock() {
+                        g.inject_input(&crate::protocol::messages::InputEvent::Scroll {
+                            dx: 0.0,
+                            dy: *delta as f64,
+                        })?;
+                        self.input_counters.injected.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+
+        *self.last_gesture.lock().unwrap() = Some(super::gestures::LastGestureSnapshot::now(
+            slot,
+            &action,
+            key,
+            detail,
+            blocked_reason,
+        ));
+        Ok(disconnected)
     }
 }
 

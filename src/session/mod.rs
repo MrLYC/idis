@@ -1,6 +1,7 @@
 mod config_store;
 mod data_channel;
 mod flow_control;
+mod gestures;
 mod handshake;
 mod lock_policy;
 mod web_screen;
@@ -9,6 +10,7 @@ mod window_routing;
 mod tests;
 
 pub use flow_control::{FlowControl, WebStreamSubscription};
+pub use gestures::LastGestureSnapshot;
 pub use window_routing::{
     ApplyRulesReport, ScreenTargetInfo, StandaloneVirtualDisplayInfo,
     MAX_STANDALONE_VIRTUAL_DISPLAYS,
@@ -23,11 +25,12 @@ use crate::protocol::messages::ClientHandshake;
 use crate::transport::SharedFrameWriter;
 use crate::trust::{default_trusted_devices_path, TrustStore};
 use crate::user_config::{
-    default_config_path, load_yaml_file, ConfigPreset, PollingConfigSection, UserConfigFile,
-    WindowRule,
+    default_config_path, load_yaml_file, ConfigPreset, EdgeGesturesConfig, PollingConfigSection,
+    UserConfigFile, WindowRule,
 };
 use config_store::{has_cli_flag, load_persisted_settings, PersistedSettings};
 use flow_control::{ActiveCapture, LowPowerSnapshot, WebAbrAccum, WebSubscriberEntry};
+use gestures::EdgeGestureTracker;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use window_routing::StandaloneVirtualDisplayEntry;
@@ -47,6 +50,7 @@ pub(super) struct InputCounters {
     pub(super) dropped_locked: AtomicU64,
     pub(super) dropped_no_permission: AtomicU64,
     pub(super) decode_errors: AtomicU64,
+    pub(super) gestures_triggered: AtomicU64,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -57,6 +61,7 @@ pub struct InputStatsSnapshot {
     pub dropped_locked: u64,
     pub dropped_no_permission: u64,
     pub decode_errors: u64,
+    pub gestures_triggered: u64,
 }
 
 /// Decision returned when prompting the user about an untrusted incoming client.
@@ -100,6 +105,7 @@ pub struct SessionSnapshot {
     pub authorized: bool,
     pub awaiting_confirm: bool,
     pub streaming: bool,
+    pub stream_paused: bool,
     pub width: u32,
     pub height: u32,
     pub native_width: u32,
@@ -169,6 +175,7 @@ struct ClientSession {
     mouse_left_down: Option<(f64, f64)>,
     /// Suppresses trailing micro-drags and `MouseUp` after a right-click tap across all OSes.
     suppress_right_click_tail: bool,
+    edge_gesture: EdgeGestureTracker,
     capture: Option<ActiveCapture>,
 }
 
@@ -302,6 +309,8 @@ pub struct SessionRegistry {
     active_preset: Mutex<Option<String>>,
     presets: Mutex<Vec<ConfigPreset>>,
     window_rules: Mutex<Vec<WindowRule>>,
+    gestures: Mutex<EdgeGesturesConfig>,
+    last_gesture: Mutex<Option<LastGestureSnapshot>>,
     next_window_rule_id: AtomicU64,
     next_virtual_display_id: AtomicU64,
     virtual_display_shutdown_epoch: AtomicU64,
@@ -830,6 +839,10 @@ impl SessionRegistry {
             .as_ref()
             .map(|y| y.window_rules.clone())
             .unwrap_or_default();
+        let init_gestures = loaded_yaml
+            .as_ref()
+            .map(|y| y.gestures.clone())
+            .unwrap_or_default();
         let reg = Self {
             config,
             backend,
@@ -859,6 +872,8 @@ impl SessionRegistry {
             active_preset: Mutex::new(init_active_preset),
             presets: Mutex::new(init_presets),
             window_rules: Mutex::new(init_window_rules),
+            gestures: Mutex::new(init_gestures),
+            last_gesture: Mutex::new(None),
             next_window_rule_id: AtomicU64::new(1),
             next_virtual_display_id: AtomicU64::new(1),
             virtual_display_shutdown_epoch: AtomicU64::new(1),
@@ -925,7 +940,15 @@ impl SessionRegistry {
                 .dropped_no_permission
                 .load(Ordering::Relaxed),
             decode_errors: self.input_counters.decode_errors.load(Ordering::Relaxed),
+            gestures_triggered: self
+                .input_counters
+                .gestures_triggered
+                .load(Ordering::Relaxed),
         }
+    }
+
+    pub fn last_gesture(&self) -> Option<LastGestureSnapshot> {
+        self.last_gesture.lock().unwrap().clone()
     }
 
     pub fn is_config_corrupt(&self) -> bool {

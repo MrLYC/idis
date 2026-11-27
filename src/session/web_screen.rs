@@ -397,6 +397,7 @@ impl SessionRegistry {
                     authorized: s.authorized,
                     awaiting_confirm: s.awaiting_confirm,
                     streaming: s.capture.is_some(),
+                    stream_paused: s.stream_paused.load(Ordering::Acquire),
                     width: w,
                     height: h,
                     native_width: phys_w,

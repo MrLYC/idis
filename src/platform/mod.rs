@@ -503,6 +503,10 @@ pub trait CaptureHandle: Send {
     fn cursor_image_png(&self) -> Option<Vec<u8>> {
         None
     }
+    /// Capture a lossless PNG screenshot of this display and write it to `dest`.
+    fn save_screenshot_png(&self, _dest: &std::path::Path) -> Result<()> {
+        anyhow::bail!("当前平台暂不支持截屏保存")
+    }
     /// Hash-deduplicated cursor PNG fetch: returns `Some(png)` only when the cursor image or
     /// hotspot changed compared to `*last_hash` (updating `*last_hash` on change). Backends with
     /// expensive PNG encoding (e.g. macOS) override this to hash raw pixels BEFORE PNG compression.

@@ -354,7 +354,7 @@ impl SessionRegistry {
             .map(|d| (d.fingerprint, d.prefs))
             .collect();
         let supports_hidpi = self.backend.supports_hidpi();
-        let mut entries: Vec<(SessionSnapshot, Option<u32>)> = {
+        let mut entries: Vec<_> = {
             let map = self.sessions.lock().unwrap();
             map.iter()
                 .map(|(key, s)| {
@@ -380,10 +380,16 @@ impl SessionRegistry {
                         .and_then(|c| c.actual_size.lock().ok().map(|g| *g))
                         .filter(|&(aw, ah)| aw > 0 && ah > 0)
                         .unwrap_or((lw, lh));
-                    let display_id = s
+                    let (display_id, handle_bounds) = s
                         .capture
                         .as_ref()
-                        .and_then(|c| c.handle.try_lock().ok().and_then(|h| h.display_id()));
+                        .and_then(|c| {
+                            c.handle
+                                .try_lock()
+                                .ok()
+                                .map(|h| (h.display_id(), h.display_bounds()))
+                        })
+                        .unwrap_or((None, None));
                     let backing_exact =
                         lw > 0 && lh > 0 && w == lw * eff_hidpi && h == lh * eff_hidpi;
                     let panel_exact = if phys_w > 0 && phys_h > 0 && w > 0 && h > 0 {
@@ -430,6 +436,7 @@ impl SessionRegistry {
                                 .and_then(|c| c.abr_status.lock().ok().map(|g| *g)),
                         },
                         display_id,
+                        handle_bounds,
                     )
                 })
                 .collect()
@@ -437,32 +444,33 @@ impl SessionRegistry {
         // Reconcile reported logical dimensions against live OS display bounds outside the
         // `sessions` lock so macOS WindowServer mode fallbacks (e.g. 1600x1200) are accurately
         // reflected in both `logical_width/height` and `is_pixel_exact`.
-        for (snap, did_opt) in &mut entries {
-            if let Some(did) = *did_opt {
-                if let Some((_, _, bw, bh)) = self.backend.display_bounds(did) {
-                    if bw >= 320 && bh >= 240 {
-                        snap.logical_width = bw;
-                        snap.logical_height = bh;
-                        let backing_exact = snap.width == bw * snap.hidpi
-                            && snap.height == bh * snap.hidpi;
-                        let panel_exact = if snap.native_width > 0
-                            && snap.native_height > 0
-                            && snap.width > 0
-                            && snap.height > 0
-                        {
-                            (snap.native_width % snap.width == 0
-                                || snap.width % snap.native_width == 0)
-                                && (snap.native_height % snap.height == 0
-                                    || snap.height % snap.native_height == 0)
-                        } else {
-                            true
-                        };
-                        snap.is_pixel_exact = backing_exact && panel_exact;
-                    }
+        for (snap, did_opt, handle_bounds) in &mut entries {
+            let bounds_opt = did_opt
+                .and_then(|did| self.backend.display_bounds(did))
+                .or(*handle_bounds);
+            if let Some((_, _, bw, bh)) = bounds_opt {
+                if bw >= 320 && bh >= 240 {
+                    snap.logical_width = bw;
+                    snap.logical_height = bh;
+                    let backing_exact = snap.width == bw * snap.hidpi
+                        && snap.height == bh * snap.hidpi;
+                    let panel_exact = if snap.native_width > 0
+                        && snap.native_height > 0
+                        && snap.width > 0
+                        && snap.height > 0
+                    {
+                        (snap.native_width % snap.width == 0
+                            || snap.width % snap.native_width == 0)
+                            && (snap.native_height % snap.height == 0
+                                || snap.height % snap.native_height == 0)
+                    } else {
+                        true
+                    };
+                    snap.is_pixel_exact = backing_exact && panel_exact;
                 }
             }
         }
-        let mut out: Vec<SessionSnapshot> = entries.into_iter().map(|(s, _)| s).collect();
+        let mut out: Vec<SessionSnapshot> = entries.into_iter().map(|(s, _, _)| s).collect();
         out.sort_by_key(|s| s.id);
         out
     }

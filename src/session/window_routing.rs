@@ -305,11 +305,19 @@ impl SessionRegistry {
                 .collect()
         };
         for (name, fp, hdl) in ipad_caps {
-            let did = hdl.lock().ok().and_then(|g| g.display_id()).unwrap_or(0);
+            let (did, handle_bounds) = hdl
+                .lock()
+                .ok()
+                .map(|g| (g.display_id().unwrap_or(0), g.display_bounds()))
+                .unwrap_or((0, None));
             if did == 0 || !seen_display_ids.insert(did) {
                 continue;
             }
-            let (x, y, w, h) = self.backend.display_bounds(did).unwrap_or((0, 0, 0, 0));
+            let (x, y, w, h) = self
+                .backend
+                .display_bounds(did)
+                .or(handle_bounds)
+                .unwrap_or((0, 0, 0, 0));
             out.push(ScreenTargetInfo {
                 id: format!("ipad:{}", fp.as_deref().unwrap_or(&name)),
                 kind: "ipad".to_string(),
@@ -330,9 +338,17 @@ impl SessionRegistry {
             .ok()
             .and_then(|g| g.as_ref().map(|c| c.handle.clone()));
         if let Some(hdl) = web_hdl {
-            let did = hdl.lock().ok().and_then(|g| g.display_id()).unwrap_or(0);
+            let (did, handle_bounds) = hdl
+                .lock()
+                .ok()
+                .map(|g| (g.display_id().unwrap_or(0), g.display_bounds()))
+                .unwrap_or((0, None));
             if did != 0 && seen_display_ids.insert(did) {
-                let (x, y, w, h) = self.backend.display_bounds(did).unwrap_or((0, 0, 0, 0));
+                let (x, y, w, h) = self
+                    .backend
+                    .display_bounds(did)
+                    .or(handle_bounds)
+                    .unwrap_or((0, 0, 0, 0));
                 out.push(ScreenTargetInfo {
                     id: "web:independent".to_string(),
                     kind: "web".to_string(),

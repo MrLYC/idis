@@ -718,6 +718,40 @@ static void clamp_encoded_dimensions(uint32_t *w, uint32_t *h, uint32_t maxEdge)
     *h = eh <= cap ? eh : cap;
 }
 
+// Cap SCStreamConfiguration width/height to the actual display's rendered pixel capacity and match
+// its aspect ratio so ScreenCaptureKit never allocates an oversized CVPixelBuffer with solid black
+// padding on the right and bottom.
+static void fit_capture_to_sc_frame(
+    uint32_t *cfgW,
+    uint32_t *cfgH,
+    CGRect scFrame,
+    uint32_t hiDPI,
+    uint32_t maxEdge
+) {
+    if (!cfgW || !cfgH) return;
+    uint32_t logW = (uint32_t)llround(scFrame.size.width);
+    uint32_t logH = (uint32_t)llround(scFrame.size.height);
+    if (logW < 320 || logH < 240) return;
+    uint32_t scale = hiDPI >= 2 ? 2 : 1;
+    uint32_t maxSrcW = (logW * scale) & ~1u;
+    uint32_t maxSrcH = (logH * scale) & ~1u;
+    if (maxSrcW < 320 || maxSrcH < 240) return;
+
+    uint32_t boundW = MIN(*cfgW, maxSrcW);
+    uint32_t boundH = MIN(*cfgH, maxSrcH);
+    double rx = (double)boundW / (double)maxSrcW;
+    double ry = (double)boundH / (double)maxSrcH;
+    double r = MIN(rx, ry);
+    if (r > 1.0) r = 1.0;
+    uint32_t fitW = ((uint32_t)llround((double)maxSrcW * r)) & ~1u;
+    uint32_t fitH = ((uint32_t)llround((double)maxSrcH * r)) & ~1u;
+    if (fitW < 320) fitW = 320;
+    if (fitH < 240) fitH = 240;
+    clamp_encoded_dimensions(&fitW, &fitH, maxEdge);
+    *cfgW = fitW;
+    *cfgH = fitH;
+}
+
 @interface IDCaptureController : NSObject <SCStreamOutput, SCStreamDelegate> {
 @public
     _Atomic BOOL _stopped;
@@ -1450,10 +1484,14 @@ static inline CMTime id_sc_min_frame_interval(uint32_t fps) {
                         os_unfair_lock_unlock(&self->_boundsLock);
                     }
 
+                    uint32_t cfgW = w;
+                    uint32_t cfgH = h;
+                    fit_capture_to_sc_frame(&cfgW, &cfgH, scFrame, self.hiDPI, self.maxPixelEdge);
+
                     SCContentFilter *filter = [[SCContentFilter alloc] initWithDisplay:found excludingWindows:@[]];
                     SCStreamConfiguration *cfg = [SCStreamConfiguration new];
-                    cfg.width = w;
-                    cfg.height = h;
+                    cfg.width = cfgW;
+                    cfg.height = cfgH;
                     cfg.scalesToFit = YES;
                     // On macOS 14+, request full Retina backing capture resolution (SCCaptureResolutionBest = 1).
                     if ([cfg respondsToSelector:NSSelectorFromString(@"setCaptureResolution:")]) {
@@ -1930,12 +1968,20 @@ static void id_unlock_keepalive_timer_cb(CFRunLoopTimerRef timer, void *info) {
     uint32_t pbW = (uint32_t)CVPixelBufferGetWidth(pb) & ~1u;
     uint32_t pbH = (uint32_t)CVPixelBufferGetHeight(pb) & ~1u;
     double scScaleFactor = 0.0;
+    double scContentScale = 0.0;
+    CGRect scContentRect = CGRectZero;
     if (@available(macOS 12.3, *)) {
         CFArrayRef attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, false);
         if (attachments && CFArrayGetCount(attachments) > 0) {
             NSDictionary *att = (__bridge NSDictionary *)CFArrayGetValueAtIndex(attachments, 0);
             NSNumber *sf = att[SCStreamFrameInfoScaleFactor];
             if (sf) scScaleFactor = sf.doubleValue;
+            NSNumber *cs = att[SCStreamFrameInfoContentScale];
+            if (cs) scContentScale = cs.doubleValue;
+            CFDictionaryRef crDict = (__bridge CFDictionaryRef)att[SCStreamFrameInfoContentRect];
+            if (crDict) {
+                CGRectMakeWithDictionaryRepresentation(crDict, &scContentRect);
+            }
         }
     }
     BOOL firstPb = !atomic_exchange_explicit(&_loggedFirstPb, YES, memory_order_acq_rel);
@@ -1948,7 +1994,7 @@ static void id_unlock_keepalive_timer_cb(CFRunLoopTimerRef timer, void *info) {
         [self queryDisplayLogicalWidth:&logW logicalHeight:&logH pixelWidth:&pixW pixelHeight:&pixH];
         id_diag_log(
             "sc_frame_geometry",
-            @"displayID=%u pb=%ux%u fmt=0x%08x enc=%ux%u modeLog=%ux%u modePix=%ux%u bounds=%.0fx%.0f scFrame=(%.0f,%.0f %.0fx%.0f) scaleFactor=%.2f hiDPI=%u",
+            @"displayID=%u pb=%ux%u fmt=0x%08x enc=%ux%u modeLog=%ux%u modePix=%ux%u bounds=%.0fx%.0f scFrame=(%.0f,%.0f %.0fx%.0f) contentRect=(%.0f,%.0f %.0fx%.0f) scaleFactor=%.2f contentScale=%.2f hiDPI=%u",
             self.displayID,
             pbW,
             pbH,
@@ -1965,16 +2011,49 @@ static void id_unlock_keepalive_timer_cb(CFRunLoopTimerRef timer, void *info) {
             scFrame.origin.y,
             scFrame.size.width,
             scFrame.size.height,
+            scContentRect.origin.x,
+            scContentRect.origin.y,
+            scContentRect.size.width,
+            scContentRect.size.height,
             scScaleFactor,
+            scContentScale,
             self.hiDPI
         );
+        // Detect ScreenCaptureKit right/bottom black padding: when the CVPixelBuffer is larger
+        // than the display's actual rendered backing pixels (`scFrame * scScaleFactor`),
+        // restart the stream at the exact non-black content size.
+        uint32_t effLogW = bounds.size.width >= 320.0
+            ? (uint32_t)llround(bounds.size.width)
+            : (uint32_t)llround(scFrame.size.width);
+        uint32_t effLogH = bounds.size.height >= 240.0
+            ? (uint32_t)llround(bounds.size.height)
+            : (uint32_t)llround(scFrame.size.height);
+        if (firstPb && effLogW >= 320 && effLogH >= 240 && scScaleFactor >= 0.5) {
+            uint32_t realPixW = ((uint32_t)llround((double)effLogW * scScaleFactor)) & ~1u;
+            uint32_t realPixH = ((uint32_t)llround((double)effLogH * scScaleFactor)) & ~1u;
+            if (realPixW >= 320 && realPixH >= 240 && (pbW > realPixW + 8 || pbH > realPixH + 8)) {
+                uint32_t healW = realPixW;
+                uint32_t healH = realPixH;
+                clamp_encoded_dimensions(&healW, &healH, self.maxPixelEdge);
+                if (healW != pbW || healH != pbH) {
+                    uint64_t nowNs = id_monotonic_ns();
+                    uint64_t prevHeal = atomic_load_explicit(&_lastScaleHealNs, memory_order_relaxed);
+                    if (nowNs - prevHeal > 3000000000ULL
+                        && atomic_compare_exchange_strong_explicit(&_lastScaleHealNs, &prevHeal, nowNs, memory_order_acq_rel, memory_order_relaxed)) {
+                        id_diag_log("sc_padding_heal", @"displayID=%u pb=%ux%u realPix=%ux%u -> heal=%ux%u", self.displayID, pbW, pbH, realPixW, realPixH, healW, healH);
+                        [self scheduleCaptureRestartAfterMs:80 targetW:healW targetH:healH attempt:0];
+                        return;
+                    }
+                }
+            }
+        }
         // Self-heal if macOS WindowServer defaulted the virtual display onto a non-integer or 1x mode
         // (e.g. 800x1066 instead of 768x1024@2x in portrait) after SCStream started.
         if (firstPb && self.virtualDisplay && self.hiDPI >= 2) {
             uint32_t reqW = self.requestedLogicalW;
             uint32_t reqH = self.requestedLogicalH;
-            uint32_t bw = (uint32_t)llround(bounds.size.width);
-            uint32_t bh = (uint32_t)llround(bounds.size.height);
+            uint32_t bw = effLogW;
+            uint32_t bh = effLogH;
             BOOL scaleTooLow = (scScaleFactor > 0.0 && scScaleFactor < 1.5);
             BOOL boundsMismatch = (bw >= 320 && bh >= 240 && reqW >= 320 && reqH >= 240 && (bw != reqW || bh != reqH));
             if (scaleTooLow || boundsMismatch) {
@@ -2271,9 +2350,16 @@ static void id_unlock_keepalive_timer_cb(CFRunLoopTimerRef timer, void *info) {
                     ok = NO;
                     return;
                 }
+                os_unfair_lock_lock(&self->_boundsLock);
+                CGRect cachedScFrame = self->_scDisplayFrame;
+                os_unfair_lock_unlock(&self->_boundsLock);
+                uint32_t cfgW = newPixW;
+                uint32_t cfgH = newPixH;
+                fit_capture_to_sc_frame(&cfgW, &cfgH, cachedScFrame, self.hiDPI, effMaxEdge);
+
                 SCStreamConfiguration *cfg = [SCStreamConfiguration new];
-                cfg.width = newPixW;
-                cfg.height = newPixH;
+                cfg.width = cfgW;
+                cfg.height = cfgH;
                 cfg.scalesToFit = YES;
                 if ([cfg respondsToSelector:NSSelectorFromString(@"setCaptureResolution:")]) {
                     [cfg setValue:@(1) forKey:@"captureResolution"];
@@ -2953,6 +3039,26 @@ static CGRect id_resolve_display_bounds(
     }
     if (outUsedFallback) *outUsedFallback = NO;
     return CGRectZero;
+}
+
+int32_t id_macos_capture_display_bounds(
+    void *handle,
+    int32_t *out_x,
+    int32_t *out_y,
+    uint32_t *out_w,
+    uint32_t *out_h
+) {
+    if (!handle) return 0;
+    IDCaptureController *ctrl = (__bridge IDCaptureController *)handle;
+    uint32_t did = atomic_load_explicit(&ctrl->_atomicDisplayID, memory_order_acquire);
+    CGDirectDisplayID target = (did != 0) ? (CGDirectDisplayID)did : CGMainDisplayID();
+    CGRect b = id_resolve_display_bounds(ctrl, target, NULL);
+    if (b.size.width < 1.0 || b.size.height < 1.0) return 0;
+    if (out_x) *out_x = (int32_t)llround(b.origin.x);
+    if (out_y) *out_y = (int32_t)llround(b.origin.y);
+    if (out_w) *out_w = (uint32_t)llround(b.size.width);
+    if (out_h) *out_h = (uint32_t)llround(b.size.height);
+    return 1;
 }
 
 static void id_warp_cursor_to_display(

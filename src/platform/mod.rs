@@ -454,6 +454,12 @@ pub trait CaptureHandle: Send {
         None
     }
 
+    /// Current logical desktop bounds `(x, y, width, height)` of the captured display, if known
+    /// (allows macOS to fall back to `SCDisplay.frame` when `CGDisplayBounds` is stale).
+    fn display_bounds(&self) -> Option<(i32, i32, u32, u32)> {
+        None
+    }
+
     /// Request an immediate IDR keyframe from the encoder (used on drop recovery, new viewer join,
     /// or resume from pause in IPPP temporal compression mode).
     fn request_keyframe(&self) {}

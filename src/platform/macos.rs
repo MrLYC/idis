@@ -163,6 +163,13 @@ extern "C" {
         pixel_h: u32,
     ) -> i32;
     fn id_macos_capture_display_id(handle: *mut c_void) -> u32;
+    fn id_macos_capture_display_bounds(
+        handle: *mut c_void,
+        out_x: *mut i32,
+        out_y: *mut i32,
+        out_w: *mut u32,
+        out_h: *mut u32,
+    ) -> i32;
     fn id_macos_main_display_id() -> u32;
     fn id_macos_display_bounds(
         display_id: u32,
@@ -345,6 +352,15 @@ impl CaptureHandle for MacCaptureHandle {
         } else {
             None
         }
+    }
+
+    fn display_bounds(&self) -> Option<(i32, i32, u32, u32)> {
+        if self.ptr.is_null() {
+            return None;
+        }
+        let (mut x, mut y, mut w, mut h) = (0i32, 0i32, 0u32, 0u32);
+        let ok = unsafe { id_macos_capture_display_bounds(self.ptr, &mut x, &mut y, &mut w, &mut h) };
+        (ok != 0 && w > 0 && h > 0).then_some((x, y, w, h))
     }
 
     fn resize(&mut self, width: u32, height: u32) -> Result<()> {

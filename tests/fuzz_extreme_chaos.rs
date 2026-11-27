@@ -290,14 +290,19 @@ fn read_ws_frame(s: &mut TcpStream) -> std::io::Result<(u8, Vec<u8>)> {
 }
 
 fn connect_ws_viewer(addr: SocketAddr, cookie: Option<&str>) -> TcpStream {
-    let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).unwrap();
+    let connect_addr = if addr.ip().is_unspecified() {
+        loopback_of(addr)
+    } else {
+        addr
+    };
+    let mut s = TcpStream::connect_timeout(&connect_addr, Duration::from_secs(2)).unwrap();
     let _ = s.set_read_timeout(Some(Duration::from_secs(3)));
     let _ = s.set_write_timeout(Some(Duration::from_secs(2)));
     let c_hdr = cookie
         .map(|c| format!("Cookie: {c}\r\n"))
         .unwrap_or_default();
     let req = format!(
-        "GET /ws/stream HTTP/1.1\r\nHost: {addr}\r\nOrigin: http://{addr}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n{c_hdr}\r\n"
+        "GET /ws/stream HTTP/1.1\r\nHost: {connect_addr}\r\nOrigin: http://{connect_addr}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n{c_hdr}\r\n"
     );
     s.write_all(req.as_bytes()).unwrap();
     let mut resp = Vec::new();
@@ -624,10 +629,11 @@ fn chaos_trailing_byte_rst_and_fin_ghost_approval_and_trust_killer() {
     assert!(!v_cookie.is_empty());
 
     // Phase A: Web `/api/view/request-approval` with 1 trailing unread byte `X` + FIN, then + SO_LINGER(0) RST!
+    let viewer_connect = loopback_of(viewer_addr);
     for use_rst in [false, true] {
-        let mut s = TcpStream::connect(viewer_addr).unwrap();
+        let mut s = TcpStream::connect(viewer_connect).unwrap();
         let req = format!(
-            "POST /api/view/request-approval HTTP/1.1\r\nHost: {viewer_addr}\r\nOrigin: http://{viewer_addr}\r\nUser-Agent: TrailingByteBot/{use_rst}\r\nCookie: {v_cookie}\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}X"
+            "POST /api/view/request-approval HTTP/1.1\r\nHost: {viewer_connect}\r\nOrigin: http://{viewer_connect}\r\nUser-Agent: TrailingByteBot/{use_rst}\r\nCookie: {v_cookie}\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}X"
         );
         s.write_all(req.as_bytes()).unwrap();
         // Wait until slot actually appears in pending_approvals
@@ -791,7 +797,11 @@ fn chaos_wifi_and_web_brutal_rst_storm_slot_and_display_recovery() {
             force_tcp_rst(d);
         }
         // 3) Web Admin / Viewer HTTP + WS mid-upgrade RST
-        let target = if rng.next_bool() { admin_addr } else { viewer_addr };
+        let target = if rng.next_bool() {
+            admin_addr
+        } else {
+            loopback_of(viewer_addr)
+        };
         if let Ok(mut w) = TcpStream::connect_timeout(&target, Duration::from_secs(1)) {
             match rng.next_usize(4) {
                 0 => {}
@@ -2252,10 +2262,11 @@ fn chaos_stop_race_with_concurrent_wifi_connect_and_pending_approval() {
     );
     assert_eq!(code, 200);
     let v_cookie = extract_set_cookie(&hdrs);
-    let mut pending_sock = TcpStream::connect(viewer_addr).unwrap();
+    let viewer_connect = loopback_of(viewer_addr);
+    let mut pending_sock = TcpStream::connect(viewer_connect).unwrap();
     let _ = pending_sock.set_read_timeout(Some(Duration::from_secs(2)));
     let req = format!(
-        "POST /api/view/request-approval HTTP/1.1\r\nHost: {viewer_addr}\r\nOrigin: http://{viewer_addr}\r\nCookie: {v_cookie}\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+        "POST /api/view/request-approval HTTP/1.1\r\nHost: {viewer_connect}\r\nOrigin: http://{viewer_connect}\r\nCookie: {v_cookie}\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
     );
     pending_sock.write_all(req.as_bytes()).unwrap();
     wait_until(
@@ -3159,12 +3170,17 @@ fn try_http_req(
     extra_headers: &str,
     body: Option<&str>,
 ) -> Option<(u16, String, String)> {
-    let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).ok()?;
+    let connect_addr = if addr.ip().is_unspecified() {
+        loopback_of(addr)
+    } else {
+        addr
+    };
+    let mut s = TcpStream::connect_timeout(&connect_addr, Duration::from_secs(2)).ok()?;
     let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
     let _ = s.set_write_timeout(Some(Duration::from_secs(2)));
     let b = body.unwrap_or("");
     let req = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nOrigin: http://{addr}\r\n{extra_headers}Content-Length: {}\r\nConnection: close\r\n\r\n{b}",
+        "{method} {path} HTTP/1.1\r\nHost: {connect_addr}\r\nOrigin: http://{connect_addr}\r\n{extra_headers}Content-Length: {}\r\nConnection: close\r\n\r\n{b}",
         b.len()
     );
     s.write_all(req.as_bytes()).ok()?;
@@ -3185,14 +3201,19 @@ fn try_http_req(
 }
 
 fn try_connect_ws_viewer(addr: SocketAddr, cookie: Option<&str>) -> Option<TcpStream> {
-    let mut s = TcpStream::connect_timeout(&addr, Duration::from_millis(400)).ok()?;
+    let connect_addr = if addr.ip().is_unspecified() {
+        loopback_of(addr)
+    } else {
+        addr
+    };
+    let mut s = TcpStream::connect_timeout(&connect_addr, Duration::from_millis(400)).ok()?;
     let _ = s.set_read_timeout(Some(Duration::from_millis(400)));
     let _ = s.set_write_timeout(Some(Duration::from_millis(400)));
     let c_hdr = cookie
         .map(|c| format!("Cookie: {c}\r\n"))
         .unwrap_or_default();
     let req = format!(
-        "GET /ws/stream HTTP/1.1\r\nHost: {addr}\r\nOrigin: http://{addr}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n{c_hdr}\r\n"
+        "GET /ws/stream HTTP/1.1\r\nHost: {connect_addr}\r\nOrigin: http://{connect_addr}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n{c_hdr}\r\n"
     );
     s.write_all(req.as_bytes()).ok()?;
     let mut resp = Vec::new();

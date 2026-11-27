@@ -69,7 +69,7 @@ fn set_cloexec(fd: i32) {
     }
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 fn close_fd(fd: i32) {
     extern "C" {
         fn close(fd: i32) -> i32;
@@ -96,7 +96,7 @@ fn take_launchd_sockets() -> ActivatedSockets {
     const ENOENT: i32 = 2;
     const ESRCH: i32 = 3;
 
-    let mut activate_one = |name: &str| -> Option<TcpListener> {
+    let activate_one = |name: &str| -> Option<TcpListener> {
         let c_name = CString::new(name).ok()?;
         let mut fds: *mut i32 = std::ptr::null_mut();
         let mut cnt: usize = 0;

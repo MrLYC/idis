@@ -268,6 +268,12 @@ impl MacOsBackend {
     }
 }
 
+impl Default for MacOsBackend {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 struct MacBonjourHandle {
     ptr: *mut c_void,
 }

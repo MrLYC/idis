@@ -47,13 +47,22 @@ pub fn write_all_vectored_with_deadline<W: Write>(
                 start.elapsed().as_millis()
             );
         }
+        // Cap each `write_vectored` syscall to 64 KiB so macOS/BSD `sosend_generic()` cannot stay
+        // trapped inside a single multi-MiB `writev()` resetting `SO_SNDTIMEO` on slow 1 KiB reads.
+        const MAX_TCP_WRITE_CHUNK: usize = 64 * 1024;
         let mut ios: [IoSlice<'_>; 8] = [IoSlice::new(&[]); 8];
         let mut n_ios = 0usize;
+        let mut chunk_budget = MAX_TCP_WRITE_CHUNK;
         for (k, p) in parts[idx..].iter().enumerate().take(8) {
             let slice = if k == 0 { &p[off..] } else { p };
             if !slice.is_empty() {
-                ios[n_ios] = IoSlice::new(slice);
+                let take = slice.len().min(chunk_budget);
+                ios[n_ios] = IoSlice::new(&slice[..take]);
                 n_ios += 1;
+                chunk_budget -= take;
+                if chunk_budget == 0 {
+                    break;
+                }
             }
         }
         if n_ios == 0 {
@@ -114,13 +123,22 @@ pub fn write_tcp_vectored_with_deadline(
             ));
         }
         let _ = stream.set_write_timeout(Some(rem));
+        // Cap each `write_vectored` syscall to 64 KiB so macOS/BSD `sosend_generic()` cannot stay
+        // trapped inside a single multi-MiB `writev()` resetting `SO_SNDTIMEO` on slow 1 KiB reads.
+        const MAX_TCP_WRITE_CHUNK: usize = 64 * 1024;
         let mut ios: [IoSlice<'_>; 8] = [IoSlice::new(&[]); 8];
         let mut n_ios = 0usize;
+        let mut chunk_budget = MAX_TCP_WRITE_CHUNK;
         for (k, p) in parts[idx..].iter().enumerate().take(8) {
             let slice = if k == 0 { &p[off..] } else { p };
             if !slice.is_empty() {
-                ios[n_ios] = IoSlice::new(slice);
+                let take = slice.len().min(chunk_budget);
+                ios[n_ios] = IoSlice::new(&slice[..take]);
                 n_ios += 1;
+                chunk_budget -= take;
+                if chunk_budget == 0 {
+                    break;
+                }
             }
         }
         if n_ios == 0 {

@@ -192,12 +192,26 @@ fn http_req(
     extra_headers: &str,
     body: Option<&str>,
 ) -> (u16, String, String) {
-    let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).unwrap();
+    // Windows Winsock rejects `connect(0.0.0.0:port)` with WSAEADDRNOTAVAIL (10049); normalize
+    // unspecified wildcard listener addresses to loopback before connecting.
+    let connect_addr = if addr.ip().is_unspecified() {
+        SocketAddr::new(
+            if addr.is_ipv6() {
+                std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+            } else {
+                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+            },
+            addr.port(),
+        )
+    } else {
+        addr
+    };
+    let mut s = TcpStream::connect_timeout(&connect_addr, Duration::from_secs(2)).unwrap();
     let _ = s.set_read_timeout(Some(Duration::from_secs(3)));
     let _ = s.set_write_timeout(Some(Duration::from_secs(2)));
     let b = body.unwrap_or("");
     let req = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nOrigin: http://{addr}\r\n{extra_headers}Content-Length: {}\r\nConnection: close\r\n\r\n{b}",
+        "{method} {path} HTTP/1.1\r\nHost: {connect_addr}\r\nOrigin: http://{connect_addr}\r\n{extra_headers}Content-Length: {}\r\nConnection: close\r\n\r\n{b}",
         b.len()
     );
     s.write_all(req.as_bytes()).unwrap();
@@ -1383,8 +1397,16 @@ fn chaos_ffmpeg_subprocess_sigkill_mid_nal_and_stderr_flood() {
         assert!(first.is_keyframe, "first AU must be self-contained IDR");
         let t0 = Instant::now();
         proc.stop();
+        // On Windows, the `.cmd` batch test shim spawns the worker as a grandchild of `cmd.exe`
+        // (no POSIX `exec`), so killing `cmd.exe` waits up to the worker's 4s self-exit before
+        // stdout closes; real `ffmpeg.exe` has no batch wrapper and exits immediately.
+        let stop_budget = if cfg!(windows) {
+            Duration::from_secs(6)
+        } else {
+            Duration::from_secs(1)
+        };
         assert!(
-            t0.elapsed() < Duration::from_secs(1),
+            t0.elapsed() < stop_budget,
             "FfmpegProcess::stop() took too long: {:?}",
             t0.elapsed()
         );

@@ -22,6 +22,7 @@ use tracing::{debug, info, warn};
 /// and immediately interrupt a thread blocked in `write_all` on a dead/sleeping iPad socket.
 pub struct TcpCanalWriter {
     write_lock: Mutex<()>,
+    closed: AtomicBool,
     stream: TcpStream,
 }
 
@@ -29,18 +30,118 @@ impl TcpCanalWriter {
     pub fn new(stream: TcpStream) -> Self {
         Self {
             write_lock: Mutex::new(()),
+            closed: AtomicBool::new(false),
             stream,
         }
+    }
+
+    #[cfg(windows)]
+    fn write_canal_parts_windows(&self, parts: &[&[u8]]) -> Result<()> {
+        use std::io::{IoSlice, Write};
+
+        if self.closed.load(Ordering::Acquire) {
+            anyhow::bail!("TCP canal writer closed");
+        }
+        let total: usize = parts.iter().map(|p| p.len()).sum();
+        if total > crate::protocol::framing::MAX_FRAME_SIZE {
+            anyhow::bail!("MSMCanalSocket block too large: {total} bytes");
+        }
+        let len_bytes = (total as u32).to_le_bytes();
+        let mut all_parts: Vec<&[u8]> = Vec::with_capacity(1 + parts.len());
+        all_parts.push(&len_bytes);
+        all_parts.extend_from_slice(parts);
+
+        let orig_timeout = self.stream.write_timeout().ok().flatten();
+        let total_budget = orig_timeout.unwrap_or(Duration::from_secs(5));
+        let deadline = Instant::now() + total_budget;
+        let mut idx = 0usize;
+        let mut off = 0usize;
+        let mut s = &self.stream;
+        let result: Result<()> = loop {
+            while idx < all_parts.len() && off >= all_parts[idx].len() {
+                idx += 1;
+                off = 0;
+            }
+            if idx >= all_parts.len() {
+                break Ok(());
+            }
+            if self.closed.load(Ordering::Acquire) {
+                break Err(anyhow::anyhow!("TCP canal writer closed"));
+            }
+            let rem = deadline.saturating_duration_since(Instant::now());
+            if rem.is_zero() {
+                break Err(anyhow::anyhow!("TCP canal write timed out"));
+            }
+            // Winsock `shutdown()` does not interrupt a synchronous blocking `send()`, so slice
+            // `SO_SNDTIMEO` to <=120ms to observe lock-free `close()` promptly without hanging.
+            let slice_timeout = rem.min(Duration::from_millis(120));
+            let _ = self.stream.set_write_timeout(Some(slice_timeout));
+
+            const MAX_CHUNK: usize = 64 * 1024;
+            let mut ios: [IoSlice<'_>; 8] = [IoSlice::new(&[]); 8];
+            let mut n_ios = 0usize;
+            let mut budget = MAX_CHUNK;
+            for (k, p) in all_parts[idx..].iter().enumerate().take(8) {
+                let slice = if k == 0 { &p[off..] } else { p };
+                if !slice.is_empty() {
+                    let take = slice.len().min(budget);
+                    ios[n_ios] = IoSlice::new(&slice[..take]);
+                    n_ios += 1;
+                    budget -= take;
+                    if budget == 0 {
+                        break;
+                    }
+                }
+            }
+            if n_ios == 0 {
+                break Ok(());
+            }
+            match s.write_vectored(&ios[..n_ios]) {
+                Ok(0) => break Err(anyhow::anyhow!("TCP canal write returned 0 bytes")),
+                Ok(mut n) => {
+                    while n > 0 && idx < all_parts.len() {
+                        let avail = all_parts[idx].len() - off;
+                        if n < avail {
+                            off += n;
+                            n = 0;
+                        } else {
+                            n -= avail;
+                            idx += 1;
+                            off = 0;
+                        }
+                    }
+                }
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::Interrupted
+                        || e.kind() == std::io::ErrorKind::TimedOut
+                        || e.kind() == std::io::ErrorKind::WouldBlock =>
+                {
+                    continue;
+                }
+                Err(e) => break Err(e.into()),
+            }
+        };
+        let _ = self.stream.set_write_timeout(orig_timeout);
+        result
     }
 }
 
 impl FrameWriter for TcpCanalWriter {
     fn send_frame(&self, payload: &[u8]) -> Result<()> {
         let _guard = self.write_lock.lock().unwrap();
-        let mut s = &self.stream;
-        let res = write_canal_block(&mut s, payload);
+        if self.closed.load(Ordering::Acquire) {
+            anyhow::bail!("TCP canal writer closed");
+        }
+        #[cfg(windows)]
+        let res = self.write_canal_parts_windows(&[payload]);
+        #[cfg(not(windows))]
+        let res = {
+            let mut s = &self.stream;
+            write_canal_block(&mut s, payload)
+        };
         if res.is_err() {
             // Immediately close on any partial-write/timeout error to prevent permanent frame desync.
+            self.closed.store(true, Ordering::Release);
             let _ = self.stream.shutdown(Shutdown::Both);
         }
         res
@@ -48,15 +149,25 @@ impl FrameWriter for TcpCanalWriter {
 
     fn send_frame_parts(&self, parts: &[&[u8]]) -> Result<()> {
         let _guard = self.write_lock.lock().unwrap();
-        let mut s = &self.stream;
-        let res = write_canal_parts(&mut s, parts);
+        if self.closed.load(Ordering::Acquire) {
+            anyhow::bail!("TCP canal writer closed");
+        }
+        #[cfg(windows)]
+        let res = self.write_canal_parts_windows(parts);
+        #[cfg(not(windows))]
+        let res = {
+            let mut s = &self.stream;
+            write_canal_parts(&mut s, parts)
+        };
         if res.is_err() {
+            self.closed.store(true, Ordering::Release);
             let _ = self.stream.shutdown(Shutdown::Both);
         }
         res
     }
 
     fn close(&self) {
+        self.closed.store(true, Ordering::Release);
         let _ = self.stream.shutdown(Shutdown::Both);
     }
 

@@ -1,6 +1,6 @@
 # idis
 
-[简体中文](README.md) | [English](README.en.md)
+[简体中文](README.md) | [English](README.en.md) | [交互式设计方案展示页](https://mrlyc.github.io/idis/)
 
 跨平台**网页扩展屏**、**macOS 独立虚拟屏与窗口自动路由**主机端（支持 macOS / Linux / Windows）。  
 任意局域网设备打开浏览器即可作为低延迟扩展屏使用——**无需在观看端安装任何客户端**，同时附带对传统 USB / Wi-Fi 扩展屏客户端的可选兼容能力。

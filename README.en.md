@@ -1,6 +1,6 @@
 # idis
 
-[简体中文](README.md) | [English](README.en.md)
+[简体中文](README.md) | [English](README.en.md) | [Interactive Design Showcase](https://mrlyc.github.io/idis/)
 
 Cross-platform **Web Extended Screen**, **macOS Virtual Display**, and **Automatic Window Routing** host for macOS, Linux, and Windows.  
 Turn any browser on your local network (tablet, laptop, phone, secondary PC) into a low-latency extended display — **zero client installation required** — with optional compatibility for legacy USB/Wi-Fi display clients.

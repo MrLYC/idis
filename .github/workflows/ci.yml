@@ -48,4 +48,6 @@ jobs:
 
       - name: Run Web frontend & static integrity tests
         if: matrix.os == 'ubuntu-latest'
-        run: node tests/web_frontend_test.mjs
+        run: |
+          node tests/web_frontend_test.mjs
+          node tests/docs_pages_test.mjs

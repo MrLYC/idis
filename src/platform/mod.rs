@@ -474,6 +474,25 @@ pub trait CaptureHandle: Send {
     fn cursor_image_png(&self) -> Option<Vec<u8>> {
         None
     }
+    /// Hash-deduplicated cursor PNG fetch: returns `Some(png)` only when the cursor image or
+    /// hotspot changed compared to `*last_hash` (updating `*last_hash` on change). Backends with
+    /// expensive PNG encoding (e.g. macOS) override this to hash raw pixels BEFORE PNG compression.
+    fn cursor_image_png_if_changed(&self, last_hash: &mut u64) -> Option<Vec<u8>> {
+        let png = self.cursor_image_png()?;
+        let mut h: u64 = 0xcbf29ce484222325;
+        for &b in &png {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        if h == 0 {
+            h = 1;
+        }
+        if *last_hash == h {
+            return None;
+        }
+        *last_hash = h;
+        Some(png)
+    }
     fn stop(&mut self);
 }
 

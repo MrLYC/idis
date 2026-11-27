@@ -163,6 +163,11 @@ struct ClientSession {
     flow: Arc<FlowControl>,
     udp_cursor_enabled: Arc<AtomicBool>,
     stream_paused: Arc<AtomicBool>,
+    /// Tracks an in-progress left mouse drag `(x, y)` so abrupt disconnect / lock / view-only
+    /// always synthesizes a safety `MouseUp` and never leaves the host mouse button stuck down.
+    mouse_left_down: Option<(f64, f64)>,
+    /// Suppresses trailing micro-drags and `MouseUp` after a right-click tap across all OSes.
+    suppress_right_click_tail: bool,
     capture: Option<ActiveCapture>,
 }
 
@@ -298,6 +303,7 @@ pub struct SessionRegistry {
     window_rules: Mutex<Vec<WindowRule>>,
     next_window_rule_id: AtomicU64,
     next_virtual_display_id: AtomicU64,
+    virtual_display_shutdown_epoch: AtomicU64,
     standalone_virtual_displays: Mutex<Vec<StandaloneVirtualDisplayEntry>>,
     applied_window_moves: Mutex<HashSet<(u32, String)>>,
     ipad_video_settings_gen: Arc<AtomicU64>,
@@ -362,12 +368,17 @@ impl SessionRegistry {
         // + `settings.json` automatically on first run if the YAML file does not exist yet.
         let (loaded_yaml, migrated_or_new, config_corrupt, config_parse_error) =
             if let Some(ref cp) = config_path {
+                crate::user_config::sweep_stale_tmp_files(cp);
                 if cp.exists() {
-                    let had_legacy_mac_entries = std::fs::read_to_string(cp)
+                    let within_cap = std::fs::metadata(cp)
                         .ok()
-                        .is_some_and(|raw| {
-                            raw.lines()
-                                .any(|line| line.trim_start().starts_with("- mac:") || line.trim_start().starts_with("mac:"))
+                        .is_some_and(|m| m.len() <= crate::user_config::MAX_YAML_CONFIG_BYTES as u64);
+                    let had_legacy_mac_entries = within_cap
+                        && std::fs::read_to_string(cp).ok().is_some_and(|raw| {
+                            raw.lines().any(|line| {
+                                line.trim_start().starts_with("- mac:")
+                                    || line.trim_start().starts_with("mac:")
+                            })
                         });
                     match load_yaml_file(cp) {
                         Ok(y) => {
@@ -849,6 +860,7 @@ impl SessionRegistry {
             window_rules: Mutex::new(init_window_rules),
             next_window_rule_id: AtomicU64::new(1),
             next_virtual_display_id: AtomicU64::new(1),
+            virtual_display_shutdown_epoch: AtomicU64::new(1),
             standalone_virtual_displays: Mutex::new(Vec::new()),
             applied_window_moves: Mutex::new(HashSet::new()),
             ipad_video_settings_gen: Arc::new(AtomicU64::new(1)),

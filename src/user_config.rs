@@ -785,7 +785,50 @@ pub fn load_yaml_file(path: &Path) -> Result<UserConfigFile> {
     }
     let raw = fs::read_to_string(path)
         .with_context(|| format!("failed to read config file {}", path.display()))?;
+    if raw.trim().is_empty() {
+        return Err(anyhow!(
+            "config file {} is empty (0 bytes or whitespace only); refusing to overwrite with defaults",
+            path.display()
+        ));
+    }
     UserConfigFile::from_yaml_str(&raw)
+}
+
+/// Best-effort startup cleanup of stale `{file_name}.{pid}.{seq}.tmp` files left behind by a
+/// prior crashed/SIGKILLed process (never removes `.tmp` files owned by the current PID).
+pub fn sweep_stale_tmp_files(target_path: &Path) {
+    let Some(parent) = target_path.parent().filter(|p| !p.as_os_str().is_empty()) else {
+        return;
+    };
+    let Some(base) = target_path.file_name().and_then(|n| n.to_str()) else {
+        return;
+    };
+    let prefix = format!("{base}.");
+    let my_pid = std::process::id().to_string();
+    let Ok(entries) = fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        if let Some(rest) = name_str
+            .strip_prefix(&prefix)
+            .and_then(|r| r.strip_suffix(".tmp"))
+        {
+            if let Some((pid_part, seq_part)) = rest.split_once('.') {
+                if pid_part != my_pid
+                    && !pid_part.is_empty()
+                    && pid_part.bytes().all(|b| b.is_ascii_digit())
+                    && !seq_part.is_empty()
+                    && seq_part.bytes().all(|b| b.is_ascii_digit())
+                {
+                    let _ = fs::remove_file(entry.path());
+                }
+            }
+        }
+    }
 }
 
 static YAML_SAVE_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -798,35 +841,42 @@ pub fn save_yaml_file(path: &Path, cfg: &UserConfigFile) -> Result<()> {
         }
     }
     let content = cfg.to_yaml_string()?;
-    let seq = YAML_SAVE_SEQ.fetch_add(1, Ordering::Relaxed);
-    let tmp_name = format!(
-        "{}.{}.{}.tmp",
-        path.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("idis.yaml"),
-        std::process::id(),
-        seq
-    );
-    let tmp_path = path.with_file_name(tmp_name);
-    {
+    let base_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("idis.yaml");
+    let pid = std::process::id();
+    let (tmp_path, mut f) = loop {
+        let seq = YAML_SAVE_SEQ.fetch_add(1, Ordering::Relaxed);
+        let candidate = path.with_file_name(format!("{base_name}.{pid}.{seq}.tmp"));
         let mut opts = fs::OpenOptions::new();
-        opts.create(true).write(true).truncate(true);
+        opts.create_new(true).write(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
             opts.mode(0o600);
         }
-        let mut f = opts
-            .open(&tmp_path)
-            .with_context(|| format!("failed to open temp config {}", tmp_path.display()))?;
-        f.write_all(content.as_bytes())
-            .with_context(|| format!("failed to write temp config {}", tmp_path.display()))?;
-    }
+        match opts.open(&candidate) {
+            Ok(file) => break (candidate, file),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(e)
+                    .with_context(|| format!("failed to open temp config {}", candidate.display()));
+            }
+        }
+    };
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600));
+        let _ = f.set_permissions(fs::Permissions::from_mode(0o600));
     }
+    if let Err(e) = f.write_all(content.as_bytes()).and_then(|()| f.sync_all()) {
+        drop(f);
+        let _ = fs::remove_file(&tmp_path);
+        return Err(e)
+            .with_context(|| format!("failed to write/sync temp config {}", tmp_path.display()));
+    }
+    drop(f);
     if let Err(e) = fs::rename(&tmp_path, path) {
         let _ = fs::remove_file(&tmp_path);
         return Err(e).with_context(|| format!("failed to replace config {}", path.display()));

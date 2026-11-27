@@ -52,8 +52,10 @@ fn read_line_unbuffered<R: Read>(
         .map_err(|_| anyhow::anyhow!("non-UTF-8 HTTP header"))
 }
 
-pub(super) fn read_http_request(stream: &TcpStream) -> Result<Option<HttpRequest>> {
-    let deadline = Instant::now() + HTTP_REQUEST_DEADLINE;
+pub(super) fn read_http_request_with_deadline(
+    stream: &TcpStream,
+    deadline: Instant,
+) -> Result<Option<HttpRequest>> {
     let mut s = stream.try_clone()?;
     read_http_request_from(&mut s, deadline, |dl| {
         let rem = dl.saturating_duration_since(Instant::now());
@@ -63,6 +65,10 @@ pub(super) fn read_http_request(stream: &TcpStream) -> Result<Option<HttpRequest
         stream.set_read_timeout(Some(rem))?;
         Ok(())
     })
+}
+
+pub(super) fn read_http_request(stream: &TcpStream) -> Result<Option<HttpRequest>> {
+    read_http_request_with_deadline(stream, Instant::now() + HTTP_REQUEST_DEADLINE)
 }
 
 pub(super) fn read_http_request_from<R: Read>(
@@ -429,9 +435,11 @@ fn send_response_with_csp(
         hdr.push_str("\r\n");
     }
     hdr.push_str("\r\n");
-    stream.write_all(hdr.as_bytes())?;
-    stream.write_all(body)?;
-    stream.flush()?;
+    crate::protocol::framing::write_tcp_vectored_with_deadline(
+        stream,
+        &[hdr.as_bytes(), body],
+        Instant::now() + HTTP_REQUEST_DEADLINE,
+    )?;
     Ok(())
 }
 
@@ -452,36 +460,127 @@ pub(super) fn send_json<T: Serialize>(
 }
 
 
-/// Write a single unmasked server->client RFC 6455 WebSocket frame.
-pub(super) fn write_ws_frame<W: Write>(writer: &mut W, opcode: u8, payload: &[u8]) -> std::io::Result<()> {
-    let mut hdr = Vec::with_capacity(10);
-    hdr.push(0x80 | (opcode & 0x0F));
-    let len = payload.len();
+fn encode_ws_server_header(opcode: u8, len: usize) -> ([u8; 10], usize) {
+    let mut hdr = [0u8; 10];
+    hdr[0] = 0x80 | (opcode & 0x0F);
     if len < 126 {
-        hdr.push(len as u8);
+        hdr[1] = len as u8;
+        (hdr, 2)
     } else if len <= u16::MAX as usize {
-        hdr.push(126);
-        hdr.extend_from_slice(&(len as u16).to_be_bytes());
+        hdr[1] = 126;
+        hdr[2..4].copy_from_slice(&(len as u16).to_be_bytes());
+        (hdr, 4)
     } else {
-        hdr.push(127);
-        hdr.extend_from_slice(&(len as u64).to_be_bytes());
+        hdr[1] = 127;
+        hdr[2..10].copy_from_slice(&(len as u64).to_be_bytes());
+        (hdr, 10)
     }
-    writer.write_all(&hdr)?;
-    writer.write_all(payload)?;
-    writer.flush()
+}
+
+/// Write a single unmasked server->client RFC 6455 WebSocket frame with an explicit wall-clock deadline.
+pub(super) fn write_ws_frame_with_deadline<W: Write>(
+    writer: &mut W,
+    opcode: u8,
+    payload: &[u8],
+    deadline: Instant,
+) -> std::io::Result<()> {
+    let (hdr, hdr_len) = encode_ws_server_header(opcode, payload.len());
+    crate::protocol::framing::write_all_vectored_with_deadline(
+        writer,
+        &[&hdr[..hdr_len], payload],
+        deadline,
+    )
+    .map_err(|e| std::io::Error::new(std::io::ErrorKind::TimedOut, format!("{e:#}")))
+}
+
+/// Write a single unmasked server->client RFC 6455 WebSocket frame to a `TcpStream` under a strict
+/// wall-clock deadline (shrinking `SO_SNDTIMEO` per syscall and shutting down on error to avoid desync).
+pub(super) fn write_ws_frame_tcp_deadline(
+    stream: &mut TcpStream,
+    opcode: u8,
+    payload: &[u8],
+    deadline: Instant,
+) -> std::io::Result<()> {
+    let (hdr, hdr_len) = encode_ws_server_header(opcode, payload.len());
+    crate::protocol::framing::write_tcp_vectored_with_deadline(
+        stream,
+        &[&hdr[..hdr_len], payload],
+        deadline,
+    )
 }
 
 /// Read a single client->server RFC 6455 frame.
 /// Only returns `WouldBlock`/`TimedOut` when 0 bytes of the header have been consumed so a
 /// mid-frame timeout never leaves residual bytes and desynchronizes the WebSocket stream.
 pub(super) fn read_ws_control_frame<R: Read>(reader: &mut R) -> std::io::Result<Option<(u8, Vec<u8>)>> {
-    let mut hdr = [0u8; 2];
-    match reader.read(&mut hdr[0..1]) {
-        Ok(0) => return Ok(None),
-        Ok(_) => {}
-        Err(e) => return Err(e),
+    read_ws_control_frame_inner(reader, None, |_| Ok(()))
+}
+
+/// Socket-aware variant of [`read_ws_control_frame`] enforcing a hard per-frame wall-clock
+/// `frame_deadline` once byte 0 arrives (defeats 1-byte trickle Slowloris on WebSocket readers).
+pub(super) fn read_ws_control_frame_deadline(
+    stream: &mut TcpStream,
+    idle_timeout: std::time::Duration,
+    frame_deadline: std::time::Duration,
+) -> std::io::Result<Option<(u8, Vec<u8>)>> {
+    let _ = stream.set_read_timeout(Some(idle_timeout));
+    let mut clone = stream.try_clone()?;
+    let res = read_ws_control_frame_inner(&mut clone, Some(frame_deadline), |dl| {
+        let rem = dl.saturating_duration_since(Instant::now());
+        if rem.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "websocket client frame read deadline exceeded",
+            ));
+        }
+        stream.set_read_timeout(Some(rem))
+    });
+    let _ = stream.set_read_timeout(Some(idle_timeout));
+    res
+}
+
+fn read_exact_with_deadline<R: Read>(
+    reader: &mut R,
+    buf: &mut [u8],
+    deadline: Option<Instant>,
+    before_read: &mut impl FnMut(Instant) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let mut filled = 0usize;
+    while filled < buf.len() {
+        if let Some(dl) = deadline {
+            before_read(dl)?;
+        }
+        match reader.read(&mut buf[filled..]) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "unexpected EOF mid-websocket frame",
+                ));
+            }
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
     }
-    if let Err(e) = reader.read_exact(&mut hdr[1..2]) {
+    Ok(())
+}
+
+fn read_ws_control_frame_inner<R: Read>(
+    reader: &mut R,
+    frame_timeout: Option<std::time::Duration>,
+    mut before_read: impl FnMut(Instant) -> std::io::Result<()>,
+) -> std::io::Result<Option<(u8, Vec<u8>)>> {
+    let mut hdr = [0u8; 2];
+    loop {
+        match reader.read(&mut hdr[0..1]) {
+            Ok(0) => return Ok(None),
+            Ok(_) => break,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    let deadline = frame_timeout.map(|d| Instant::now() + d);
+    if let Err(e) = read_exact_with_deadline(reader, &mut hdr[1..2], deadline, &mut before_read) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,
             format!("incomplete websocket frame header: {e}"),
@@ -500,13 +599,13 @@ pub(super) fn read_ws_control_frame<R: Read>(reader: &mut R) -> std::io::Result<
     let mut len = (hdr[1] & 0x7F) as u64;
     if len == 126 {
         let mut ext = [0u8; 2];
-        reader.read_exact(&mut ext).map_err(|e| {
+        read_exact_with_deadline(reader, &mut ext, deadline, &mut before_read).map_err(|e| {
             std::io::Error::new(std::io::ErrorKind::UnexpectedEof, format!("ws ext16: {e}"))
         })?;
         len = u16::from_be_bytes(ext) as u64;
     } else if len == 127 {
         let mut ext = [0u8; 8];
-        reader.read_exact(&mut ext).map_err(|e| {
+        read_exact_with_deadline(reader, &mut ext, deadline, &mut before_read).map_err(|e| {
             std::io::Error::new(std::io::ErrorKind::UnexpectedEof, format!("ws ext64: {e}"))
         })?;
         len = u64::from_be_bytes(ext);
@@ -525,13 +624,13 @@ pub(super) fn read_ws_control_frame<R: Read>(reader: &mut R) -> std::io::Result<
     }
     let mut mask_key = [0u8; 4];
     if masked {
-        reader.read_exact(&mut mask_key).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::UnexpectedEof, format!("ws mask: {e}"))
-        })?;
+        read_exact_with_deadline(reader, &mut mask_key, deadline, &mut before_read).map_err(
+            |e| std::io::Error::new(std::io::ErrorKind::UnexpectedEof, format!("ws mask: {e}")),
+        )?;
     }
     let mut payload = vec![0u8; len as usize];
     if len > 0 {
-        reader.read_exact(&mut payload).map_err(|e| {
+        read_exact_with_deadline(reader, &mut payload, deadline, &mut before_read).map_err(|e| {
             std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
                 format!("ws payload: {e}"),

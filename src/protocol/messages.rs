@@ -430,6 +430,12 @@ pub fn build_udp_cursor_position_packet(x: u32, y: u32, visible: bool) -> [u8; 9
     pkt
 }
 
+/// Keyboard modifier bitmask for `InputEvent::KeyModified`.
+pub const KEY_MOD_SHIFT: u8 = 1 << 0;
+pub const KEY_MOD_CTRL: u8 = 1 << 1;
+pub const KEY_MOD_ALT: u8 = 1 << 2;
+pub const KEY_MOD_META: u8 = 1 << 3;
+
 /// Decoded input events arriving from a connected legacy display client on the Data channel.
 #[derive(Debug, Clone, PartialEq)]
 pub enum InputEvent {
@@ -441,8 +447,19 @@ pub enum InputEvent {
     },
     MouseDragged { x: f64, y: f64 },
     MouseUp { x: f64, y: f64, double_click: bool },
-    KeySpecial { key_code: u16 }, // 0x33 = Backspace, 0x24 = Return
+    /// Special non-printable key using macOS virtual key code convention:
+    /// 0x33=Backspace, 0x24=Return, 0x30=Tab, 0x35=Escape, 0x75=ForwardDelete,
+    /// 0x7E=Up, 0x7D=Down, 0x7B=Left, 0x7C=Right, 0x73=Home, 0x77=End, 0x74=PageUp, 0x79=PageDown.
+    KeySpecial { key_code: u16 },
     KeyUnicode { ch: u16 },
+    /// Multi-character text input (iOS QuickType suggestions, CJK phrases, surrogate-pair emoji).
+    KeyText { text: String },
+    /// Key press combined with hardware keyboard modifiers (`KEY_MOD_*` bitmask).
+    KeyModified {
+        key_code: Option<u16>,
+        ch: Option<u16>,
+        modifiers: u8,
+    },
     Scroll { dx: f64, dy: f64 },
 }
 
@@ -592,6 +609,58 @@ fn decode_input_value_inner(val: &ArchivedValue, allow_unwrap: bool) -> Option<I
             .get("specialValue")
             .and_then(|v| v.as_i64())
             .unwrap_or(0);
+        let raw_mods = fields
+            .get("modifiers")
+            .or_else(|| fields.get("modifierFlags"))
+            .or_else(|| fields.get("flags"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0) as u64;
+        // Decode Apple `UIKeyModifierFlags` / `NSEventModifierFlags` (bits 17..=20).
+        let mut modifiers = 0u8;
+        if (raw_mods & (1 << 17)) != 0 {
+            modifiers |= KEY_MOD_SHIFT;
+        }
+        if (raw_mods & (1 << 18)) != 0 {
+            modifiers |= KEY_MOD_CTRL;
+        }
+        if (raw_mods & (1 << 19)) != 0 {
+            modifiers |= KEY_MOD_ALT;
+        }
+        if (raw_mods & (1 << 20)) != 0 {
+            modifiers |= KEY_MOD_META;
+        }
+
+        let special_code = match special {
+            1 => Some(0x33u16), // Backspace
+            2 => Some(0x24),    // Return
+            3 => Some(0x30),    // Tab
+            4 => Some(0x35),    // Escape
+            5 => Some(0x75),    // Forward Delete
+            _ => None,
+        };
+        if let Some(key_code) = special_code {
+            return if modifiers != 0 {
+                Some(InputEvent::KeyModified {
+                    key_code: Some(key_code),
+                    ch: None,
+                    modifiers,
+                })
+            } else {
+                Some(InputEvent::KeySpecial { key_code })
+            };
+        }
+
+        // Preserve multi-char QuickType / CJK / surrogate-pair emoji strings (capped at 64 UTF-16 units).
+        if let Some(ArchivedValue::String(s)) = fields.get("value") {
+            let utf16_len = s.encode_utf16().count();
+            if utf16_len > 1 {
+                let bounded: String = s.chars().take(64).collect();
+                if !bounded.is_empty() {
+                    return Some(InputEvent::KeyText { text: bounded });
+                }
+            }
+        }
+
         let value = fields
             .get("value")
             .and_then(|v| match v {
@@ -601,21 +670,48 @@ fn decode_input_value_inner(val: &ArchivedValue, allow_unwrap: bool) -> Option<I
                 other => other.as_i64(),
             })
             .unwrap_or(0) as u16;
-        return match special {
-            1 => Some(InputEvent::KeySpecial { key_code: 0x33 }), // Backspace
-            2 => Some(InputEvent::KeySpecial { key_code: 0x24 }), // Return
-            3 => Some(InputEvent::KeySpecial { key_code: 0x30 }), // Tab
-            4 => Some(InputEvent::KeySpecial { key_code: 0x35 }), // Escape
-            5 => Some(InputEvent::KeySpecial { key_code: 0x75 }), // Forward Delete
-            _ => match value {
-                0x08 => Some(InputEvent::KeySpecial { key_code: 0x33 }), // BS
-                0x09 => Some(InputEvent::KeySpecial { key_code: 0x30 }), // TAB
-                0x0A | 0x0D => Some(InputEvent::KeySpecial { key_code: 0x24 }), // LF/CR
-                0x1B => Some(InputEvent::KeySpecial { key_code: 0x35 }), // ESC
-                0x7F => Some(InputEvent::KeySpecial { key_code: 0x75 }), // DEL
-                0 => None,
-                ch => Some(InputEvent::KeyUnicode { ch }),
-            },
+
+        let mapped_special = match value {
+            0x08 => Some(0x33u16), // BS
+            0x09 => Some(0x30),    // TAB
+            0x0A | 0x0D => Some(0x24), // LF/CR
+            0x1B => Some(0x35),    // ESC
+            0x7F | 0xF728 => Some(0x75), // DEL / NSDeleteFunctionKey
+            0xF700 => Some(0x7E),  // NSUpArrowFunctionKey
+            0xF701 => Some(0x7D),  // NSDownArrowFunctionKey
+            0xF702 => Some(0x7B),  // NSLeftArrowFunctionKey
+            0xF703 => Some(0x7C),  // NSRightArrowFunctionKey
+            0xF729 => Some(0x73),  // NSHomeFunctionKey
+            0xF72B => Some(0x77),  // NSEndFunctionKey
+            0xF72C => Some(0x74),  // NSPageUpFunctionKey
+            0xF72D => Some(0x79),  // NSPageDownFunctionKey
+            _ => None,
+        };
+        if let Some(key_code) = mapped_special {
+            return if modifiers != 0 {
+                Some(InputEvent::KeyModified {
+                    key_code: Some(key_code),
+                    ch: None,
+                    modifiers,
+                })
+            } else {
+                Some(InputEvent::KeySpecial { key_code })
+            };
+        }
+        if value == 0 {
+            return None;
+        }
+        // Printable chars with only Shift already carry uppercase/shifted glyphs; use KeyModified
+        // only when Cmd/Ctrl/Alt shortcut modifiers are active.
+        let shortcut_mods = modifiers & (KEY_MOD_CTRL | KEY_MOD_ALT | KEY_MOD_META);
+        return if shortcut_mods != 0 {
+            Some(InputEvent::KeyModified {
+                key_code: None,
+                ch: Some(value),
+                modifiers,
+            })
+        } else {
+            Some(InputEvent::KeyUnicode { ch: value })
         };
     }
 

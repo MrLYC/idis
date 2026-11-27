@@ -748,9 +748,9 @@ static void clamp_encoded_dimensions(uint32_t *w, uint32_t *h, uint32_t maxEdge)
     _Atomic uint32_t _vtErrorStreak;
     _Atomic uint64_t _lastVtRebuildNs;
     _Atomic uint64_t _lastEncodeNs;
-    // Per-capture client-cursor hotspot (in rendered PNG video-pixel coordinates) & diag dedup.
-    _Atomic int32_t _cursorHotX;
-    _Atomic int32_t _cursorHotY;
+    // Per-capture client-cursor hotspot packed as `((uint64_t)(uint32_t)hotX << 32) | (uint32_t)hotY`
+    // so query_cursor never observes a torn (hotX, hotY) pair across cursor shape transitions.
+    _Atomic uint64_t _cursorHotPacked;
     _Atomic uint64_t _lastCursorDiagKey;
     _Atomic BOOL _atomicShowCursor;
     _Atomic uint64_t _lastScaleHealNs;
@@ -3105,26 +3105,112 @@ void id_macos_inject_scroll(void *handle, double dx, double dy) {
     }
 }
 
-void id_macos_inject_key_code(uint16_t key_code) {
-    CGEventRef down = CGEventCreateKeyboardEvent(NULL, (CGKeyCode)key_code, true);
-    CGEventRef up = CGEventCreateKeyboardEvent(NULL, (CGKeyCode)key_code, false);
-    if (down) { CGEventPost(kCGSessionEventTap, down); CFRelease(down); }
-    if (up) { CGEventPost(kCGSessionEventTap, up); CFRelease(up); }
+static CGEventFlags id_mods_to_cg_flags(uint8_t mods) {
+    CGEventFlags f = 0;
+    if (mods & (1u << 0)) f |= kCGEventFlagMaskShift;
+    if (mods & (1u << 1)) f |= kCGEventFlagMaskControl;
+    if (mods & (1u << 2)) f |= kCGEventFlagMaskAlternate;
+    if (mods & (1u << 3)) f |= kCGEventFlagMaskCommand;
+    return f;
 }
 
-void id_macos_inject_unicode(uint16_t ch) {
+static int32_t id_ascii_to_ansi_keycode(uint16_t ch) {
+    if (ch >= 'A' && ch <= 'Z') ch = (uint16_t)(ch - 'A' + 'a');
+    switch (ch) {
+        case 'a': return 0x00; case 's': return 0x01; case 'd': return 0x02; case 'f': return 0x03;
+        case 'h': return 0x04; case 'g': return 0x05; case 'z': return 0x06; case 'x': return 0x07;
+        case 'c': return 0x08; case 'v': return 0x09; case 'b': return 0x0B; case 'q': return 0x0C;
+        case 'w': return 0x0D; case 'e': return 0x0E; case 'r': return 0x0F; case 'y': return 0x10;
+        case 't': return 0x11; case '1': return 0x12; case '2': return 0x13; case '3': return 0x14;
+        case '4': return 0x15; case '6': return 0x16; case '5': return 0x17; case '=': return 0x18;
+        case '9': return 0x19; case '7': return 0x1A; case '-': return 0x1B; case '8': return 0x1C;
+        case '0': return 0x1D; case ']': return 0x1E; case 'o': return 0x1F; case 'u': return 0x20;
+        case '[': return 0x21; case 'i': return 0x22; case 'p': return 0x23; case 'l': return 0x25;
+        case 'j': return 0x26; case '\'': return 0x27; case 'k': return 0x28; case ';': return 0x29;
+        case '\\': return 0x2A; case ',': return 0x2B; case '/': return 0x2C; case 'n': return 0x2D;
+        case 'm': return 0x2E; case '.': return 0x2F; case ' ': return 0x31; case '`': return 0x32;
+        default: return -1;
+    }
+}
+
+void id_macos_inject_key_code_mods(uint16_t key_code, uint8_t mods) {
+    CGEventFlags flags = id_mods_to_cg_flags(mods);
+    CGEventRef down = CGEventCreateKeyboardEvent(NULL, (CGKeyCode)key_code, true);
+    CGEventRef up = CGEventCreateKeyboardEvent(NULL, (CGKeyCode)key_code, false);
+    if (down) {
+        if (flags != 0) CGEventSetFlags(down, flags);
+        CGEventPost(kCGSessionEventTap, down);
+        CFRelease(down);
+    }
+    if (up) {
+        if (flags != 0) CGEventSetFlags(up, flags);
+        CGEventPost(kCGSessionEventTap, up);
+        CFRelease(up);
+    }
+}
+
+void id_macos_inject_key_code(uint16_t key_code) {
+    id_macos_inject_key_code_mods(key_code, 0);
+}
+
+void id_macos_inject_unicode_mods(uint16_t ch, uint8_t mods) {
+    if (mods != 0) {
+        int32_t kc = id_ascii_to_ansi_keycode(ch);
+        if (kc >= 0) {
+            id_macos_inject_key_code_mods((uint16_t)kc, mods);
+            return;
+        }
+    }
     UniChar uc = (UniChar)ch;
+    CGEventFlags flags = id_mods_to_cg_flags(mods);
     CGEventRef down = CGEventCreateKeyboardEvent(NULL, 0, true);
     CGEventRef up = CGEventCreateKeyboardEvent(NULL, 0, false);
     if (down) {
+        if (flags != 0) CGEventSetFlags(down, flags);
         CGEventKeyboardSetUnicodeString(down, 1, &uc);
         CGEventPost(kCGSessionEventTap, down);
         CFRelease(down);
     }
     if (up) {
+        if (flags != 0) CGEventSetFlags(up, flags);
         CGEventKeyboardSetUnicodeString(up, 1, &uc);
         CGEventPost(kCGSessionEventTap, up);
         CFRelease(up);
+    }
+}
+
+void id_macos_inject_unicode(uint16_t ch) {
+    id_macos_inject_unicode_mods(ch, 0);
+}
+
+void id_macos_inject_text(const uint16_t *units, size_t len) {
+    if (!units || len == 0) return;
+    if (len > 64) len = 64;
+    // CoreGraphics caps a single CGEvent's inline Unicode string at 20 UniChars.
+    // Chunk safely without ever splitting a UTF-16 surrogate pair across events.
+    size_t offset = 0;
+    while (offset < len) {
+        size_t chunk = len - offset;
+        if (chunk > 20) {
+            chunk = 20;
+            uint16_t last = units[offset + chunk - 1];
+            if (last >= 0xD800 && last <= 0xDBFF && chunk > 1) {
+                chunk -= 1;
+            }
+        }
+        CGEventRef down = CGEventCreateKeyboardEvent(NULL, 0, true);
+        CGEventRef up = CGEventCreateKeyboardEvent(NULL, 0, false);
+        if (down) {
+            CGEventKeyboardSetUnicodeString(down, (UniCharCount)chunk, (const UniChar *)(units + offset));
+            CGEventPost(kCGSessionEventTap, down);
+            CFRelease(down);
+        }
+        if (up) {
+            CGEventKeyboardSetUnicodeString(up, (UniCharCount)chunk, (const UniChar *)(units + offset));
+            CGEventPost(kCGSessionEventTap, up);
+            CFRelease(up);
+        }
+        offset += chunk;
     }
 }
 
@@ -3144,8 +3230,9 @@ int32_t id_macos_query_cursor(void *handle, uint32_t video_w, uint32_t video_h, 
     if (inside) {
         double scaleX = (video_w > 0 && bounds.size.width > 0.0) ? ((double)video_w / bounds.size.width) : 1.0;
         double scaleY = (video_h > 0 && bounds.size.height > 0.0) ? ((double)video_h / bounds.size.height) : 1.0;
-        double hotX = (double)atomic_load_explicit(&ctrl->_cursorHotX, memory_order_relaxed);
-        double hotY = (double)atomic_load_explicit(&ctrl->_cursorHotY, memory_order_relaxed);
+        uint64_t packedHot = atomic_load_explicit(&ctrl->_cursorHotPacked, memory_order_acquire);
+        double hotX = (double)(int32_t)(packedHot >> 32);
+        double hotY = (double)(int32_t)(packedHot & 0xFFFFFFFFu);
         // Compensate for cursor hotspot (stored in rendered video-pixel PNG coordinates so the
         // scaled PNG's hotspot aligns 1:1 with the logical pointer position in video pixel space).
         double vx = (loc.x - bounds.origin.x) * scaleX - hotX;
@@ -3159,7 +3246,14 @@ int32_t id_macos_query_cursor(void *handle, uint32_t video_w, uint32_t video_h, 
     return 1;
 }
 
-int32_t id_macos_cursor_png(void *handle, uint32_t video_w, uint32_t video_h, uint8_t **out_ptr, size_t *out_len) {
+int32_t id_macos_cursor_png_if_changed(
+    void *handle,
+    uint32_t video_w,
+    uint32_t video_h,
+    uint64_t *in_out_hash,
+    uint8_t **out_ptr,
+    size_t *out_len
+) {
     @autoreleasepool {
         if (!out_ptr || !out_len) return 0;
         *out_ptr = NULL;
@@ -3219,9 +3313,11 @@ int32_t id_macos_cursor_png(void *handle, uint32_t video_w, uint32_t video_h, ui
         size_t h = (size_t)MAX(4, llround(origH * effScaleY));
 
         NSPoint hot = cursor.hotSpot;
+        int32_t hotX = (int32_t)llround(hot.x * effScaleX);
+        int32_t hotY = (int32_t)llround(hot.y * effScaleY);
         if (ctrl) {
-            atomic_store_explicit(&ctrl->_cursorHotX, (int32_t)llround(hot.x * effScaleX), memory_order_relaxed);
-            atomic_store_explicit(&ctrl->_cursorHotY, (int32_t)llround(hot.y * effScaleY), memory_order_relaxed);
+            uint64_t packed = ((uint64_t)(uint32_t)hotX << 32) | (uint32_t)hotY;
+            atomic_store_explicit(&ctrl->_cursorHotPacked, packed, memory_order_release);
             uint64_t diagKey = ((uint64_t)(w & 0xFFFF) << 48)
                              | ((uint64_t)(h & 0xFFFF) << 32)
                              | ((uint64_t)(video_w & 0xFFFF) << 16)
@@ -3277,6 +3373,38 @@ int32_t id_macos_cursor_png(void *handle, uint32_t video_w, uint32_t video_h, ui
         CGContextSetInterpolationQuality(cgCtx, kCGInterpolationHigh);
         CGContextClearRect(cgCtx, CGRectMake(0, 0, (CGFloat)w, (CGFloat)h));
         CGContextDrawImage(cgCtx, CGRectMake(0, 0, (CGFloat)w, (CGFloat)h), srcImg);
+
+        // Compute FNV-1a hash of (w, h, hotX, hotY, raw RGBA pixels) BEFORE expensive PNG zlib
+        // compression so unchanged cursors skip PNG encoding ~99% of ticks.
+        uint64_t computed_hash = 0;
+        if (in_out_hash) {
+            uint64_t hv = 14695981039346656037ULL;
+            uint32_t meta[4] = { (uint32_t)w, (uint32_t)h, (uint32_t)hotX, (uint32_t)hotY };
+            const uint8_t *mp = (const uint8_t *)meta;
+            for (size_t i = 0; i < sizeof(meta); i++) {
+                hv ^= (uint64_t)mp[i];
+                hv *= 1099511628211ULL;
+            }
+            const uint8_t *px = (const uint8_t *)CGBitmapContextGetData(cgCtx);
+            if (px) {
+                size_t stride = CGBitmapContextGetBytesPerRow(cgCtx);
+                size_t rowBytes = w * 4;
+                for (size_t y = 0; y < h; y++) {
+                    const uint8_t *row = px + y * stride;
+                    for (size_t x = 0; x < rowBytes; x++) {
+                        hv ^= (uint64_t)row[x];
+                        hv *= 1099511628211ULL;
+                    }
+                }
+            }
+            if (hv == 0) hv = 1;
+            if (*in_out_hash == hv) {
+                CGContextRelease(cgCtx);
+                return 2;
+            }
+            computed_hash = hv;
+        }
+
         CGImageRef scaledImg = CGBitmapContextCreateImage(cgCtx);
         CGContextRelease(cgCtx);
         if (!scaledImg) return 0;
@@ -3290,10 +3418,17 @@ int32_t id_macos_cursor_png(void *handle, uint32_t video_w, uint32_t video_h, ui
         uint8_t *buf = (uint8_t *)malloc(png.length);
         if (!buf) return 0;
         memcpy(buf, png.bytes, png.length);
+        if (in_out_hash && computed_hash != 0) {
+            *in_out_hash = computed_hash;
+        }
         *out_ptr = buf;
         *out_len = png.length;
         return 1;
     }
+}
+
+int32_t id_macos_cursor_png(void *handle, uint32_t video_w, uint32_t video_h, uint8_t **out_ptr, size_t *out_len) {
+    return id_macos_cursor_png_if_changed(handle, video_w, video_h, NULL, out_ptr, out_len) == 1 ? 1 : 0;
 }
 
 void id_macos_free_bytes(uint8_t *ptr) {

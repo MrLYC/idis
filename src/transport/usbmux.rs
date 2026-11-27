@@ -181,9 +181,7 @@ pub fn write_usbmux_plist<W: Write>(writer: &mut W, tag: u32, dict: &Dictionary)
     hdr[4..8].copy_from_slice(&USBMUX_VERSION_PLIST.to_le_bytes());
     hdr[8..12].copy_from_slice(&USBMUX_MESSAGE_PLIST.to_le_bytes());
     hdr[12..16].copy_from_slice(&tag.to_le_bytes());
-    writer.write_all(&hdr)?;
-    writer.write_all(&xml)?;
-    writer.flush()?;
+    crate::protocol::framing::write_all_vectored(writer, &[&hdr, &xml])?;
     Ok(())
 }
 
@@ -211,6 +209,9 @@ pub fn read_usbmux_plist<R: Read>(reader: &mut R) -> Result<Option<(u32, Diction
     let packet_deadline = Instant::now() + Duration::from_secs(5);
     let mut filled = first_n;
     while filled < 16 {
+        if Instant::now() >= packet_deadline {
+            bail!("usbmuxd plist mid-packet header read deadline exceeded");
+        }
         match reader.read(&mut hdr[filled..]) {
             Ok(0) => bail!("unexpected EOF reading usbmuxd plist header"),
             Ok(n) => filled += n,
@@ -219,7 +220,7 @@ pub fn read_usbmux_plist<R: Read>(reader: &mut R) -> Result<Option<(u32, Diction
                 if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) =>
             {
                 if Instant::now() >= packet_deadline {
-                    return Err(e.into());
+                    bail!("usbmuxd plist mid-packet header read timed out");
                 }
                 thread::sleep(Duration::from_millis(5));
                 continue;
@@ -235,6 +236,9 @@ pub fn read_usbmux_plist<R: Read>(reader: &mut R) -> Result<Option<(u32, Diction
     let mut body = vec![0u8; size - 16];
     let mut body_filled = 0;
     while body_filled < body.len() {
+        if Instant::now() >= packet_deadline {
+            bail!("usbmuxd plist mid-packet body read deadline exceeded");
+        }
         match reader.read(&mut body[body_filled..]) {
             Ok(0) => bail!("unexpected EOF reading usbmuxd plist body"),
             Ok(n) => body_filled += n,
@@ -243,7 +247,7 @@ pub fn read_usbmux_plist<R: Read>(reader: &mut R) -> Result<Option<(u32, Diction
                 if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) =>
             {
                 if Instant::now() >= packet_deadline {
-                    return Err(e.into());
+                    bail!("usbmuxd plist mid-packet body read timed out");
                 }
                 thread::sleep(Duration::from_millis(5));
                 continue;
@@ -419,15 +423,44 @@ fn serve_peertalk_stream_with_guard(
     }
 
     let mut reader = stream;
+    let preauth_deadline = Instant::now() + Duration::from_secs(15);
+    let mut cleared_preauth_timeout = false;
     let mut unknown_pt_logs: u32 = 0;
     loop {
         let is_authed = registry.is_authorized_id(&session_key, session_id);
-        let max_len = if is_authed {
-            crate::protocol::framing::MAX_CONTROL_FRAME_SIZE
+        let read_res = if is_authed {
+            if !cleared_preauth_timeout {
+                let _ = reader.set_read_timeout(None);
+                cleared_preauth_timeout = true;
+            }
+            crate::protocol::framing::read_pt_frame_limited(
+                &mut reader,
+                crate::protocol::framing::MAX_CONTROL_FRAME_SIZE,
+            )
         } else {
-            crate::protocol::framing::MAX_PREAUTH_FRAME_SIZE
+            let rem = preauth_deadline.saturating_duration_since(Instant::now());
+            if rem.is_zero() {
+                warn!("[{session_key}] USB PeerTalk pre-auth deadline exceeded; closing");
+                break;
+            }
+            match &mut reader {
+                UsbmuxStream::Tcp(tcp) => crate::protocol::framing::read_pt_frame_limited_deadline(
+                    tcp,
+                    crate::protocol::framing::MAX_PREAUTH_FRAME_SIZE,
+                    preauth_deadline,
+                ),
+                #[cfg(unix)]
+                UsbmuxStream::Unix(u) => {
+                    crate::protocol::framing::read_pt_frame_limited_deadline_with(
+                        u,
+                        crate::protocol::framing::MAX_PREAUTH_FRAME_SIZE,
+                        preauth_deadline,
+                        |s, d| s.set_read_timeout(Some(d)),
+                    )
+                }
+            }
         };
-        match crate::protocol::framing::read_pt_frame_limited(&mut reader, max_len) {
+        match read_res {
             Ok(Some(frame)) => match frame.frame_type {
                 PT_FRAME_TYPE_TELEMETRY => {
                     if let Err(e) = registry.handle_telemetry_bytes_for_session(
@@ -436,6 +469,11 @@ fn serve_peertalk_stream_with_guard(
                         &frame.payload,
                     ) {
                         warn!("[{session_key}] USB telemetry packet error: {e:#}");
+                        if !is_authed || !registry.has_session_id(&session_key, session_id) {
+                            break;
+                        }
+                    } else if !registry.has_session_id(&session_key, session_id) {
+                        break;
                     }
                 }
                 PT_FRAME_TYPE_DATA => {

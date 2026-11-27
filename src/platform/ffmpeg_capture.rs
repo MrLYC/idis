@@ -230,9 +230,35 @@ impl FfmpegProcess {
 
         if let Some(mut err_pipe) = stderr {
             thread::spawn(move || {
-                let mut msg = String::new();
-                if err_pipe.read_to_string(&mut msg).is_ok() && !msg.trim().is_empty() {
-                    warn!("ffmpeg stderr: {}", msg.trim());
+                // Bound retained stderr to 8 KiB while draining the pipe so noisy FFmpeg stderr
+                // can never OOM `idis` or backpressure/SIGPIPE the encoder subprocess.
+                const MAX_STDERR_BYTES: usize = 8192;
+                let mut kept = Vec::new();
+                let mut total = 0usize;
+                let mut scratch = [0u8; 4096];
+                loop {
+                    match err_pipe.read(&mut scratch) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            total = total.saturating_add(n);
+                            if kept.len() < MAX_STDERR_BYTES {
+                                let take = n.min(MAX_STDERR_BYTES - kept.len());
+                                kept.extend_from_slice(&scratch[..take]);
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                let msg = String::from_utf8_lossy(&kept);
+                let trimmed = msg.trim();
+                if !trimmed.is_empty() {
+                    if total > MAX_STDERR_BYTES {
+                        warn!(
+                            "ffmpeg stderr (truncated to {MAX_STDERR_BYTES}B of {total}B): {trimmed}"
+                        );
+                    } else {
+                        warn!("ffmpeg stderr: {trimmed}");
+                    }
                 }
             });
         }
@@ -265,19 +291,10 @@ impl FfmpegProcess {
                     }
                 }
             }
-            // Only flush buffered tail AU on natural EOF; intentional `stop()` kills FFmpeg mid-write,
-            // so flushing `splitter.finish()` would emit a truncated NAL (e.g. half an IDR slice) into `tx`.
+            // Live FFmpeg screen capture never reaches a clean natural EOF unless stopped or
+            // externally killed/crashed — do NOT flush `splitter.finish()`, which would emit a
+            // truncated mid-write partial NAL (e.g. half an IDR slice) into `tx`.
             if !stop_bg.load(Ordering::SeqCst) {
-                for au in splitter.finish() {
-                    let is_kf = crate::protocol::annexb::is_self_contained_idr(&au);
-                    let _ = tx.send_latest(EncodedFrame {
-                        width: w,
-                        height: h,
-                        bytes_per_row: w * 4,
-                        annex_b: au,
-                        is_keyframe: is_kf,
-                    });
-                }
                 warn!("FFmpeg capture process exited unexpectedly — closing frame stream");
                 tx.close();
             }

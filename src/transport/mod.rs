@@ -120,10 +120,117 @@ pub fn enable_tcp_keepalive(stream: &TcpStream) {
 }
 
 #[cfg(unix)]
+#[cfg(target_os = "macos")]
+type UnixNfdsT = u32;
+#[cfg(unix)]
+#[cfg(not(target_os = "macos"))]
+type UnixNfdsT = usize;
+
+#[cfg(unix)]
+#[repr(C)]
+struct UnixPollFd {
+    fd: i32,
+    events: i16,
+    revents: i16,
+}
+
+#[cfg(unix)]
+extern "C" {
+    fn poll(fds: *mut UnixPollFd, nfds: UnixNfdsT, timeout: i32) -> i32;
+}
+
+#[cfg(unix)]
 fn is_raw_fd_peer_closed(fd: i32) -> bool {
     extern "C" {
         fn recv(socket: i32, buf: *mut std::ffi::c_void, len: usize, flags: i32) -> isize;
     }
+    const POLLERR: i16 = 0x0008;
+    const POLLHUP: i16 = 0x0010;
+    const POLLNVAL: i16 = 0x0020;
+    #[cfg(target_os = "linux")]
+    const POLLRDHUP: i16 = 0x2000;
+    #[cfg(not(target_os = "linux"))]
+    const POLLRDHUP: i16 = 0;
+
+    // Non-destructive `poll(2)` check FIRST so peer FIN/RST is detected immediately even when
+    // unread trailing bytes remain in the kernel receive queue (where `recv(MSG_PEEK)` returns 1).
+    let mut pfd = UnixPollFd {
+        fd,
+        events: POLLRDHUP,
+        revents: 0,
+    };
+    let prc = unsafe { poll(&mut pfd, 1, 0) };
+    if prc > 0 && (pfd.revents & (POLLERR | POLLHUP | POLLNVAL | POLLRDHUP)) != 0 {
+        return true;
+    }
+
+    // On macOS/XNU, `poll(2)` lacks `POLLRDHUP` and does not raise `POLLHUP` for TCP peer FIN
+    // when unread trailing bytes remain in the receive queue. A zero-timeout `kqueue(EVFILT_READ)`
+    // probe sets `EV_EOF` from `SBS_CANTRCVMORE` even with unread bytes queued.
+    #[cfg(target_os = "macos")]
+    if fd >= 0 {
+        #[repr(C)]
+        struct KEvent {
+            ident: usize,
+            filter: i16,
+            flags: u16,
+            fflags: u32,
+            data: isize,
+            udata: *mut std::ffi::c_void,
+        }
+        #[repr(C)]
+        struct Timespec {
+            tv_sec: isize,
+            tv_nsec: isize,
+        }
+        extern "C" {
+            fn kqueue() -> i32;
+            fn kevent(
+                kq: i32,
+                changelist: *const KEvent,
+                nchanges: i32,
+                eventlist: *mut KEvent,
+                nevents: i32,
+                timeout: *const Timespec,
+            ) -> i32;
+            fn close(fd: i32) -> i32;
+        }
+        const EVFILT_READ: i16 = -1;
+        const EV_ADD: u16 = 0x0001;
+        const EV_ONESHOT: u16 = 0x0010;
+        const EV_EOF: u16 = 0x8000;
+        let kq = unsafe { kqueue() };
+        if kq >= 0 {
+            let change = KEvent {
+                ident: fd as usize,
+                filter: EVFILT_READ,
+                flags: EV_ADD | EV_ONESHOT,
+                fflags: 0,
+                data: 0,
+                udata: std::ptr::null_mut(),
+            };
+            let mut out = KEvent {
+                ident: 0,
+                filter: 0,
+                flags: 0,
+                fflags: 0,
+                data: 0,
+                udata: std::ptr::null_mut(),
+            };
+            let zero = Timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            let n = unsafe { kevent(kq, &change, 1, &mut out, 1, &zero) };
+            unsafe {
+                let _ = close(kq);
+            }
+            if n > 0 && (out.flags & EV_EOF) != 0 {
+                return true;
+            }
+        }
+    }
+
     const MSG_PEEK: i32 = 0x2;
     #[cfg(target_os = "macos")]
     const MSG_DONTWAIT: i32 = 0x80;
@@ -324,19 +431,6 @@ impl WakePipe {
         }
         #[cfg(unix)]
         {
-            #[cfg(target_os = "macos")]
-            type NfdsT = u32;
-            #[cfg(not(target_os = "macos"))]
-            type NfdsT = usize;
-            #[repr(C)]
-            struct PollFd {
-                fd: i32,
-                events: i16,
-                revents: i16,
-            }
-            extern "C" {
-                fn poll(fds: *mut PollFd, nfds: NfdsT, timeout: i32) -> i32;
-            }
             const POLLIN: i16 = 0x0001;
             let deadline = std::time::Instant::now() + dur;
             loop {
@@ -348,7 +442,7 @@ impl WakePipe {
                     return PollOutcome::Timeout;
                 }
                 let ms = rem.as_millis().min(i32::MAX as u128) as i32;
-                let mut pfd = PollFd {
+                let mut pfd = UnixPollFd {
                     fd: self.read_fd,
                     events: POLLIN,
                     revents: 0,
@@ -402,19 +496,6 @@ impl Drop for WakePipe {
 /// `wake_pipe.wake()` is invoked.
 #[cfg(unix)]
 pub fn poll_fd_interruptible(fd: i32, wake: &WakePipe) -> io::Result<PollOutcome> {
-    #[cfg(target_os = "macos")]
-    type NfdsT = u32;
-    #[cfg(not(target_os = "macos"))]
-    type NfdsT = usize;
-    #[repr(C)]
-    struct PollFd {
-        fd: i32,
-        events: i16,
-        revents: i16,
-    }
-    extern "C" {
-        fn poll(fds: *mut PollFd, nfds: NfdsT, timeout: i32) -> i32;
-    }
     const POLLIN: i16 = 0x0001;
 
     loop {
@@ -422,12 +503,12 @@ pub fn poll_fd_interruptible(fd: i32, wake: &WakePipe) -> io::Result<PollOutcome
             return Ok(PollOutcome::Woken);
         }
         let mut pfds = [
-            PollFd {
+            UnixPollFd {
                 fd,
                 events: POLLIN,
                 revents: 0,
             },
-            PollFd {
+            UnixPollFd {
                 fd: wake.read_fd,
                 events: POLLIN,
                 revents: 0,
@@ -533,7 +614,7 @@ pub fn install_sigterm_handler(on_term: Arc<dyn Fn() + Send + Sync + 'static>) {
         fn read(fd: i32, buf: *mut std::ffi::c_void, count: usize) -> isize;
         fn write(fd: i32, buf: *const std::ffi::c_void, count: usize) -> isize;
         fn close(fd: i32) -> i32;
-        fn signal(sig: i32, handler: extern "C" fn(i32)) -> usize;
+        fn signal(sig: i32, handler: usize) -> usize;
     }
     const F_GETFD: i32 = 1;
     const F_SETFD: i32 = 2;
@@ -605,7 +686,7 @@ pub fn install_sigterm_handler(on_term: Arc<dyn Fn() + Send + Sync + 'static>) {
         return;
     }
     unsafe {
-        let _ = signal(SIGTERM, sigterm_trampoline);
+        let _ = signal(SIGTERM, sigterm_trampoline as *const () as usize);
     }
     let read_fd = fds[0];
     let _ = std::thread::Builder::new()
@@ -615,6 +696,11 @@ pub fn install_sigterm_handler(on_term: Arc<dyn Fn() + Send + Sync + 'static>) {
             loop {
                 let n = unsafe { read(read_fd, buf.as_mut_ptr().cast(), 1) };
                 if n > 0 {
+                    // Restore SIG_DFL immediately so a 2nd SIGTERM terminates cleanly and a
+                    // racing signal can never write into a closed/reused FD.
+                    unsafe {
+                        let _ = signal(SIGTERM, 0usize);
+                    }
                     on_term();
                     break;
                 }
@@ -625,12 +711,9 @@ pub fn install_sigterm_handler(on_term: Arc<dyn Fn() + Send + Sync + 'static>) {
                     break;
                 }
             }
-            let old_wr = SIGTERM_PIPE_WR.swap(-1, Ordering::AcqRel);
-            if old_wr >= 0 {
-                unsafe {
-                    let _ = close(old_wr);
-                }
-            }
+            // Leave the write-end pipe FD open (with SIGTERM_PIPE_WR = -1) until process exit so
+            // any signal handler already mid-flight before SIG_DFL cannot hit a reused FD.
+            SIGTERM_PIPE_WR.store(-1, Ordering::Release);
             unsafe {
                 let _ = close(read_fd);
             }

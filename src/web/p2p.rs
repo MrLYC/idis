@@ -379,6 +379,10 @@ struct P2pPeerNode {
     frame_waker: FrameWaker,
     /// Map of `parent_id -> (failed_at, consecutive_fail_count)` for exponential retry backoff.
     avoid_parents: HashMap<u64, (Instant, u32)>,
+    /// Parent-side recent child fallback timestamps; if >= 2 children fall back within 30s,
+    /// demote this parent for 30s so a blackholed root cannot keep trapping new viewers.
+    recent_child_fallbacks: Vec<Instant>,
+    parent_cooldown_until: Option<Instant>,
     fallback_count: u32,
     last_fallback_reason: Option<String>,
 }
@@ -386,6 +390,10 @@ struct P2pPeerNode {
 impl P2pPeerNode {
     fn can_relay(&self) -> bool {
         self.supported && self.relay_priority > 0
+    }
+
+    fn is_in_parent_cooldown(&self, now: Instant) -> bool {
+        self.parent_cooldown_until.is_some_and(|until| now < until)
     }
 
     fn max_fanout(&self) -> usize {
@@ -504,6 +512,8 @@ impl P2pRelayHub {
             sig_tx,
             frame_waker,
             avoid_parents: HashMap::new(),
+            recent_child_fallbacks: Vec::new(),
+            parent_cooldown_until: None,
             fallback_count: 0,
             last_fallback_reason: None,
         };
@@ -577,10 +587,13 @@ impl P2pRelayHub {
     pub fn on_hello_with_priority(&self, viewer_id: u64, supported: bool, relay_priority: u8) {
         let mut nodes = self.nodes.lock().unwrap();
         let order = self.join_order.lock().unwrap();
-        if let Some(node) = nodes.get_mut(&viewer_id) {
+        let (children_to_release, detached_parent) = {
+            let Some(node) = nodes.get_mut(&viewer_id) else {
+                return;
+            };
             node.supported = supported;
             node.relay_priority = if supported { relay_priority.min(2) } else { 0 };
-            Self::send_json(
+            let _ = Self::send_json(
                 node,
                 serde_json::json!({
                     "type": "p2p_welcome",
@@ -592,7 +605,48 @@ impl P2pRelayHub {
                 "[p2p] viewer #{viewer_id} hello (supported={}, relay_priority={})",
                 node.supported, node.relay_priority
             );
+            let allowed_fanout = node.max_fanout();
+            let excess = if node.children.len() > allowed_fanout {
+                node.children.split_off(allowed_fanout)
+            } else {
+                Vec::new()
+            };
+            for &cid in &excess {
+                let _ = Self::send_json(
+                    node,
+                    serde_json::json!({ "type": "p2p_remove_child", "child_id": cid }),
+                );
+            }
+            let detached_parent = if !node.supported {
+                node.p2p_active = false;
+                node.depth = 0;
+                node.ws_direct_paused.store(false, Ordering::Release);
+                node.frame_waker.wake();
+                node.parent_id.take()
+            } else {
+                None
+            };
+            (excess, detached_parent)
+        };
+        if let Some(pid) = detached_parent {
+            if let Some(parent) = nodes.get_mut(&pid) {
+                parent.children.retain(|&c| c != viewer_id);
+                let _ = Self::send_json(
+                    parent,
+                    serde_json::json!({ "type": "p2p_remove_child", "child_id": viewer_id }),
+                );
+            }
         }
+        for cid in children_to_release {
+            if let Some(child) = nodes.get_mut(&cid) {
+                child.parent_id = None;
+                child.depth = 0;
+                child.p2p_active = false;
+                child.ws_direct_paused.store(false, Ordering::Release);
+                let _ = Self::send_json(child, serde_json::json!({ "type": "p2p_parent_lost" }));
+            }
+        }
+        Self::recompute_depths_locked(&mut nodes);
         if self.is_enabled() {
             self.rebalance_locked(&mut nodes, &order);
         }
@@ -710,7 +764,14 @@ impl P2pRelayHub {
         if let Some(pid) = old_parent {
             if let Some(parent) = nodes.get_mut(&pid) {
                 parent.children.retain(|&c| c != viewer_id);
-                Self::send_json(
+                parent
+                    .recent_child_fallbacks
+                    .retain(|&ts| now.saturating_duration_since(ts) < Duration::from_secs(30));
+                parent.recent_child_fallbacks.push(now);
+                if parent.recent_child_fallbacks.len() >= 2 {
+                    parent.parent_cooldown_until = Some(now + Duration::from_secs(30));
+                }
+                let _ = Self::send_json(
                     parent,
                     serde_json::json!({ "type": "p2p_remove_child", "child_id": viewer_id }),
                 );
@@ -839,11 +900,16 @@ impl P2pRelayHub {
         }
     }
 
-    fn send_json(node: &P2pPeerNode, val: serde_json::Value) {
-        if let Err(e) = node.sig_tx.try_send(val.to_string()) {
-            warn!("[p2p] outbound signaling channel saturated/closed: {e}");
-        }
+    fn send_json(node: &P2pPeerNode, val: serde_json::Value) -> bool {
+        let ok = match node.sig_tx.try_send(val.to_string()) {
+            Ok(()) => true,
+            Err(e) => {
+                warn!("[p2p] outbound signaling channel saturated/closed: {e}");
+                false
+            }
+        };
         node.frame_waker.wake();
+        ok
     }
 
     fn is_ancestor(nodes: &HashMap<u64, P2pPeerNode>, candidate_ancestor: u64, mut node_id: u64) -> bool {
@@ -990,7 +1056,9 @@ impl P2pRelayHub {
             .filter_map(|(idx, &id)| {
                 nodes
                     .get(&id)
-                    .filter(|n| n.parent_id.is_none() && n.can_relay())
+                    .filter(|n| {
+                        n.parent_id.is_none() && n.can_relay() && !n.is_in_parent_cooldown(now)
+                    })
                     .map(|_| (idx, id))
             })
             .collect();
@@ -1028,6 +1096,7 @@ impl P2pRelayHub {
                         return false;
                     };
                     if !p.can_relay()
+                        || p.is_in_parent_cooldown(now)
                         || p.children.len() >= p.max_fanout()
                         || p.depth.saturating_add(1).saturating_add(cid_height) > MAX_P2P_DEPTH
                         || c.avoid_parents.contains_key(&pid)
@@ -1048,23 +1117,50 @@ impl P2pRelayHub {
 
             if let Some(pid) = best_parent {
                 let child_depth = nodes[&pid].depth.saturating_add(1);
-                if let Some(parent) = nodes.get_mut(&pid) {
-                    parent.children.push(cid);
-                    Self::send_json(
+                let parent_accepted = if let Some(parent) = nodes.get_mut(&pid) {
+                    if Self::send_json(
                         parent,
                         serde_json::json!({ "type": "p2p_add_child", "child_id": cid }),
-                    );
+                    ) {
+                        parent.children.push(cid);
+                        true
+                    } else {
+                        // Saturated/dead signaling queue: demote parent instead of committing a broken edge.
+                        parent.parent_cooldown_until = Some(now + Duration::from_secs(30));
+                        false
+                    }
+                } else {
+                    false
+                };
+                if !parent_accepted {
+                    continue;
                 }
-                if let Some(child) = nodes.get_mut(&cid) {
-                    child.parent_id = Some(pid);
-                    child.depth = child_depth;
-                    child.p2p_active = false;
-                    // Keep WS direct active until child confirms first P2P frame (`p2p_active`).
-                    child.ws_direct_paused.store(false, Ordering::Release);
-                    Self::send_json(
+                let child_accepted = if let Some(child) = nodes.get_mut(&cid) {
+                    if Self::send_json(
                         child,
                         serde_json::json!({ "type": "p2p_assign_parent", "parent_id": pid }),
-                    );
+                    ) {
+                        child.parent_id = Some(pid);
+                        child.depth = child_depth;
+                        child.p2p_active = false;
+                        // Keep WS direct active until child confirms first P2P frame (`p2p_active`).
+                        child.ws_direct_paused.store(false, Ordering::Release);
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                if !child_accepted {
+                    if let Some(parent) = nodes.get_mut(&pid) {
+                        parent.children.retain(|&c| c != cid);
+                        let _ = Self::send_json(
+                            parent,
+                            serde_json::json!({ "type": "p2p_remove_child", "child_id": cid }),
+                        );
+                    }
+                    continue;
                 }
                 Self::recompute_depths_locked(nodes);
                 debug!("[p2p] assigned viewer #{cid} -> parent #{pid} (depth={child_depth})");
@@ -1234,10 +1330,12 @@ mod tests {
     #[test]
     fn p2p_hub_mobile_fallback_relay_and_periodic_rebalance_after_fallback() {
         let hub = P2pRelayHub::new(true);
+        let mut _sig_rxs = Vec::new();
         for id in 1..=3u64 {
-            let (sig_tx, _sig_rx) = mpsc::sync_channel(32);
+            let (sig_tx, sig_rx) = mpsc::sync_channel(32);
             let (_ftx, frx) = latest_frame_channel();
             hub.register(id, sig_tx, frx.waker());
+            _sig_rxs.push(sig_rx);
         }
         // All 3 viewers are foreground mobile (priority=1): viewer #1 becomes fallback root (fanout=2)
         hub.on_hello_with_priority(1, true, 1);

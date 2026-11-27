@@ -135,6 +135,9 @@ impl WifiServerController {
         prebound_data: Option<TcpListener>,
     ) -> Result<(SocketAddr, SocketAddr)> {
         let _op = self.op_lock.lock().unwrap();
+        if self.global_stop.load(Ordering::Acquire) {
+            anyhow::bail!("Wi-Fi server controller is shutting down");
+        }
         if let Some((ref h, _)) = *self.state.lock().unwrap() {
             return Ok((h.telemetry_addr, h.data_addr));
         }
@@ -171,8 +174,10 @@ impl WifiServerController {
         if let Some((mut handle, _)) = old {
             let tel = handle.telemetry_addr;
             let data = handle.data_addr;
-            self.registry.close_wifi_sessions();
+            // Stop accept threads FIRST so no late-accepted connection can register a new session
+            // after `close_wifi_sessions()` runs.
             handle.stop();
+            self.registry.close_wifi_sessions();
             self.registry.notify_lifecycle_wakeup();
             info!("iPad Wi-Fi listener closed (telemetry={tel}, data={data})");
             crate::debug_trace::record(
@@ -366,6 +371,8 @@ pub fn start_wifi_server_with_listeners(
                         let reg_c = reg.clone();
                         let key_c = key.clone();
                         let workers_c = preauth_workers.clone();
+                        let stop_a_w = stop_a.clone();
+                        let stop_g_w = stop_g.clone();
                         thread::spawn(move || {
                             struct WorkerGuard(Arc<AtomicUsize>);
                             impl Drop for WorkerGuard {
@@ -374,6 +381,10 @@ pub fn start_wifi_server_with_listeners(
                                 }
                             }
                             let _preauth_guard = Some(WorkerGuard(workers_c));
+                            if stop_a_w.load(Ordering::Acquire) || stop_g_w.load(Ordering::Acquire) {
+                                let _ = stream.shutdown(Shutdown::Both);
+                                return;
+                            }
                             info!("Wi-Fi telemetry connection accepted from {peer}");
                             let writer_stream = match stream.try_clone() {
                                 Ok(s) => s,
@@ -413,6 +424,10 @@ pub fn start_wifi_server_with_listeners(
                                 key: key_c.clone(),
                                 id: session_id,
                             };
+                            if stop_a_w.load(Ordering::Acquire) || stop_g_w.load(Ordering::Acquire) {
+                                let _ = reader.shutdown(Shutdown::Both);
+                                return;
+                            }
                             // Enforce a 15s TOTAL pre-auth deadline (allows pre-auth Ping probes while
                             // defeating slowloris keepalives) and 64 KiB frame cap until authorized.
                             let preauth_deadline = Instant::now() + Duration::from_secs(15);
@@ -527,6 +542,8 @@ pub fn start_wifi_server_with_listeners(
                         let reg_c = reg.clone();
                         let key_c = key.clone();
                         let dw_count = data_workers.clone();
+                        let stop_d_w = stop_a.clone();
+                        let stop_g_w = stop_g.clone();
                         thread::spawn(move || {
                             struct DataWorkerGuard(Arc<AtomicUsize>);
                             impl Drop for DataWorkerGuard {
@@ -535,6 +552,10 @@ pub fn start_wifi_server_with_listeners(
                                 }
                             }
                             let _worker_guard = DataWorkerGuard(dw_count);
+                            if stop_d_w.load(Ordering::Acquire) || stop_g_w.load(Ordering::Acquire) {
+                                let _ = stream.shutdown(Shutdown::Both);
+                                return;
+                            }
                             let (session_id, data_gen) = match reg_c.attach_data_channel_checked(
                                 &key_c,
                                 None,
@@ -568,6 +589,10 @@ pub fn start_wifi_server_with_listeners(
                                 session_id,
                                 data_gen,
                             };
+                            if stop_d_w.load(Ordering::Acquire) || stop_g_w.load(Ordering::Acquire) {
+                                let _ = stream.shutdown(Shutdown::Both);
+                                return;
+                            }
                             let mut reader = stream;
                             loop {
                                 match read_canal_block_limited(&mut reader, MAX_CONTROL_FRAME_SIZE) {

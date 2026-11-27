@@ -23,12 +23,16 @@ pub const PT_FRAME_TYPE_DATA: u32 = 101; // 0x65
 pub const PEERTALK_USB_PORT: u16 = 2345; // 0x0929
 
 /// Write all slices to `writer` using `write_vectored` with a full short-write advancement loop
-/// (eliminates per-frame heap allocation and payload copying on hot video send paths).
-pub fn write_all_vectored<W: Write>(writer: &mut W, parts: &[&[u8]]) -> Result<()> {
+/// and a hard wall-clock `deadline` (eliminates per-frame heap allocation and prevents 1-byte-window
+/// slow readers from resetting `SO_SNDTIMEO` indefinitely).
+pub fn write_all_vectored_with_deadline<W: Write>(
+    writer: &mut W,
+    parts: &[&[u8]],
+    deadline: Instant,
+) -> Result<()> {
     let start = Instant::now();
     let mut idx = 0usize;
     let mut off = 0usize;
-    let mut writes = 0usize;
     while idx < parts.len() {
         while idx < parts.len() && off >= parts[idx].len() {
             idx += 1;
@@ -37,7 +41,7 @@ pub fn write_all_vectored<W: Write>(writer: &mut W, parts: &[&[u8]]) -> Result<(
         if idx >= parts.len() {
             break;
         }
-        if writes > 0 && start.elapsed() >= MAX_VECTORED_WRITE_DEADLINE {
+        if Instant::now() >= deadline {
             bail!(
                 "write_vectored frame deadline exceeded ({}ms)",
                 start.elapsed().as_millis()
@@ -61,7 +65,6 @@ pub fn write_all_vectored<W: Write>(writer: &mut W, parts: &[&[u8]]) -> Result<(
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e.into()),
         };
-        writes += 1;
         let mut rem = n;
         while rem > 0 && idx < parts.len() {
             let avail = parts[idx].len() - off;
@@ -79,8 +82,91 @@ pub fn write_all_vectored<W: Write>(writer: &mut W, parts: &[&[u8]]) -> Result<(
     Ok(())
 }
 
-/// Zero-copy vectored variant of [`write_canal_block`] (stack-allocated slice table for <=7 parts).
-pub fn write_canal_parts<W: Write>(writer: &mut W, parts: &[&[u8]]) -> Result<()> {
+/// Write all slices to `writer` using `write_vectored` with the default 5s wall-clock deadline.
+pub fn write_all_vectored<W: Write>(writer: &mut W, parts: &[&[u8]]) -> Result<()> {
+    write_all_vectored_with_deadline(writer, parts, Instant::now() + MAX_VECTORED_WRITE_DEADLINE)
+}
+
+/// Write all slices to a `TcpStream` under a strict wall-clock `deadline`, shrinking
+/// `SO_SNDTIMEO` to the remaining budget before every `write_vectored` syscall and immediately
+/// shutting down the socket on any error to prevent concurrent mid-frame desync.
+pub fn write_tcp_vectored_with_deadline(
+    stream: &mut TcpStream,
+    parts: &[&[u8]],
+    deadline: Instant,
+) -> std::io::Result<()> {
+    let mut idx = 0usize;
+    let mut off = 0usize;
+    while idx < parts.len() {
+        while idx < parts.len() && off >= parts[idx].len() {
+            idx += 1;
+            off = 0;
+        }
+        if idx >= parts.len() {
+            break;
+        }
+        let rem = deadline.saturating_duration_since(Instant::now());
+        if rem.is_zero() {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "TCP vectored write deadline exceeded",
+            ));
+        }
+        let _ = stream.set_write_timeout(Some(rem));
+        let mut ios: [IoSlice<'_>; 8] = [IoSlice::new(&[]); 8];
+        let mut n_ios = 0usize;
+        for (k, p) in parts[idx..].iter().enumerate().take(8) {
+            let slice = if k == 0 { &p[off..] } else { p };
+            if !slice.is_empty() {
+                ios[n_ios] = IoSlice::new(slice);
+                n_ios += 1;
+            }
+        }
+        if n_ios == 0 {
+            break;
+        }
+        let n = match stream.write_vectored(&ios[..n_ios]) {
+            Ok(0) => {
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "TCP write_vectored returned 0 bytes",
+                ));
+            }
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => {
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+                return Err(e);
+            }
+        };
+        let mut rem_bytes = n;
+        while rem_bytes > 0 && idx < parts.len() {
+            let avail = parts[idx].len() - off;
+            if rem_bytes < avail {
+                off += rem_bytes;
+                rem_bytes = 0;
+            } else {
+                rem_bytes -= avail;
+                idx += 1;
+                off = 0;
+            }
+        }
+    }
+    if let Err(e) = stream.flush() {
+        let _ = stream.shutdown(std::net::Shutdown::Both);
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Zero-copy vectored variant of [`write_canal_block`] with an explicit wall-clock deadline.
+pub fn write_canal_parts_with_deadline<W: Write>(
+    writer: &mut W,
+    parts: &[&[u8]],
+    deadline: Instant,
+) -> Result<()> {
     let total: usize = parts.iter().map(|p| p.len()).sum();
     if total > MAX_FRAME_SIZE {
         bail!("MSMCanalSocket block too large: {total} bytes");
@@ -92,12 +178,30 @@ pub fn write_canal_parts<W: Write>(writer: &mut W, parts: &[&[u8]]) -> Result<()
         for (i, p) in parts.iter().enumerate() {
             stack[i + 1] = p;
         }
-        return write_all_vectored(writer, &stack[..1 + parts.len()]);
+        return write_all_vectored_with_deadline(writer, &stack[..1 + parts.len()], deadline);
     }
     let mut all: Vec<&[u8]> = Vec::with_capacity(1 + parts.len());
     all.push(&len_bytes);
     all.extend_from_slice(parts);
-    write_all_vectored(writer, &all)
+    write_all_vectored_with_deadline(writer, &all, deadline)
+}
+
+/// Zero-copy vectored variant of [`write_canal_block`] (stack-allocated slice table for <=7 parts).
+pub fn write_canal_parts<W: Write>(writer: &mut W, parts: &[&[u8]]) -> Result<()> {
+    write_canal_parts_with_deadline(
+        writer,
+        parts,
+        Instant::now() + MAX_VECTORED_WRITE_DEADLINE,
+    )
+}
+
+/// Write an `MSMCanalSocket` length-prefixed block with an explicit wall-clock deadline.
+pub fn write_canal_block_with_deadline<W: Write>(
+    writer: &mut W,
+    payload: &[u8],
+    deadline: Instant,
+) -> Result<()> {
+    write_canal_parts_with_deadline(writer, &[payload], deadline)
 }
 
 /// Write an `MSMCanalSocket` length-prefixed block: `[u32_le len][payload]`.
@@ -293,9 +397,20 @@ pub fn read_pt_frame_limited<R: Read>(reader: &mut R, max_size: usize) -> Result
     if size > limit {
         bail!("PTProtocol incoming frame too large: {size} bytes (limit {limit})");
     }
-    let mut payload = vec![0u8; size];
-    if size > 0 {
-        reader.read_exact(&mut payload)?;
+    let mut payload = Vec::with_capacity(size.min(64 * 1024));
+    let mut remaining = size;
+    let mut chunk = [0u8; 16 * 1024];
+    while remaining > 0 {
+        let want = remaining.min(chunk.len());
+        match reader.read(&mut chunk[..want]) {
+            Ok(0) => bail!("unexpected EOF reading PTProtocol payload ({remaining} bytes remaining)"),
+            Ok(n) => {
+                payload.extend_from_slice(&chunk[..n]);
+                remaining -= n;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e.into()),
+        }
     }
     Ok(Some(PtFrame {
         version,
@@ -303,6 +418,84 @@ pub fn read_pt_frame_limited<R: Read>(reader: &mut R, max_size: usize) -> Result
         tag,
         payload,
     }))
+}
+
+/// Generic socket-aware PeerTalk reader enforcing BOTH `max_size` and a hard wall-clock `deadline`
+/// (supports both TCP and Unix-domain `/var/run/usbmuxd` sockets).
+pub fn read_pt_frame_limited_deadline_with<R: Read, F>(
+    reader: &mut R,
+    max_size: usize,
+    deadline: Instant,
+    mut set_timeout: F,
+) -> Result<Option<PtFrame>>
+where
+    F: FnMut(&mut R, std::time::Duration) -> std::io::Result<()>,
+{
+    let mut hdr = [0u8; 16];
+    let mut filled = 0usize;
+    while filled < 16 {
+        let rem = deadline.saturating_duration_since(Instant::now());
+        if rem.is_zero() {
+            bail!("PTProtocol frame read deadline exceeded");
+        }
+        set_timeout(reader, rem)?;
+        match reader.read(&mut hdr[filled..]) {
+            Ok(0) if filled == 0 => return Ok(None),
+            Ok(0) => bail!("unexpected EOF reading PTProtocol header ({filled}/16 bytes)"),
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    let version = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
+    let frame_type = u32::from_be_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]);
+    let tag = u32::from_be_bytes([hdr[8], hdr[9], hdr[10], hdr[11]]);
+    let size = u32::from_be_bytes([hdr[12], hdr[13], hdr[14], hdr[15]]) as usize;
+    if version != PT_PROTOCOL_VERSION {
+        bail!("unexpected PTProtocol version: {version}");
+    }
+    let limit = max_size.min(MAX_FRAME_SIZE);
+    if size > limit {
+        bail!("PTProtocol incoming frame too large: {size} bytes (limit {limit})");
+    }
+    let mut payload = Vec::with_capacity(size.min(64 * 1024));
+    let mut remaining = size;
+    let mut chunk = [0u8; 16 * 1024];
+    while remaining > 0 {
+        let rem = deadline.saturating_duration_since(Instant::now());
+        if rem.is_zero() {
+            bail!("PTProtocol payload read deadline exceeded");
+        }
+        set_timeout(reader, rem)?;
+        let want = remaining.min(chunk.len());
+        match reader.read(&mut chunk[..want]) {
+            Ok(0) => bail!("unexpected EOF reading PTProtocol payload ({remaining} bytes remaining)"),
+            Ok(n) => {
+                payload.extend_from_slice(&chunk[..n]);
+                remaining -= n;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(Some(PtFrame {
+        version,
+        frame_type,
+        tag,
+        payload,
+    }))
+}
+
+/// Read a PeerTalk `PTProtocol` frame enforcing BOTH a maximum payload size and a hard wall-clock
+/// `deadline` (defeats 1-byte trickle Slowloris attacks by tightening `SO_RCVTIMEO` before every read).
+pub fn read_pt_frame_limited_deadline(
+    stream: &mut TcpStream,
+    max_size: usize,
+    deadline: Instant,
+) -> Result<Option<PtFrame>> {
+    read_pt_frame_limited_deadline_with(stream, max_size, deadline, |s, rem| {
+        s.set_read_timeout(Some(rem))
+    })
 }
 
 #[cfg(test)]

@@ -389,7 +389,10 @@ impl SessionRegistry {
             prev
         };
 
-        self.allow_input.store(eff_cfg.allow_input, Ordering::Release);
+        let prev_allow = self.allow_input.swap(eff_cfg.allow_input, Ordering::AcqRel);
+        if prev_allow && !eff_cfg.allow_input {
+            self.release_all_stuck_mouse_buttons();
+        }
         self.set_client_cursor_inner(eff_cfg.client_cursor, false);
         self.web_require_approval
             .store(eff_cfg.web_require_approval, Ordering::Release);
@@ -1354,26 +1357,29 @@ impl SessionRegistry {
 
     pub fn set_low_power(&self, enabled: bool) {
         let _tx = self.config_tx_lock.lock().unwrap();
-        let prev = self.low_power.swap(enabled, Ordering::AcqRel);
+        let prev = self.low_power.load(Ordering::Acquire);
+        if enabled && !prev {
+            // Populate `low_power_snapshot` BEFORE publishing `low_power = true` so no concurrent
+            // reader observes `low_power == true` with `low_power_snapshot == None`.
+            let vs = self.video_settings();
+            let pol = self.polling_config();
+            let mut snap = self.low_power_snapshot.lock().unwrap();
+            if snap.is_none() {
+                *snap = Some(LowPowerSnapshot {
+                    p2p_relay_enabled: self.is_p2p_relay_enabled(),
+                    max_web_viewers: self.max_web_viewers(),
+                    fps: vs.fps,
+                    bitrate_mbps: vs.bitrate_mbps,
+                    hidpi: vs.hidpi,
+                    polling: pol,
+                });
+            }
+        }
+        self.low_power.store(enabled, Ordering::Release);
         if prev != enabled {
             info!("Runtime setting updated: low_power={enabled}");
         }
         if enabled {
-            if !prev {
-                let vs = self.video_settings();
-                let pol = self.polling_config();
-                let mut snap = self.low_power_snapshot.lock().unwrap();
-                if snap.is_none() {
-                    *snap = Some(LowPowerSnapshot {
-                        p2p_relay_enabled: self.is_p2p_relay_enabled(),
-                        max_web_viewers: self.max_web_viewers(),
-                        fps: vs.fps,
-                        bitrate_mbps: vs.bitrate_mbps,
-                        hidpi: vs.hidpi,
-                        polling: pol,
-                    });
-                }
-            }
             // Low-power basic mode: trusted devices only (cancel any pending approvals),
             // disable Web viewing & P2P, drop stream to 4M/15fps eco 1x, and switch active polling
             // intervals to low-power defaults without clobbering saved YAML baseline preferences.
@@ -1488,6 +1494,9 @@ impl SessionRegistry {
         info!("Runtime setting updated: allow_input={allowed}");
         if prev != allowed {
             self.persist_config_patch(|c| c.allow_input = allowed);
+            if !allowed {
+                self.release_all_stuck_mouse_buttons();
+            }
         }
         let caps = self.backend.capabilities();
         if allowed && caps.accessibility_permission_required && !caps.accessibility_granted {
@@ -1515,12 +1524,14 @@ impl SessionRegistry {
     }
 
     pub fn set_max_web_viewers(&self, max_viewers: usize) {
+        let _tx = self.config_tx_lock.lock().unwrap();
         self.set_max_web_viewers_inner(max_viewers, true);
     }
 
     /// Update runtime `max_web_viewers` without overwriting persisted `idis.yaml` baseline
     /// (used by external port idle auto-close so the user's saved YAML limit is preserved).
     pub fn set_max_web_viewers_runtime(&self, max_viewers: usize) {
+        let _tx = self.config_tx_lock.lock().unwrap();
         self.set_max_web_viewers_inner(max_viewers, false);
     }
 
@@ -1553,7 +1564,7 @@ impl SessionRegistry {
                     let excess: Vec<_> = subs.drain(clamped..).collect();
                     let n = excess.len();
                     for s in excess {
-                        s.tx.close();
+                        s.kick();
                     }
                     n
                 } else {

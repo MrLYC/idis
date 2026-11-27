@@ -1092,9 +1092,63 @@ enum WsFrame {
     Close(Option<u16>),
 }
 
+fn read_exact_mid_frame(
+    stream: &mut TcpStream,
+    buf: &mut [u8],
+    deadline: Instant,
+) -> std::io::Result<()> {
+    let mut filled = 0usize;
+    while filled < buf.len() {
+        let rem = deadline.saturating_duration_since(Instant::now());
+        if rem.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "mid-frame WebSocket read deadline exceeded",
+            ));
+        }
+        match stream.read(&mut buf[filled..]) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "unexpected EOF mid-WebSocket frame",
+                ));
+            }
+            Ok(n) => filled += n,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::Interrupted
+                        | std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
 fn ws_read_server_frame(stream: &mut TcpStream) -> std::io::Result<WsFrame> {
     let mut h2 = [0u8; 2];
-    stream.read_exact(&mut h2)?;
+    // Only allow WouldBlock/TimedOut at byte 0; once byte 0 is consumed, finish the entire
+    // frame within a 10s deadline or return UnexpectedEof so callers never desync framing!
+    loop {
+        match stream.read(&mut h2[0..1]) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "WebSocket stream closed cleanly",
+                ));
+            }
+            Ok(_) => break,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    let dl = Instant::now() + Duration::from_secs(10);
+    read_exact_mid_frame(stream, &mut h2[1..2], dl)?;
     let opcode = h2[0] & 0x0F;
     let masked = (h2[1] & 0x80) != 0;
     let len_code = h2[1] & 0x7F;
@@ -1102,18 +1156,18 @@ fn ws_read_server_frame(stream: &mut TcpStream) -> std::io::Result<WsFrame> {
         0..=125 => len_code as usize,
         126 => {
             let mut b = [0u8; 2];
-            stream.read_exact(&mut b)?;
+            read_exact_mid_frame(stream, &mut b, dl)?;
             u16::from_be_bytes(b) as usize
         }
         _ => {
             let mut b = [0u8; 8];
-            stream.read_exact(&mut b)?;
+            read_exact_mid_frame(stream, &mut b, dl)?;
             u64::from_be_bytes(b) as usize
         }
     };
     let mask = if masked {
         let mut m = [0u8; 4];
-        stream.read_exact(&mut m)?;
+        read_exact_mid_frame(stream, &mut m, dl)?;
         Some(m)
     } else {
         None
@@ -1126,7 +1180,7 @@ fn ws_read_server_frame(stream: &mut TcpStream) -> std::io::Result<WsFrame> {
     }
     let mut payload = vec![0u8; len];
     if len > 0 {
-        stream.read_exact(&mut payload)?;
+        read_exact_mid_frame(stream, &mut payload, dl)?;
     }
     if let Some(m) = mask {
         for (i, b) in payload.iter_mut().enumerate() {
@@ -1803,9 +1857,9 @@ fn run_web_client(
         if args.p2p_hello {
             let hello = serde_json::json!({
                 "type": "p2p_hello",
-                "webrtc": true,
-                "mobile": false,
-                "max_children": 2,
+                "supported": true,
+                "can_relay": true,
+                "relay_priority": 2,
             })
             .to_string();
             let mk = (mask_rng.next_u64() as u32).to_le_bytes();

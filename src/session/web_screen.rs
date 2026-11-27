@@ -203,7 +203,7 @@ impl SessionRegistry {
             .unwrap_or_else(|| self.max_extended_screens());
         let auth_sessions = map.values().filter(|s| s.authorized).count();
         let already_has_virtual_standalone =
-            standalone.is_some() && self.web_screen_mode() != WebScreenMode::Main;
+            standalone.is_some() && self.web_screen_mode() == WebScreenMode::Independent;
         if !subs.is_empty()
             && !already_has_virtual_standalone
             && max_ext > 0
@@ -236,7 +236,7 @@ impl SessionRegistry {
             let max_ext = self.max_extended_screens();
             let auth_sessions = map.values().filter(|s| s.authorized).count();
             let already_has_virtual_standalone =
-                standalone.is_some() && self.web_screen_mode() != WebScreenMode::Main;
+                standalone.is_some() && self.web_screen_mode() == WebScreenMode::Independent;
             if !subs.is_empty()
                 && !already_has_virtual_standalone
                 && max_ext > 0
@@ -287,6 +287,7 @@ impl SessionRegistry {
                 standalone.take()
             }
         };
+        let had_prev_cap = prev_cap.is_some();
         if let Some(mut cap) = prev_cap {
             cap.shutdown();
             if let Ok(mut lf) = self.last_standalone_web_frame.lock() {
@@ -299,6 +300,9 @@ impl SessionRegistry {
             // `web_follow_ipad_session_id` before clearing owner, cached IDR, and bumping epoch (Iter-8 P2-B3).
             self.web_screen_mode.store(mode.as_u8(), Ordering::Release);
             self.web_follow_ipad_session_id.store(0, Ordering::Release);
+            if let Ok(mut g) = self.standalone_web_resume_after.lock() {
+                *g = None;
+            }
             if let Ok(mut lf) = self.last_ipad_web_frame.lock() {
                 *lf = None;
             }
@@ -318,9 +322,9 @@ impl SessionRegistry {
                 self.web_screen_mode
                     .store(prev_mode.as_u8(), Ordering::Release);
                 self.bump_web_source_epoch();
-                // Restore previous dedicated standalone/main capture if we tore it down before
+                // Restore previous dedicated standalone/main capture ONLY if we tore one down before
                 // the failed switch so active Web viewers never remain stuck black (Iter-6 P2-A4).
-                if has_viewers && (prev_mode != WebScreenMode::FollowIpad || !has_ipad) {
+                if had_prev_cap {
                     let _ = self.ensure_standalone_web_capture_locked();
                 }
                 self.sync_capture_pause_states();
@@ -432,6 +436,19 @@ impl SessionRegistry {
             .collect()
     }
 
+    /// Register an optional lock-free callback invoked when this viewer is kicked, allowing
+    /// wedged zero-window WebSocket writers to abort immediately without waiting for `SO_SNDTIMEO`.
+    /// Returns `false` if the viewer was already kicked/removed before registration.
+    pub fn set_web_viewer_unblock_hook(&self, id: u64, hook: Arc<dyn Fn() + Send + Sync>) -> bool {
+        let mut subs = self.web_subscribers.lock().unwrap();
+        if let Some(entry) = subs.iter_mut().find(|s| s.id == id) {
+            entry.unblock_io = Some(hook);
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn kick_web_viewer(&self, id: u64) -> Option<Option<String>> {
         let mut kicked_fp = None;
         let removed = {
@@ -440,7 +457,7 @@ impl SessionRegistry {
             subs.retain(|s| {
                 if s.id == id {
                     kicked_fp = Some(s.fingerprint.clone());
-                    s.tx.close();
+                    s.kick();
                     false
                 } else {
                     true
@@ -458,7 +475,7 @@ impl SessionRegistry {
             let before = subs.len();
             subs.retain(|s| {
                 if s.session_tag.as_deref() == Some(tag) {
-                    s.tx.close();
+                    s.kick();
                     false
                 } else {
                     true
@@ -482,7 +499,7 @@ impl SessionRegistry {
                     .as_deref()
                     .is_some_and(|fp| fp.eq_ignore_ascii_case(&norm_fp))
                 {
-                    s.tx.close();
+                    s.kick();
                     false
                 } else {
                     true
@@ -502,7 +519,7 @@ impl SessionRegistry {
                 if keep(s.is_admin, s.fingerprint.as_deref()) {
                     true
                 } else {
-                    s.tx.close();
+                    s.kick();
                     false
                 }
             });
@@ -521,6 +538,9 @@ impl SessionRegistry {
                     out.push(fp);
                 }
                 s.tx.close();
+                if let Some(f) = s.unblock_io {
+                    f();
+                }
             }
             out
         };
@@ -533,7 +553,7 @@ impl SessionRegistry {
             let mut subs = self.web_subscribers.lock().unwrap();
             let n = subs.len();
             for s in subs.drain(..) {
-                s.tx.close();
+                s.kick();
             }
             n
         };
@@ -546,6 +566,9 @@ impl SessionRegistry {
             let mut cap = self.standalone_web_capture.lock().unwrap();
             let subs = self.web_subscribers.lock().unwrap();
             if subs.is_empty() {
+                if let Ok(mut g) = self.standalone_web_resume_after.lock() {
+                    *g = None;
+                }
                 cap.take()
             } else {
                 None
@@ -565,7 +588,12 @@ impl SessionRegistry {
         // Check under consistent lock order (`standalone_web_capture` -> `sessions` -> `web_subscribers`)
         // then RELEASE all locks BEFORE calling blocking `backend.start_capture()` (outer `web_mode_lock`
         // already serializes standalone capture startup).
-        if self.is_web_lock_disconnect_admit_blocked() || self.is_host_lock_paused_web() {
+        if self.is_web_lock_disconnect_blocking()
+            || self.web_lock_disconnecting.load(Ordering::Acquire)
+            || self.is_host_lock_paused_web()
+            || self.is_low_power()
+            || self.max_web_viewers() == 0
+        {
             return Ok(());
         }
         let screen_mode = self.web_screen_mode();
@@ -675,6 +703,7 @@ impl SessionRegistry {
         let standalone_arc = self.standalone_web_capture.clone();
         let size_v = actual_size.clone();
         let host_lock_paused_web_v = self.host_lock_paused_web.clone();
+        let web_lock_disconnecting_v = self.web_lock_disconnecting.clone();
         let hdl_v = shared_handle.clone();
         let all_intra_v = self.config.all_intra;
         let video_v = self.video.clone();
@@ -717,7 +746,9 @@ impl SessionRegistry {
                                 }
                             }
                         }
-                        if host_lock_paused_web_v.load(Ordering::Acquire) {
+                        if host_lock_paused_web_v.load(Ordering::Acquire)
+                            || web_lock_disconnecting_v.load(Ordering::Acquire)
+                        {
                             awaiting_idr = true;
                             continue;
                         }
@@ -752,8 +783,15 @@ impl SessionRegistry {
                                 frame.width, frame.height
                             );
                         }
-                        if stop_v.load(Ordering::Acquire) {
-                            break;
+                        if stop_v.load(Ordering::Acquire)
+                            || host_lock_paused_web_v.load(Ordering::Acquire)
+                            || web_lock_disconnecting_v.load(Ordering::Acquire)
+                        {
+                            if stop_v.load(Ordering::Acquire) {
+                                break;
+                            }
+                            awaiting_idr = true;
+                            continue;
                         }
                         broadcast_to_web_subscribers_tagged(
                             &subs_v,
@@ -771,7 +809,9 @@ impl SessionRegistry {
                             last_web_source_epoch = cur_epoch;
                             awaiting_idr = true;
                         }
-                        if host_lock_paused_web_v.load(Ordering::Acquire) {
+                        if host_lock_paused_web_v.load(Ordering::Acquire)
+                            || web_lock_disconnecting_v.load(Ordering::Acquire)
+                        {
                             awaiting_idr = true;
                         }
                         let has_visible_viewer = subs_v
@@ -782,6 +822,7 @@ impl SessionRegistry {
                             && awaiting_idr
                             && has_visible_viewer
                             && !host_lock_paused_web_v.load(Ordering::Acquire)
+                            && !web_lock_disconnecting_v.load(Ordering::Acquire)
                             && last_kf_req.elapsed() >= Duration::from_millis(500)
                         {
                             last_kf_req = Instant::now();
@@ -805,7 +846,10 @@ impl SessionRegistry {
                         .lock()
                         .ok()
                         .is_some_and(|s| s.iter().any(|e| e.visible.load(Ordering::Acquire)));
-                    if host_lock_paused_web_v.load(Ordering::Acquire) || !has_visible_viewer {
+                    if host_lock_paused_web_v.load(Ordering::Acquire)
+                        || web_lock_disconnecting_v.load(Ordering::Acquire)
+                        || !has_visible_viewer
+                    {
                         if let Ok(mut acc) = web_abr_acc_v.lock() {
                             *acc = WebAbrAccum::default();
                         }
@@ -929,26 +973,45 @@ impl SessionRegistry {
             stream_thread: Some(stream_thread),
             cursor_thread: None,
         };
-        let orphan = {
+        let (orphan, quota_exceeded) = {
             let mut standalone_guard = self.standalone_web_capture.lock().unwrap();
             let map = self.sessions.lock().unwrap();
             let subs = self.web_subscribers.lock().unwrap();
+            let within_quota = screen_mode == WebScreenMode::Main || {
+                let max_ext = self.max_extended_screens();
+                let auth_sessions = map.values().filter(|s| s.authorized).count();
+                max_ext == 0 || (auth_sessions + 1) <= max_ext
+            };
             let still_needed = standalone_guard.is_none()
                 && !subs.is_empty()
-                && !self.is_web_lock_disconnect_admit_blocked()
+                && within_quota
+                && self.max_web_viewers() > 0
+                && !self.is_low_power()
+                && !self.is_web_lock_disconnect_blocking()
+                && !self.web_lock_disconnecting.load(Ordering::Acquire)
                 && !self.is_host_lock_paused_web()
                 && self.web_screen_mode() == screen_mode
                 && (screen_mode != WebScreenMode::FollowIpad
                     || !map.values().any(|s| s.capture.is_some()));
             if still_needed {
                 *standalone_guard = Some(new_cap);
-                None
+                (None, false)
             } else {
-                Some(new_cap)
+                (Some(new_cap), !within_quota)
             }
         };
         if let Some(mut cap) = orphan {
             cap.shutdown();
+            if self.web_lock_disconnecting.load(Ordering::Acquire)
+                || self.is_host_lock_paused_web()
+            {
+                if let Ok(mut lf) = self.last_standalone_web_frame.lock() {
+                    *lf = None;
+                }
+            }
+            if quota_exceeded {
+                return Err(anyhow!("扩展屏数量已达上限"));
+            }
         } else {
             // Immediately pause hardware capture if all viewers are already hidden or host is lock-paused.
             self.sync_capture_pause_states();
@@ -1015,10 +1078,16 @@ impl SessionRegistry {
             let standalone = self.standalone_web_capture.lock().unwrap();
             let map = self.sessions.lock().unwrap();
             let mut subs = self.web_subscribers.lock().unwrap();
-            // Re-check lock-disconnect admission INSIDE `web_subscribers` lock so admission is
-            // totally ordered against `kick_all_web_viewers()` (P1-A2 / NoConnectedWhenDisconnectEnforced).
+            // Re-check lock-disconnect, low_power, and live `max_web_viewers` INSIDE `web_subscribers`
+            // lock so admission is totally ordered against `kick_all_web_viewers()` and `set_low_power(true)`!
             if self.is_web_lock_disconnect_admit_blocked() {
                 return Err(anyhow!("host screen is locked (on_lock_web=disconnect)"));
+            }
+            let max_viewers = self.max_web_viewers();
+            if max_viewers == 0 || self.is_low_power() {
+                return Err(anyhow!(
+                    "网页观看已关闭（当前网页观看上限为 0，请在管理后台「网页扩展屏配置」调大观看上限）"
+                ));
             }
             if subs.len() >= max_viewers {
                 // If the same authenticated browser session is reconnecting/switching tabs before
@@ -1055,7 +1124,7 @@ impl SessionRegistry {
                 };
                 if let Some(idx) = same_idx {
                     let old = subs.remove(idx);
-                    old.tx.close();
+                    old.kick();
                 }
             }
             if subs.len() >= max_viewers {
@@ -1088,6 +1157,7 @@ impl SessionRegistry {
                 connected_at: Instant::now(),
                 visible: Arc::new(AtomicBool::new(true)),
                 tx,
+                unblock_io: None,
             });
             want_standalone
         };
@@ -1098,8 +1168,12 @@ impl SessionRegistry {
 
         if use_standalone {
             if let Err(e) = self.ensure_standalone_web_capture() {
-                let mut subs = self.web_subscribers.lock().unwrap();
-                subs.retain(|s| s.id != sub_id);
+                {
+                    let mut subs = self.web_subscribers.lock().unwrap();
+                    subs.retain(|s| s.id != sub_id);
+                }
+                self.stop_standalone_web_capture_if_no_viewers();
+                self.sync_capture_pause_states();
                 return Err(e);
             }
         }

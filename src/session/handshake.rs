@@ -120,10 +120,14 @@ impl SessionRegistry {
             if let Some(existing) = map.get(&key) {
                 if existing.authorized {
                     // Protect a live streaming session from unauthenticated same-IP hijack, while
-                    // allowing immediate reconnect if the prior TCP socket closed cleanly or during wake grace.
+                    // allowing immediate reconnect if either TCP socket closed cleanly or during wake grace.
                     let active_stream = !in_wake
                         && existing.capture.is_some()
                         && !existing.telemetry_writer.is_peer_closed()
+                        && !existing
+                            .data_writer
+                            .as_ref()
+                            .is_some_and(|dw| dw.is_peer_closed())
                         && existing.last_activity.elapsed() < Duration::from_secs(3);
                     if active_stream {
                         warn!(
@@ -173,6 +177,8 @@ impl SessionRegistry {
                     flow: Arc::new(FlowControl::new(self.initial_session_max_in_flight())),
                     udp_cursor_enabled: Arc::new(AtomicBool::new(!is_usb)),
                     stream_paused: Arc::new(AtomicBool::new(false)),
+                    mouse_left_down: None,
+                    suppress_right_click_tail: false,
                     capture: None,
                 },
             );
@@ -223,6 +229,8 @@ impl SessionRegistry {
                     flow: Arc::new(FlowControl::new(self.initial_session_max_in_flight())),
                     udp_cursor_enabled: Arc::new(AtomicBool::new(false)),
                     stream_paused: Arc::new(AtomicBool::new(false)),
+                    mouse_left_down: None,
+                    suppress_right_click_tail: false,
                     capture: None,
                 },
             );
@@ -815,9 +823,11 @@ impl SessionRegistry {
         // be declined immediately after. Same-fingerprint reconnects still proceed so they can
         // supersede their own stale session once authorized.
         {
+            // Hold `standalone_web_capture` lock across `sessions` lock (canonical lock order)
+            // so concurrent Independent Web start_capture and iPad handshake cannot both bypass `max_extended_screens`.
+            let standalone_guard = self.standalone_web_capture.lock().unwrap();
             let standalone_web_n = usize::from(
-                self.is_web_independent_screen()
-                    && self.standalone_web_capture.lock().unwrap().is_some(),
+                self.is_web_independent_screen() && standalone_guard.is_some(),
             );
             let map = self.sessions.lock().unwrap();
             let max_ext = self.max_extended_screens();
@@ -895,10 +905,10 @@ impl SessionRegistry {
         // Enforce `max_extended_screens` on authorized sessions (allowing the same device to
         // supersede its own previous session across Wi-Fi/USB or DHCP IP changes).
         let (tel_writer, data_port, superseded) = {
-            // Consistent lock order: `standalone_web_capture` -> `sessions`.
+            // Consistent lock order: `standalone_web_capture` -> `sessions` (held together to prevent quota lock-gap).
+            let standalone_guard = self.standalone_web_capture.lock().unwrap();
             let standalone_web_n = usize::from(
-                self.is_web_independent_screen()
-                    && self.standalone_web_capture.lock().unwrap().is_some(),
+                self.is_web_independent_screen() && standalone_guard.is_some(),
             );
             let mut map = self.sessions.lock().unwrap();
             let max_ext = self.max_extended_screens();
@@ -1033,7 +1043,11 @@ impl SessionRegistry {
             warn!("[{key}] OrientationChange had unparseable param: {param:?}");
             return Ok(());
         };
-        let (new_w, new_h, eff_vs, eff_edge, handle_opt) = {
+        if !(0..=4).contains(&orientation) {
+            debug!("[{key}] Ignoring non-interface OrientationChange={orientation} (FaceUp/FaceDown/unknown)");
+            return Ok(());
+        }
+        let (new_w, new_h, eff_vs, eff_edge, handle_opt, geometry_changed) = {
             let mut map = self.sessions.lock().unwrap();
             let Some(sess) = map
                 .get_mut(key)
@@ -1044,13 +1058,22 @@ impl SessionRegistry {
             let Some(hs) = sess.handshake.as_mut() else {
                 return Ok(());
             };
-            hs.orientation = orientation;
             let eff_vs = self.effective_video_for_fingerprint(sess.fingerprint.as_deref());
+            let (prev_w, prev_h) = Self::resolve_dimensions_for_settings(hs, &eff_vs, self.backend.supports_hidpi());
+            let prev_edge = Self::effective_ipad_max_pixel_edge(hs, &eff_vs);
+            hs.orientation = orientation;
             let (w, h) = Self::resolve_dimensions_for_settings(hs, &eff_vs, self.backend.supports_hidpi());
             let edge = Self::effective_ipad_max_pixel_edge(hs, &eff_vs);
+            let changed = (w, h, edge) != (prev_w, prev_h, prev_edge);
             let hdl = sess.capture.as_ref().map(|c| c.handle.clone());
-            (w, h, eff_vs, edge, hdl)
+            (w, h, eff_vs, edge, hdl, changed)
         };
+        if !geometry_changed {
+            debug!(
+                "[{key}] OrientationChange -> {orientation} kept identical {new_w}x{new_h} (max_edge={eff_edge}); skipping no-op display reconfigure"
+            );
+            return Ok(());
+        }
         let eff_hidpi = if self.backend.supports_hidpi() { eff_vs.hidpi } else { 1 };
         info!(
             "[{key}] OrientationChange -> {orientation} ({}) -> reconfiguring display to {new_w}x{new_h} (max_edge={eff_edge})",
@@ -1279,24 +1302,31 @@ impl SessionRegistry {
             self.resume_standalone_web_capture_if_needed();
             return;
         }
-        let has_viewers = !self.web_subscribers.lock().unwrap().is_empty();
-        let has_ipad_capture = self
-            .sessions
-            .lock()
-            .unwrap()
-            .values()
-            .any(|s| s.capture.is_some());
-        if !has_viewers || has_ipad_capture {
-            if let Ok(mut g) = self.standalone_web_resume_after.lock() {
+        // Canonical lock order: `sessions` -> `web_subscribers` -> `standalone_web_resume_after`.
+        let scheduled = {
+            let map = self.sessions.lock().unwrap();
+            let subs = self.web_subscribers.lock().unwrap();
+            let has_ipad_capture = map.values().any(|s| s.capture.is_some());
+            let has_viewers = !subs.is_empty();
+            let mut g = self.standalone_web_resume_after.lock().unwrap();
+            if !has_viewers
+                || has_ipad_capture
+                || self.is_host_lock_paused_web()
+                || self.is_web_lock_disconnect_blocking()
+                || self.web_screen_mode() != crate::config::WebScreenMode::FollowIpad
+            {
                 *g = None;
+                false
+            } else {
+                let deadline = Instant::now() + grace;
+                if g.is_none_or(|cur| deadline < cur) {
+                    *g = Some(deadline);
+                }
+                true
             }
+        };
+        if !scheduled {
             return;
-        }
-        let deadline = Instant::now() + grace;
-        if let Ok(mut g) = self.standalone_web_resume_after.lock() {
-            if g.is_none_or(|cur| deadline < cur) {
-                *g = Some(deadline);
-            }
         }
         info!(
             "Deferring standalone Web virtual display fallback for {}s while awaiting iPad reconnect",
@@ -1366,7 +1396,10 @@ impl SessionRegistry {
                 dw.close();
             }
             sess.telemetry_writer.close();
+            let stuck_mouse = sess.mouse_left_down.take();
+            sess.suppress_right_click_tail = false;
             if let Some(mut cap) = sess.capture.take() {
+                Self::release_stuck_mouse_handle(&cap.handle, stuck_mouse);
                 cap.shutdown();
             }
             let was_follow_owner = self
@@ -1384,6 +1417,16 @@ impl SessionRegistry {
                 self.sync_capture_pause_states();
                 self.request_active_keyframes();
             }
+        }
+    }
+
+    /// True when the session no longer exists, its ID was superseded, or its Telemetry socket
+    /// has already been closed/reset by the peer (used to self-evict dead Wi-Fi/USB approval slots).
+    pub fn is_session_peer_closed(&self, key: &str, session_id: u64) -> bool {
+        let map = self.sessions.lock().unwrap();
+        match map.get(key) {
+            Some(sess) if sess.id == session_id => sess.telemetry_writer.is_peer_closed(),
+            _ => true,
         }
     }
 
@@ -1420,6 +1463,9 @@ impl SessionRegistry {
     pub fn close_all(&self) {
         // Kick Web viewers FIRST so closing iPad sessions never spuriously spawns and immediately
         // tears down a standalone virtual display during Ctrl-C / "disconnect all".
+        if let Ok(mut g) = self.standalone_web_resume_after.lock() {
+            *g = None;
+        }
         self.kick_all_web_viewers();
         self.close_all_ipad_sessions();
         self.stop_standalone_web_capture_if_no_viewers();

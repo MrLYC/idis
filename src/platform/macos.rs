@@ -112,7 +112,10 @@ extern "C" {
     );
     fn id_macos_inject_scroll(handle: *mut c_void, dx: f64, dy: f64);
     fn id_macos_inject_key_code(key_code: u16);
+    fn id_macos_inject_key_code_mods(key_code: u16, mods: u8);
     fn id_macos_inject_unicode(ch: u16);
+    fn id_macos_inject_unicode_mods(ch: u16, mods: u8);
+    fn id_macos_inject_text(units: *const u16, len: usize);
     fn id_macos_is_accessibility_trusted() -> i32;
     fn id_macos_is_screen_locked() -> i32;
     fn id_macos_pump_main_runloop();
@@ -133,6 +136,14 @@ extern "C" {
         handle: *mut c_void,
         video_w: u32,
         video_h: u32,
+        out_ptr: *mut *mut u8,
+        out_len: *mut usize,
+    ) -> i32;
+    fn id_macos_cursor_png_if_changed(
+        handle: *mut c_void,
+        video_w: u32,
+        video_h: u32,
+        in_out_hash: *mut u64,
         out_ptr: *mut *mut u8,
         out_len: *mut usize,
     ) -> i32;
@@ -471,6 +482,26 @@ impl CaptureHandle for MacCaptureHandle {
             InputEvent::KeyUnicode { ch } => {
                 unsafe { id_macos_inject_unicode(ch) };
             }
+            InputEvent::KeyText { ref text } => {
+                let mut units: Vec<u16> = text.encode_utf16().take(64).collect();
+                if units.last().is_some_and(|&u| (0xD800..=0xDBFF).contains(&u)) {
+                    units.pop();
+                }
+                if !units.is_empty() {
+                    unsafe { id_macos_inject_text(units.as_ptr(), units.len()) };
+                }
+            }
+            InputEvent::KeyModified {
+                key_code,
+                ch,
+                modifiers,
+            } => {
+                if let Some(kc) = key_code {
+                    unsafe { id_macos_inject_key_code_mods(kc, modifiers) };
+                } else if let Some(u) = ch {
+                    unsafe { id_macos_inject_unicode_mods(u, modifiers) };
+                }
+            }
             InputEvent::Scroll { dx, dy } => {
                 unsafe { id_macos_inject_scroll(self.ptr, dx, dy) };
             }
@@ -509,6 +540,26 @@ impl CaptureHandle for MacCaptureHandle {
         let mut len: usize = 0;
         let ok = unsafe { id_macos_cursor_png(self.ptr, vw, vh, &mut ptr, &mut len) };
         if ok != 0 && !ptr.is_null() && len > 0 {
+            let bytes = unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec();
+            unsafe { id_macos_free_bytes(ptr) };
+            Some(bytes)
+        } else {
+            None
+        }
+    }
+
+    fn cursor_image_png_if_changed(&self, last_hash: &mut u64) -> Option<Vec<u8>> {
+        if self.ptr.is_null() {
+            return None;
+        }
+        let (mut vw, mut vh) = (0u32, 0u32);
+        unsafe { id_macos_capture_size(self.ptr, &mut vw, &mut vh) };
+        let mut ptr: *mut u8 = std::ptr::null_mut();
+        let mut len: usize = 0;
+        let rc = unsafe {
+            id_macos_cursor_png_if_changed(self.ptr, vw, vh, last_hash, &mut ptr, &mut len)
+        };
+        if rc == 1 && !ptr.is_null() && len > 0 {
             let bytes = unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec();
             unsafe { id_macos_free_bytes(ptr) };
             Some(bytes)

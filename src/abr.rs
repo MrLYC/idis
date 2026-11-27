@@ -304,6 +304,7 @@ impl AbrController {
                 } else {
                     self.failed_up_probes = 0;
                 }
+                self.last_up_at = None;
                 self.tier += 1;
                 self.congested_streak = 0;
                 self.last_change = now;
@@ -313,10 +314,11 @@ impl AbrController {
         }
 
         self.congested_streak = 0;
-        // Clear failed-probe backoff once a step-up holds stably for >= 20s without congestion.
-        if self
-            .last_up_at
-            .is_some_and(|up_ts| now.saturating_duration_since(up_ts) > Duration::from_secs(20))
+        // Clear failed-probe backoff ONLY once a step-up actually held stably for > 20s without stepping down.
+        if self.last_up_at == Some(self.last_change)
+            && self
+                .last_up_at
+                .is_some_and(|up_ts| now.saturating_duration_since(up_ts) > Duration::from_secs(20))
         {
             self.failed_up_probes = 0;
         }
@@ -518,8 +520,10 @@ impl InFlightController {
             .windowed_min_rtt()
             .unwrap_or(if self.is_usb { 10.0 } else { 20.0 });
         let fps = target_fps.clamp(10, 120) as f64;
-        // Little's law pipeline depth from clean baseline RTT (+1 frame headroom for jitter).
-        let ideal = (((fps * (base_rtt_ms / 1000.0)).ceil() as u32) + 1).clamp(1, max_bound);
+        // Little's law pipeline depth from clean baseline RTT (+1 frame headroom for jitter),
+        // keeping healthy floor >= 2 (when max_bound >= 2) so a sub-ms LAN RTT never pins limit=1.
+        let min_healthy = 2.min(max_bound);
+        let ideal = (((fps * (base_rtt_ms / 1000.0)).ceil() as u32) + 1).clamp(min_healthy, max_bound);
 
         if self.limit < ideal {
             self.trim_streak = 0;

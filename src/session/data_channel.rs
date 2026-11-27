@@ -50,6 +50,7 @@ impl SessionRegistry {
             stream_paused,
             prev_capture,
             prev_dw,
+            prev_stuck_mouse,
         ) = {
             let mut map = self.sessions.lock().unwrap();
             let sess = map
@@ -72,6 +73,8 @@ impl SessionRegistry {
                 .ok_or_else(|| anyhow!("data channel arrived before Handshake for {key}"))?;
             let prev_capture = sess.capture.take();
             let prev_dw = sess.data_writer.replace(data_writer.clone());
+            let prev_stuck_mouse = sess.mouse_left_down.take();
+            sess.suppress_right_click_tail = false;
             sess.data_generation = data_gen;
             sess.flow.reset_in_flight();
             sess.stream_paused.store(false, Ordering::Release);
@@ -88,15 +91,29 @@ impl SessionRegistry {
                 sess.stream_paused.clone(),
                 prev_capture,
                 prev_dw,
+                prev_stuck_mouse,
             )
         };
-        // Close old socket FIRST (lock-free shutdown) so any blocked writer thread wakes immediately
-        // before `prev.shutdown()` joins it.
+        // Close old socket FIRST (lock-free shutdown), release any stuck mouse button, join old
+        // capture threads, and release FollowIpad ownership before starting the replacement capture.
         if let Some(old_dw) = prev_dw {
             old_dw.close();
         }
         if let Some(mut prev) = prev_capture {
+            Self::release_stuck_mouse_handle(&prev.handle, prev_stuck_mouse);
             prev.shutdown();
+            if self
+                .web_follow_ipad_session_id
+                .compare_exchange(session_id, 0, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                if self.web_screen_mode() == crate::config::WebScreenMode::FollowIpad {
+                    self.bump_web_source_epoch();
+                }
+                if let Ok(mut lf) = self.last_ipad_web_frame.lock() {
+                    *lf = None;
+                }
+            }
         }
         // Cancel any pending follow-iPad standalone Web fallback grace timer and stop standalone Web
         // capture before starting the iPad capture so both pipelines never interleave frames.
@@ -176,12 +193,16 @@ impl SessionRegistry {
                     let mut map = self.sessions.lock().unwrap();
                     map.get_mut(key)
                         .filter(|s| s.id == session_id && s.data_generation == data_gen)
-                        .and_then(|s| s.data_writer.take())
+                        .and_then(|s| {
+                            s.data_detached_at = Some(Instant::now());
+                            s.data_writer.take()
+                        })
                 };
                 if let Some(dw) = failed_dw {
                     dw.close();
                 }
                 self.resume_standalone_web_capture_if_needed();
+                self.sync_capture_pause_states();
                 return Err(e);
             }
         };
@@ -265,6 +286,7 @@ impl SessionRegistry {
             let mut last_video_gen = video_gen_v.load(Ordering::Acquire);
             let mut abr_win_start = Instant::now();
             let mut abr_win_sent: u64 = 0;
+            let mut abr_win_flow_blocked: u64 = 0;
             let mut abr_win_send_ms_sum: u64 = 0;
             let mut abr_win_max_send_ms: u64 = 0;
             let mut abr_prev_drops_total: u64 = flow_v.dropped_frames();
@@ -670,6 +692,7 @@ impl SessionRegistry {
                     };
                     if !flow_v.try_acquire_send_no_drop_count() {
                         // Hold consecutive P-frames so once an ACK wakes us, the intact chain drains smoothly!
+                        abr_win_flow_blocked = abr_win_flow_blocked.saturating_add(1);
                         break;
                     }
                     pending_queue.pop_front();
@@ -856,7 +879,7 @@ impl SessionRegistry {
                         avg_send_ms,
                         max_send_ms: abr_win_max_send_ms,
                         avg_ack_rtt_ms: rtt_ms,
-                        in_flight_saturated: limit > 0 && flow_v.in_flight() >= limit,
+                        in_flight_saturated: limit > 0 && abr_win_flow_blocked > 0,
                     };
 
                     let abr_active = supports_live_abr_v && cur_vs.adaptive_quality;
@@ -1010,6 +1033,7 @@ impl SessionRegistry {
 
                     abr_win_start = now;
                     abr_win_sent = 0;
+                    abr_win_flow_blocked = 0;
                     abr_win_send_ms_sum = 0;
                     abr_win_max_send_ms = 0;
                 }
@@ -1083,7 +1107,7 @@ impl SessionRegistry {
             let size_c = actual_size.clone();
             Some(thread::spawn(move || {
                 let mut prev: Option<CursorState> = None;
-                let mut prev_png: Option<Vec<u8>> = None;
+                let mut prev_png_hash: u64 = 0;
                 let mut prev_stream_size: (u32, u32) = (0, 0);
                 let mut tick: u32 = 0;
                 let mut udp_err_streak: u32 = 0;
@@ -1104,7 +1128,7 @@ impl SessionRegistry {
                         if was_enabled {
                             was_enabled = false;
                             prev = None;
-                            prev_png = None;
+                            prev_png_hash = 0;
                             if let Some((ref sock, target)) = udp_sock {
                                 if udp_flag.load(Ordering::Acquire) {
                                     let hide_pkt = build_udp_cursor_position_packet(0, 0, false);
@@ -1123,7 +1147,7 @@ impl SessionRegistry {
                     if !was_enabled {
                         was_enabled = true;
                         prev = None;
-                        prev_png = None;
+                        prev_png_hash = 0;
                         if let Some((_, addr)) = &udp_sock {
                             info!("[{key_c}] Enabled 120Hz ultra-low-latency UDP cursor channel -> {addr}");
                         }
@@ -1141,37 +1165,37 @@ impl SessionRegistry {
                         let size_changed = cur_stream_size != prev_stream_size;
                         let mut png_updated = false;
 
-                        // Poll cursor PNG on first visibility, stream resolution/ABR change, or every 16 ticks (~128ms).
-                        if c.visible
-                            && (prev_png.is_none() || size_changed || tick.is_multiple_of(16))
+                        // Poll cursor PNG only when Telemetry cursor is supported, on first
+                        // visibility, stream resolution/ABR change, or every 16 ticks (~128ms).
+                        if supports_tel_cursor
+                            && c.visible
+                            && (prev_png_hash == 0 || size_changed || tick.is_multiple_of(16))
                         {
                             prev_stream_size = cur_stream_size;
-                            let png = hdl_c.lock().ok().and_then(|g| g.cursor_image_png());
+                            let png = hdl_c
+                                .lock()
+                                .ok()
+                                .and_then(|g| g.cursor_image_png_if_changed(&mut prev_png_hash));
                             if let Some(img) = png {
-                                if prev_png.as_deref() != Some(img.as_slice()) {
-                                    let img_len = img.len();
-                                    if let Ok(bytes) =
-                                        build_cursor_image_packet(img.clone()).encode()
-                                    {
-                                        if tw_c.send_frame(&bytes).is_err() {
-                                            break;
-                                        }
-                                    }
-                                    debug!(
-                                        "[{key_c}] Sent ChangeCursorImage ({img_len}B PNG, stream={}x{})",
-                                        cur_stream_size.0, cur_stream_size.1
-                                    );
-                                    prev_png = Some(img);
-                                    png_updated = true;
-                                    // Re-query cursor position once so the hotspot offset matches the newly pushed PNG.
-                                    if let Some(fresh) =
-                                        hdl_c.lock().ok().and_then(|g| g.query_cursor())
-                                    {
-                                        c = fresh;
+                                let img_len = img.len();
+                                if let Ok(bytes) = build_cursor_image_packet(img).encode() {
+                                    if tw_c.send_frame(&bytes).is_err() {
+                                        break;
                                     }
                                 }
-                            } else if prev_png.is_none() {
-                                debug!("[{key_c}] cursor_image_png() returned None while cursor visible");
+                                debug!(
+                                    "[{key_c}] Sent ChangeCursorImage ({img_len}B PNG, stream={}x{})",
+                                    cur_stream_size.0, cur_stream_size.1
+                                );
+                                png_updated = true;
+                                // Re-query cursor position once so the hotspot offset matches the newly pushed PNG.
+                                if let Some(fresh) =
+                                    hdl_c.lock().ok().and_then(|g| g.query_cursor())
+                                {
+                                    c = fresh;
+                                }
+                            } else if prev_png_hash == 0 {
+                                debug!("[{key_c}] cursor_image_png_if_changed() returned None while cursor visible");
                             }
                         }
 
@@ -1284,8 +1308,12 @@ impl SessionRegistry {
             prev.shutdown();
         }
         if let Some(mut orphan) = active {
+            data_writer.close();
             orphan.shutdown();
-            self.resume_standalone_web_capture_if_needed();
+            self.schedule_standalone_web_resume_after(Duration::from_secs(6));
+            return Err(anyhow!(
+                "data channel attachment superseded or closed during start_capture"
+            ));
         } else {
             // Re-sync OS cursor visibility in case `client_cursor` was toggled during blocking `start_capture()` (P2-B3).
             let want_show_cursor = !self.is_client_cursor();
@@ -1315,32 +1343,77 @@ impl SessionRegistry {
         Ok((session_id, data_gen))
     }
 
+    /// Synthesize a safety `MouseUp` outside `self.sessions` lock so an abrupt disconnect,
+    /// screen lock, or view-only switch mid-drag never leaves the host left mouse button stuck.
+    pub(super) fn release_stuck_mouse_handle(
+        handle: &super::flow_control::SharedCaptureHandle,
+        pos: Option<(f64, f64)>,
+    ) {
+        if let Some((x, y)) = pos {
+            if let Ok(g) = handle.lock() {
+                let _ = g.inject_input(&crate::protocol::messages::InputEvent::MouseUp {
+                    x,
+                    y,
+                    double_click: false,
+                });
+            }
+        }
+    }
+
+    /// Release any held left mouse buttons across all active iPad sessions (used when toggling
+    /// view-only or pausing iPad input on host screen lock).
+    pub(super) fn release_all_stuck_mouse_buttons(&self) {
+        let pending: Vec<(super::flow_control::SharedCaptureHandle, (f64, f64))> = {
+            let mut map = self.sessions.lock().unwrap();
+            let mut out = Vec::new();
+            for sess in map.values_mut() {
+                sess.suppress_right_click_tail = false;
+                if let Some(pos) = sess.mouse_left_down.take() {
+                    if let Some(ref cap) = sess.capture {
+                        out.push((cap.handle.clone(), pos));
+                    }
+                }
+            }
+            out
+        };
+        for (hdl, pos) in pending {
+            Self::release_stuck_mouse_handle(&hdl, Some(pos));
+        }
+    }
+
     /// Detach a session's Data channel & capture only if both `session_id` and `data_generation`
     /// still match (preserves healthy Telemetry so legacy iDisplay can reopen Data on resume/blip).
     pub fn close_data_attachment_if_match(&self, key: &str, session_id: u64, data_gen: u64) {
-        let (cap_opt, dw_opt) = {
+        let (cap_opt, dw_opt, stuck_mouse) = {
             let mut map = self.sessions.lock().unwrap();
             if let Some(sess) = map
                 .get_mut(key)
                 .filter(|s| s.id == session_id && s.data_generation == data_gen)
             {
                 sess.data_detached_at = Some(Instant::now());
-                (sess.capture.take(), sess.data_writer.take())
+                sess.suppress_right_click_tail = false;
+                (
+                    sess.capture.take(),
+                    sess.data_writer.take(),
+                    sess.mouse_left_down.take(),
+                )
             } else {
-                (None, None)
+                (None, None, None)
             }
         };
         let detached = cap_opt.is_some() || dw_opt.is_some();
         if detached {
             self.record_external_activity();
         }
-        // Close socket and join capture/writer threads BEFORE releasing `web_follow_ipad_session_id`,
-        // bumping `web_source_epoch`, and clearing `last_ipad_web_frame` so the dying iPad thread
-        // can NEVER re-claim ownership or poison the cache under the new epoch (Iter-8 P1-B2).
+        // Close socket and release any stuck mouse button + join capture/writer threads BEFORE
+        // releasing `web_follow_ipad_session_id`, bumping `web_source_epoch`, and clearing
+        // `last_ipad_web_frame` so the dying iPad thread can NEVER re-claim ownership or poison
+        // the cache under the new epoch (Iter-8 P1-B2).
         if let Some(dw) = dw_opt {
             dw.close();
         }
         if let Some(mut cap) = cap_opt {
+            Self::release_stuck_mouse_handle(&cap.handle, stuck_mouse);
             cap.shutdown();
         }
         let mut was_follow_owner = false;
@@ -1393,6 +1466,9 @@ impl SessionRegistry {
             sess.last_activity = Instant::now();
             sess.capture.as_ref().map(|c| c.handle.clone())
         };
+        if handle_opt.is_none() {
+            return Ok(());
+        }
         self.input_counters.received.fetch_add(1, Ordering::Relaxed);
         if self.host_lock_paused_ipad.load(Ordering::Acquire)
             || self.is_ipad_lock_disconnect_blocking()
@@ -1495,10 +1571,64 @@ impl SessionRegistry {
                     continue;
                 }
             };
-            if let Some(ref hdl) = handle_opt {
-                if let Ok(g) = hdl.lock() {
-                    g.inject_input(&event)?;
-                    self.input_counters.injected.fetch_add(1, Ordering::Relaxed);
+            let should_inject = {
+                let mut map = self.sessions.lock().unwrap();
+                if !self.is_input_allowed()
+                    || self.host_lock_paused_ipad.load(Ordering::Acquire)
+                    || self.is_ipad_lock_disconnect_blocking()
+                {
+                    false
+                } else if let Some(sess) = map.get_mut(key).filter(|s| {
+                    expected_session_id.is_none_or(|eid| s.id == eid)
+                        && expected_data_gen.is_none_or(|dg| s.data_generation == dg)
+                }) {
+                    match &event {
+                        crate::protocol::messages::InputEvent::MouseDown {
+                            x,
+                            y,
+                            right_click,
+                            ..
+                        } => {
+                            if *right_click {
+                                sess.suppress_right_click_tail = true;
+                                sess.mouse_left_down = None;
+                            } else {
+                                sess.suppress_right_click_tail = false;
+                                sess.mouse_left_down = Some((*x, *y));
+                            }
+                            true
+                        }
+                        crate::protocol::messages::InputEvent::MouseDragged { x, y } => {
+                            if sess.suppress_right_click_tail {
+                                false
+                            } else {
+                                if sess.mouse_left_down.is_some() {
+                                    sess.mouse_left_down = Some((*x, *y));
+                                }
+                                true
+                            }
+                        }
+                        crate::protocol::messages::InputEvent::MouseUp { .. } => {
+                            if sess.suppress_right_click_tail {
+                                sess.suppress_right_click_tail = false;
+                                false
+                            } else {
+                                sess.mouse_left_down = None;
+                                true
+                            }
+                        }
+                        _ => true,
+                    }
+                } else {
+                    false
+                }
+            };
+            if should_inject {
+                if let Some(ref hdl) = handle_opt {
+                    if let Ok(g) = hdl.lock() {
+                        g.inject_input(&event)?;
+                        self.input_counters.injected.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }
         }
@@ -1515,6 +1645,8 @@ pub(super) fn extract_bplist_payloads(bytes: &[u8]) -> Vec<&[u8]> {
         return vec![bytes];
     }
     // Try coalesced `[u32_le len][bplist...]` and `[u32_be len][bplist...]` streams.
+    // If a trailing coalesced chunk is truncated, preserve any already-validated leading chunks.
+    let mut best_prefix: Vec<&[u8]> = Vec::new();
     for big_endian in [false, true] {
         let mut out = Vec::new();
         let mut off = 0usize;
@@ -1538,6 +1670,12 @@ pub(super) fn extract_bplist_payloads(bytes: &[u8]) -> Vec<&[u8]> {
         if ok && off == bytes.len() && !out.is_empty() {
             return out;
         }
+        if out.len() > best_prefix.len() {
+            best_prefix = out;
+        }
+    }
+    if !best_prefix.is_empty() {
+        return best_prefix;
     }
     // Fallback: locate an embedded `bplist` marker after a small (<=32B) transport header.
     let scan_limit = bytes.len().min(38);

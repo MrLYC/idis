@@ -146,21 +146,22 @@ impl SessionRegistry {
         } else {
             720
         };
-        {
+        let shutdown_epoch = {
             let list = self.standalone_virtual_displays.lock().unwrap();
             if list.len() >= MAX_STANDALONE_VIRTUAL_DISPLAYS {
                 return Err(anyhow!(
                     "临时虚拟屏数量已达上限（最多 {MAX_STANDALONE_VIRTUAL_DISPLAYS} 块）"
                 ));
             }
-        }
+            self.virtual_display_shutdown_epoch.load(Ordering::Acquire)
+        };
         let seq = self
             .next_virtual_display_id
             .fetch_add(1, Ordering::AcqRel);
         let name = sanitize_virtual_display_name(raw_name, seq);
         let serial_num = 0x4944_8000u32.wrapping_add((seq as u32) & 0x7FFF);
 
-        let handle = self
+        let mut handle = self
             .backend
             .create_standalone_virtual_display(&name, w, h, serial_num)?;
         let display_id = handle.display_id();
@@ -175,12 +176,17 @@ impl SessionRegistry {
         };
         {
             let mut list = self.standalone_virtual_displays.lock().unwrap();
-            if list.len() >= MAX_STANDALONE_VIRTUAL_DISPLAYS {
+            let epoch_changed =
+                self.virtual_display_shutdown_epoch.load(Ordering::Acquire) != shutdown_epoch;
+            if epoch_changed || list.len() >= MAX_STANDALONE_VIRTUAL_DISPLAYS {
                 drop(list);
+                handle.stop();
                 drop(handle);
-                return Err(anyhow!(
-                    "临时虚拟屏数量已达上限（最多 {MAX_STANDALONE_VIRTUAL_DISPLAYS} 块）"
-                ));
+                return Err(anyhow!(if epoch_changed {
+                    "临时虚拟屏创建期间触发了全量关闭，已自动清理"
+                } else {
+                    "临时虚拟屏数量已达上限（最多 4 块）"
+                }));
             }
             list.push(StandaloneVirtualDisplayEntry {
                 id: seq,
@@ -224,6 +230,8 @@ impl SessionRegistry {
     pub fn shutdown_all_virtual_displays(&self) {
         let entries: Vec<StandaloneVirtualDisplayEntry> = {
             let mut list = self.standalone_virtual_displays.lock().unwrap();
+            self.virtual_display_shutdown_epoch
+                .fetch_add(1, Ordering::AcqRel);
             std::mem::take(&mut *list)
         };
         for mut entry in entries {

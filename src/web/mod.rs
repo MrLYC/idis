@@ -52,6 +52,40 @@ pub mod fuzz_hooks {
         let mut cursor = Cursor::new(raw);
         http::read_ws_control_frame(&mut cursor)
     }
+
+    pub fn read_http_request_with_deadline(
+        stream: &std::net::TcpStream,
+        deadline: Instant,
+    ) -> anyhow::Result<Option<ParsedHttpRequest>> {
+        let req = http::read_http_request_with_deadline(stream, deadline)?;
+        Ok(req.map(|r| (r.method, r.path, r.headers, r.body)))
+    }
+
+    pub fn read_ws_control_frame_with_deadline(
+        stream: &mut std::net::TcpStream,
+        idle_timeout: Duration,
+        frame_deadline: Duration,
+    ) -> std::io::Result<Option<(u8, Vec<u8>)>> {
+        http::read_ws_control_frame_deadline(stream, idle_timeout, frame_deadline)
+    }
+
+    pub fn write_ws_frame_with_deadline<W: std::io::Write>(
+        writer: &mut W,
+        opcode: u8,
+        payload: &[u8],
+        deadline: Instant,
+    ) -> std::io::Result<()> {
+        http::write_ws_frame_with_deadline(writer, opcode, payload, deadline)
+    }
+
+    pub fn write_ws_frame_tcp_with_deadline(
+        stream: &mut std::net::TcpStream,
+        opcode: u8,
+        payload: &[u8],
+        deadline: Instant,
+    ) -> std::io::Result<()> {
+        http::write_ws_frame_tcp_deadline(stream, opcode, payload, deadline)
+    }
 }
 use routes::handle_connection;
 use serde::Serialize;
@@ -136,6 +170,9 @@ struct WebState {
     admin_token: Option<String>,
     admin_token_explicit: bool,
     view_token: Mutex<Option<String>>,
+    /// Monotonic generation bumped on every `set_view_token` rotation/disable so in-flight
+    /// `?token=` WebSockets and logins can never survive token rotation.
+    view_token_gen: AtomicU64,
     admin_sessions: Mutex<HashMap<String, u64>>,
     viewer_sessions: Mutex<HashMap<String, u64>>,
     web_once_approved: Mutex<HashMap<String, u64>>,
@@ -255,6 +292,7 @@ impl WebState {
         sid
     }
 
+    #[cfg(test)]
     fn create_viewer_session(&self) -> String {
         let sid = generate_random_hex(24);
         let now = unix_now_secs();
@@ -310,16 +348,64 @@ impl WebState {
         }
     }
 
+    /// Atomically verify `candidate` against `view_token` and mint a viewer session cookie
+    /// under `view_token.lock()` so a concurrent `set_view_token` rotation can never let a stale
+    /// passcode insert a surviving session after `viewer_sessions.clear()`.
+    pub(super) fn login_viewer_with_token(
+        &self,
+        candidate: &str,
+        old_cookie: Option<&str>,
+    ) -> Option<String> {
+        let tok_guard = self.view_token.lock().unwrap();
+        let expected = tok_guard.as_deref()?;
+        if !http::ct_eq(candidate, expected) {
+            return None;
+        }
+        let sid = generate_random_hex(24);
+        let now = unix_now_secs();
+        let ttl = SESSION_TTL.as_secs();
+        let mut map = self.viewer_sessions.lock().unwrap();
+        if let Some(old) = old_cookie {
+            map.remove(old);
+        }
+        map.retain(|_, created| now.saturating_sub(*created) < ttl);
+        if map.len() >= MAX_ACTIVE_SESSIONS {
+            if let Some(oldest_key) = map
+                .iter()
+                .min_by_key(|(_, ts)| **ts)
+                .map(|(k, _)| k.clone())
+            {
+                map.remove(&oldest_key);
+            }
+        }
+        map.insert(sid.clone(), now);
+        Some(sid)
+    }
+
+    /// Verify a `?token=` candidate under `view_token.lock()` and return the matched `view_token_gen`.
+    pub(super) fn verify_view_token_with_gen(&self, candidate: &str) -> Option<u64> {
+        let tok_guard = self.view_token.lock().unwrap();
+        let expected = tok_guard.as_deref()?;
+        if http::ct_eq(candidate, expected) {
+            Some(self.view_token_gen.load(Ordering::Acquire))
+        } else {
+            None
+        }
+    }
+
     fn set_view_token(self: &Arc<Self>, new_token: Option<String>) {
         let cleaned = new_token
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
-        *self.view_token.lock().unwrap() = cleaned;
-        // Rotating or disabling the viewer passcode immediately invalidates all viewer sessions,
-        // cancels any in-flight Web viewer approvals, kicks active streams (P1-C1), and opens or
-        // closes the dedicated 0.0.0.0 Web Viewer listener accordingly.
-        self.viewer_sessions.lock().unwrap().clear();
-        self.web_once_approved.lock().unwrap().clear();
+        {
+            let mut tok_guard = self.view_token.lock().unwrap();
+            *tok_guard = cleaned;
+            self.view_token_gen.fetch_add(1, Ordering::AcqRel);
+            // Invalidate viewer sessions & one-time approvals BEFORE releasing `view_token` lock
+            // so `login_viewer_with_token` is totally ordered against rotation!
+            self.viewer_sessions.lock().unwrap().clear();
+            self.web_once_approved.lock().unwrap().clear();
+        }
         self.cancel_pending_web_approvals(None);
         self.registry.kick_all_web_viewers();
         self.sync_viewer_listener();
@@ -398,6 +484,7 @@ impl WebState {
         let _op_guard = self.viewer_listener_op_lock.lock().unwrap();
         let want_open = !self.stopping.load(Ordering::SeqCst)
             && !self.global_stop.load(Ordering::SeqCst)
+            && !self.registry.is_low_power()
             && self.registry.max_web_viewers() > 0
             && self.view_token.lock().unwrap().is_some();
 
@@ -585,7 +672,13 @@ impl WebState {
     }
 
     fn enqueue_pending_approval(&self, device: &PendingDevice) -> ConfirmDecision {
-        self.enqueue_pending_approval_with_liveness(device, || false)
+        self.enqueue_pending_approval_with_liveness(device, || {
+            !device.is_web
+                && device.session_id != 0
+                && self
+                    .registry
+                    .is_session_peer_closed(&device.addr, device.session_id)
+        })
     }
 
     /// Enqueue a pending connection approval and wait until the admin decides, the 60s timeout
@@ -596,6 +689,9 @@ impl WebState {
         device: &PendingDevice,
         is_peer_closed: impl Fn() -> bool,
     ) -> ConfirmDecision {
+        if self.stopping.load(Ordering::Acquire) || self.global_stop.load(Ordering::Acquire) {
+            return ConfirmDecision::Deny;
+        }
         let id = self.next_approval_id.fetch_add(1, Ordering::Relaxed);
         let pair = Arc::new((Mutex::new(None), Condvar::new()));
         let tty_prompted = std::io::stdin().is_terminal();
@@ -679,7 +775,10 @@ impl WebState {
             if elapsed >= PENDING_APPROVAL_TIMEOUT {
                 break;
             }
-            if is_peer_closed() {
+            if self.stopping.load(Ordering::Acquire)
+                || self.global_stop.load(Ordering::Acquire)
+                || is_peer_closed()
+            {
                 peer_gone = true;
                 break;
             }
@@ -849,18 +948,22 @@ impl WebServerHandle {
     pub fn stop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
         self.state.registry.notify_lifecycle_wakeup();
-        if let Some(t) = self.idle_thread.take() {
-            let _ = t.join();
-        }
-        self.state.sync_viewer_listener();
-        self.state.wifi_controller.stop();
+        // 1) Wake & join Admin accept thread FIRST so no new Admin HTTP settings requests can
+        //    re-open Wi-Fi or Viewer listeners after we stop them.
         self.wake.wake();
         #[cfg(not(unix))]
         crate::transport::wake_blocking_listener_addr(self.addr);
-        self.state.cancel_pending_approvals(None, None);
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
+        if let Some(t) = self.idle_thread.take() {
+            let _ = t.join();
+        }
+        // 2) Close Viewer & Wi-Fi listeners and abort any in-flight approvals / Web viewers.
+        self.state.sync_viewer_listener();
+        self.state.wifi_controller.stop();
+        self.state.cancel_pending_approvals(None, None);
+        self.state.registry.kick_all_web_viewers();
     }
 }
 
@@ -952,6 +1055,7 @@ pub fn start_web_server_with_listener(
         admin_token: admin_token.clone(),
         admin_token_explicit: admin_token.is_some() && !admin_token_generated,
         view_token: Mutex::new(view_token),
+        view_token_gen: AtomicU64::new(1),
         admin_sessions: Mutex::new(HashMap::new()),
         viewer_sessions: Mutex::new(HashMap::new()),
         web_once_approved: Mutex::new(HashMap::new()),
@@ -966,13 +1070,21 @@ pub fn start_web_server_with_listener(
         p2p: Arc::new(P2pRelayHub::new(registry.is_p2p_relay_enabled())),
     });
 
-    // Wire Web Admin approval queue, cancellation hook & dynamic Viewer listener lifecycle hook into SessionRegistry!
+    // Wire Web Admin approval queue, cancellation hook & dynamic Viewer listener lifecycle hook into SessionRegistry
+    // using Weak references so `SessionRegistry <-> WebState` never forms a permanent Arc cycle.
     {
-        let st = state.clone();
-        registry.set_confirm_handler(Arc::new(move |dev| st.enqueue_pending_approval(dev)));
-        let st_cancel = state.clone();
+        let st_weak = Arc::downgrade(&state);
+        registry.set_confirm_handler(Arc::new(move |dev| {
+            st_weak
+                .upgrade()
+                .map(|st| st.enqueue_pending_approval(dev))
+                .unwrap_or(ConfirmDecision::Deny)
+        }));
+        let st_cancel_weak = Arc::downgrade(&state);
         registry.set_cancel_pending_handler(Arc::new(move |sid, addr| {
-            st_cancel.cancel_pending_approvals(sid, addr);
+            if let Some(st) = st_cancel_weak.upgrade() {
+                st.cancel_pending_approvals(sid, addr);
+            }
         }));
         let st_viewer_weak = Arc::downgrade(&state);
         registry.set_web_viewer_limit_handler(Arc::new(move |_max_viewers| {

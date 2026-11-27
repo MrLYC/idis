@@ -184,13 +184,12 @@ fn main() -> Result<()> {
         ctrlc::set_handler(move || {
             let n = ctrlc_hits.fetch_add(1, Ordering::SeqCst) + 1;
             if n >= 2 {
-                eprintln!("\nReceived second Ctrl-C — forcing immediate exit.");
                 std::process::exit(130);
             }
-            eprintln!("\nShutting down... (press Ctrl-C again to force quit)");
-            info!("Received Ctrl-C, shutting down... (press Ctrl-C again to force quit)");
             stop_sig.store(true, Ordering::SeqCst);
             reg_sig.notify_lifecycle_wakeup();
+            eprintln!("\nShutting down... (press Ctrl-C again to force quit)");
+            info!("Received Ctrl-C, shutting down... (press Ctrl-C again to force quit)");
         })?;
     }
     {
@@ -621,7 +620,8 @@ fn main() -> Result<()> {
         }
     }
 
-    registry.close_all();
+    // Stop all listeners/acceptors FIRST so no new connections, sessions, virtual displays,
+    // or config writes can be initiated while `registry.close_all()` tears down active state.
     if let Some(mut h) = web_handle.take() {
         h.stop();
     }
@@ -629,12 +629,13 @@ fn main() -> Result<()> {
     if let Some(mut h) = usb_handle.take() {
         h.stop();
     }
+    registry.close_all();
     debug_trace::record("lifecycle", "shutdown", serde_json::json!({}));
-    debug_trace::flush_global();
     if let Some(ref rec) = debug_recorder {
         info!("Debug trace saved to: {}", rec.path().display());
     }
     info!("Shutdown complete.");
+    debug_trace::flush_global();
     Ok(())
 }
 

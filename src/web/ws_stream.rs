@@ -1,10 +1,13 @@
-use super::http::{compute_ws_accept, read_ws_control_frame, send_json, send_response, write_ws_frame};
+use super::http::{
+    compute_ws_accept, read_ws_control_frame_deadline, send_json, send_response,
+    write_ws_frame_tcp_deadline,
+};
 use super::p2p::{self, MAX_SIGNAL_PAYLOAD_BYTES};
 use super::{unix_now_secs, WebState, SESSION_TTL};
 use crate::platform::RecvFrameError;
+use crate::protocol::framing::write_tcp_vectored_with_deadline;
 use anyhow::Result;
 use std::collections::HashMap;
-use std::io::Write;
 use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -19,7 +22,7 @@ pub(super) enum WsAuth {
     AdminCookie(String),
     ViewerCookie(String),
     LoopbackAdmin,
-    QueryViewToken,
+    QueryViewToken(u64),
 }
 
 /// Upgrade HTTP/1.1 connection to RFC 6455 WebSocket and stream extended display fMP4 frames.
@@ -44,9 +47,21 @@ pub(super) fn handle_ws_stream(
             b"missing Sec-WebSocket-Key",
         );
     };
+    if stop_a.load(Ordering::Acquire)
+        || stop_g.load(Ordering::Acquire)
+        || state.stopping.load(Ordering::Acquire)
+    {
+        return send_response(
+            &mut stream,
+            "503 Service Unavailable",
+            "text/plain",
+            &[],
+            b"server is shutting down",
+        );
+    }
     let session_tag = match &ws_auth {
         WsAuth::AdminCookie(tok) | WsAuth::ViewerCookie(tok) => Some(tok.clone()),
-        WsAuth::LoopbackAdmin | WsAuth::QueryViewToken => None,
+        WsAuth::LoopbackAdmin | WsAuth::QueryViewToken(_) => None,
     };
     let is_admin_ws = matches!(ws_auth, WsAuth::AdminCookie(_) | WsAuth::LoopbackAdmin);
     let sub = match state.registry.subscribe_web_stream_with_identity(
@@ -67,6 +82,36 @@ pub(super) fn handle_ws_stream(
             );
         }
     };
+    // Post-subscribe auth/approval/token-gen re-check BEFORE sending HTTP 101 so a concurrent
+    // `set_view_token` rotation/disable or `web_require_approval` flip can never slip past `kick_all_web_viewers`.
+    let post_sub_auth_ok = match &ws_auth {
+        WsAuth::AdminCookie(tok) => state.verify_admin_cookie(Some(tok)),
+        WsAuth::ViewerCookie(tok) => state.verify_viewer_cookie(Some(tok)),
+        WsAuth::LoopbackAdmin => true,
+        WsAuth::QueryViewToken(tok_gen) => {
+            state.view_token.lock().unwrap().is_some()
+                && state.view_token_gen.load(Ordering::Acquire) == *tok_gen
+        }
+    };
+    let post_sub_approval_ok =
+        is_admin_ws || state.is_web_viewer_approved(false, viewer_fingerprint.as_deref());
+    if !post_sub_auth_ok
+        || !post_sub_approval_ok
+        || state.registry.max_web_viewers() == 0
+        || state.registry.is_low_power()
+        || stop_a.load(Ordering::Acquire)
+        || stop_g.load(Ordering::Acquire)
+        || state.stopping.load(Ordering::Acquire)
+    {
+        drop(sub);
+        return send_response(
+            &mut stream,
+            "401 Unauthorized",
+            "text/plain",
+            &[],
+            b"viewer session revoked during upgrade",
+        );
+    }
     let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
     let accept = compute_ws_accept(ws_key);
     let upgrade_resp = format!(
@@ -75,8 +120,11 @@ pub(super) fn handle_ws_stream(
          Connection: Upgrade\r\n\
          Sec-WebSocket-Accept: {accept}\r\n\r\n"
     );
-    stream.write_all(upgrade_resp.as_bytes())?;
-    stream.flush()?;
+    write_tcp_vectored_with_deadline(
+        &mut stream,
+        &[upgrade_resp.as_bytes()],
+        Instant::now() + Duration::from_secs(5),
+    )?;
 
     info!(
         "[web {peer}] Extended-screen WebSocket stream started (viewer_id={})",
@@ -84,7 +132,43 @@ pub(super) fn handle_ws_stream(
     );
 
     let closed = Arc::new(AtomicBool::new(false));
+    let kicked_io = Arc::new(AtomicBool::new(false));
+    let shutdown_sock = Arc::new(stream.try_clone()?);
     let shared_writer = Arc::new(Mutex::new(stream.try_clone()?));
+    // Register a lock-free kick hook that marks `kicked_io` and immediately shuts down the TCP
+    // socket ONLY if a thread is currently wedged inside `shared_writer.lock()` (e.g. zero-window
+    // slow reader), while allowing healthy idle viewers to deliver a clean RFC 6455 4001/4002 Close frame.
+    {
+        let sw_chk = shared_writer.clone();
+        let sock_chk = shutdown_sock.clone();
+        let kicked_c = kicked_io.clone();
+        let registered = state
+            .registry
+            .set_web_viewer_unblock_hook(sub.id, Arc::new(move || {
+                kicked_c.store(true, Ordering::SeqCst);
+                if sw_chk.try_lock().is_err() {
+                    let _ = sock_chk.shutdown(Shutdown::Both);
+                }
+            }));
+        if !registered {
+            let close_code: u16 = if state.registry.is_web_lock_disconnect_blocking() {
+                4002
+            } else {
+                4001
+            };
+            drop(sub);
+            if let Ok(mut w) = shared_writer.try_lock() {
+                let _ = write_ws_frame_tcp_deadline(
+                    &mut w,
+                    0x8,
+                    &close_code.to_be_bytes(),
+                    Instant::now() + Duration::from_millis(200),
+                );
+            }
+            let _ = shutdown_sock.shutdown(Shutdown::Both);
+            return Ok(());
+        }
+    }
     let ws_started_at = Instant::now();
     let ws_started_wall = unix_now_secs();
     let last_pong_ms = Arc::new(AtomicU64::new(0));
@@ -102,6 +186,10 @@ pub(super) fn handle_ws_stream(
     let viewer_needs_idr = Arc::new(AtomicBool::new(true));
     let reader_closed = closed.clone();
     let reader_writer = shared_writer.clone();
+    let reader_write_failed = Arc::new(AtomicBool::new(false));
+    let main_write_failed = reader_write_failed.clone();
+    let reader_kicked = kicked_io.clone();
+    let reader_waker = sub.rx.waker();
     let reader_pong = last_pong_ms.clone();
     let reader_p2p = state.p2p.clone();
     let reader_registry = state.registry.clone();
@@ -118,7 +206,11 @@ pub(super) fn handle_ws_stream(
         let mut last_idr_req = Instant::now() - Duration::from_secs(1);
         let mut last_vis_req = Instant::now() - Duration::from_secs(1);
         while !reader_closed.load(Ordering::Relaxed) {
-            match read_ws_control_frame(&mut ws_reader) {
+            match read_ws_control_frame_deadline(
+                &mut ws_reader,
+                Duration::from_secs(2),
+                Duration::from_secs(5),
+            ) {
                 Ok(Some((opcode, payload))) => {
                     let now_ms = ws_started_at.elapsed().as_millis() as u64;
                     match opcode {
@@ -251,8 +343,20 @@ pub(super) fn handle_ws_stream(
                             }
                         }
                         0x8 => {
-                            if let Ok(mut w) = reader_writer.lock() {
-                                let _ = write_ws_frame(&mut *w, 0x8, &[]);
+                            if !reader_kicked.load(Ordering::Acquire) {
+                                if let Ok(mut w) = reader_writer.lock() {
+                                    if !reader_write_failed.load(Ordering::Acquire)
+                                        && write_ws_frame_tcp_deadline(
+                                            &mut w,
+                                            0x8,
+                                            &[],
+                                            Instant::now() + Duration::from_millis(500),
+                                        )
+                                        .is_err()
+                                    {
+                                        reader_write_failed.store(true, Ordering::Release);
+                                    }
+                                }
                             }
                             break;
                         }
@@ -264,9 +368,18 @@ pub(super) fn handle_ws_stream(
                                 ping_count = 0;
                             }
                             ping_count = ping_count.saturating_add(1);
-                            if ping_count <= 30 {
+                            if ping_count <= 30 && !reader_kicked.load(Ordering::Acquire) {
                                 if let Ok(mut w) = reader_writer.lock() {
-                                    if write_ws_frame(&mut *w, 0xA, &payload).is_err() {
+                                    if reader_write_failed.load(Ordering::Acquire)
+                                        || write_ws_frame_tcp_deadline(
+                                            &mut w,
+                                            0xA,
+                                            &payload,
+                                            Instant::now() + Duration::from_secs(5),
+                                        )
+                                        .is_err()
+                                    {
+                                        reader_write_failed.store(true, Ordering::Release);
                                         break;
                                     }
                                 }
@@ -291,6 +404,7 @@ pub(super) fn handle_ws_stream(
             }
         }
         reader_closed.store(true, Ordering::SeqCst);
+        reader_waker.wake();
     });
 
     let mut last_ping = Instant::now();
@@ -320,6 +434,7 @@ pub(super) fn handle_ws_stream(
         let epoch_changed = !first_init && *last_epoch != pkt.epoch;
         let need_init =
             first_init || epoch_changed || *last_init_gen != pkt.init_gen || force_init;
+        let deadline = Instant::now() + Duration::from_secs(5);
         if need_init {
             let meta = serde_json::json!({
                 "type": "init",
@@ -336,8 +451,12 @@ pub(super) fn handle_ws_stream(
             *last_src = Some((cur_source, is_indep));
             *last_epoch = pkt.epoch;
             *last_init_gen = pkt.init_gen;
-            write_ws_frame(writer, 0x1, meta.as_bytes())?;
-            writer.write_all(&pkt.init_ws_frame)?;
+            write_ws_frame_tcp_deadline(writer, 0x1, meta.as_bytes(), deadline)?;
+            write_tcp_vectored_with_deadline(
+                writer,
+                &[&pkt.init_ws_frame, &pkt.media_ws_frame],
+                deadline,
+            )
         } else if *last_src != Some((cur_source, is_indep)) {
             let meta = serde_json::json!({
                 "type": "source",
@@ -346,25 +465,46 @@ pub(super) fn handle_ws_stream(
             })
             .to_string();
             *last_src = Some((cur_source, is_indep));
-            write_ws_frame(writer, 0x1, meta.as_bytes())?;
+            write_ws_frame_tcp_deadline(writer, 0x1, meta.as_bytes(), deadline)?;
+            write_tcp_vectored_with_deadline(writer, &[&pkt.media_ws_frame], deadline)
+        } else {
+            write_tcp_vectored_with_deadline(writer, &[&pkt.media_ws_frame], deadline)
         }
-        writer.write_all(&pkt.media_ws_frame)?;
-        writer.flush()
     };
 
     while !closed.load(Ordering::Relaxed)
         && !stop_a.load(Ordering::SeqCst)
         && !stop_g.load(Ordering::SeqCst)
+        && !main_write_failed.load(Ordering::Acquire)
     {
         // 1) Drain outbound P2P signaling messages promptly.
+        let mut kicked_exit = false;
         while let Ok(sig_msg) = sig_rx.try_recv() {
             let mut w = shared_writer.lock().unwrap();
-            if write_ws_frame(&mut *w, 0x1, sig_msg.as_bytes()).is_err() {
+            if kicked_io.load(Ordering::Acquire) {
+                if state.registry.is_web_lock_disconnect_blocking() {
+                    kicked_by_lock = true;
+                } else {
+                    kicked_by_admin = true;
+                }
+                kicked_exit = true;
+                break;
+            }
+            if main_write_failed.load(Ordering::Acquire)
+                || write_ws_frame_tcp_deadline(
+                    &mut w,
+                    0x1,
+                    sig_msg.as_bytes(),
+                    Instant::now() + Duration::from_secs(5),
+                )
+                .is_err()
+            {
                 write_failed = true;
+                main_write_failed.store(true, Ordering::Release);
                 break;
             }
         }
-        if write_failed {
+        if write_failed || kicked_exit {
             break;
         }
 
@@ -377,8 +517,25 @@ pub(super) fn handle_ws_stream(
             })
             .to_string();
             let mut w = shared_writer.lock().unwrap();
-            if write_ws_frame(&mut *w, 0x1, meta.as_bytes()).is_err() {
+            if kicked_io.load(Ordering::Acquire) {
+                if state.registry.is_web_lock_disconnect_blocking() {
+                    kicked_by_lock = true;
+                } else {
+                    kicked_by_admin = true;
+                }
+                break;
+            }
+            if main_write_failed.load(Ordering::Acquire)
+                || write_ws_frame_tcp_deadline(
+                    &mut w,
+                    0x1,
+                    meta.as_bytes(),
+                    Instant::now() + Duration::from_secs(5),
+                )
+                .is_err()
+            {
                 write_failed = true;
+                main_write_failed.store(true, Ordering::Release);
                 break;
             }
             last_sent_lock_paused = cur_lock_paused;
@@ -408,6 +565,7 @@ pub(super) fn handle_ws_stream(
             }
         }
         let need_static_seed = (!initial_seed_done || (was_ws_paused && !cur_ws_paused))
+            && !kicked_io.load(Ordering::Acquire)
             && !cur_lock_paused
             && !cur_lock_blocking
             && !cur_tab_hidden
@@ -433,6 +591,14 @@ pub(super) fn handle_ws_stream(
             if let Some(pkt) = seed_pkt {
                 let is_indep = state.registry.is_web_independent_screen();
                 let mut w = shared_writer.lock().unwrap();
+                if kicked_io.load(Ordering::Acquire) {
+                    if state.registry.is_web_lock_disconnect_blocking() {
+                        kicked_by_lock = true;
+                    } else {
+                        kicked_by_admin = true;
+                    }
+                    break;
+                }
                 if write_shared_pkt(
                     &mut w,
                     &pkt,
@@ -558,6 +724,14 @@ pub(super) fn handle_ws_stream(
                     }
                     let send_t0 = Instant::now();
                     let mut w = shared_writer.lock().unwrap();
+                    if kicked_io.load(Ordering::Acquire) {
+                        if state.registry.is_web_lock_disconnect_blocking() {
+                            kicked_by_lock = true;
+                        } else {
+                            kicked_by_admin = true;
+                        }
+                        break;
+                    }
                     if write_shared_pkt(
                         &mut w,
                         &pkt,
@@ -611,8 +785,25 @@ pub(super) fn handle_ws_stream(
                     .to_string();
                     last_sent_source = Some((cur_source, is_indep));
                     let mut w = shared_writer.lock().unwrap();
-                    if write_ws_frame(&mut *w, 0x1, meta.as_bytes()).is_err() {
+                    if kicked_io.load(Ordering::Acquire) {
+                        if state.registry.is_web_lock_disconnect_blocking() {
+                            kicked_by_lock = true;
+                        } else {
+                            kicked_by_admin = true;
+                        }
+                        break;
+                    }
+                    if main_write_failed.load(Ordering::Acquire)
+                        || write_ws_frame_tcp_deadline(
+                            &mut w,
+                            0x1,
+                            meta.as_bytes(),
+                            Instant::now() + Duration::from_secs(5),
+                        )
+                        .is_err()
+                    {
                         write_failed = true;
+                        main_write_failed.store(true, Ordering::Release);
                         break;
                     }
                 }
@@ -652,14 +843,17 @@ pub(super) fn handle_ws_stream(
                 WsAuth::AdminCookie(tok) => state.verify_admin_cookie(Some(tok)),
                 WsAuth::ViewerCookie(tok) => state.verify_viewer_cookie(Some(tok)),
                 WsAuth::LoopbackAdmin => true,
-                WsAuth::QueryViewToken => {
+                WsAuth::QueryViewToken(tok_gen) => {
                     unix_now_secs().saturating_sub(ws_started_wall) < SESSION_TTL.as_secs()
                         && state.view_token.lock().unwrap().is_some()
+                        && state.view_token_gen.load(Ordering::Acquire) == *tok_gen
                 }
             };
             let approval_valid = matches!(ws_auth, WsAuth::AdminCookie(_) | WsAuth::LoopbackAdmin)
                 || state.is_web_viewer_approved(false, viewer_fingerprint.as_deref());
-            if !ttl_valid || !approval_valid {
+            let viewers_enabled =
+                state.registry.max_web_viewers() > 0 && !state.registry.is_low_power();
+            if !ttl_valid || !approval_valid || !viewers_enabled {
                 info!(
                     "[web {peer}] Closing WebSocket: session expired or approval/trust revoked (ttl_valid={ttl_valid}, approval_valid={approval_valid})"
                 );
@@ -668,14 +862,28 @@ pub(super) fn handle_ws_stream(
                 }
                 break;
             }
-            let mut w = shared_writer.lock().unwrap();
-            // Send RFC 6455 Ping (checked by server Pong watchdog) AND a lightweight JSON heartbeat
-            // so the browser's JS watchdog can detect silent host sleep/network drops on static screens.
-            if write_ws_frame(&mut *w, 0x9, b"ping").is_err()
-                || write_ws_frame(&mut *w, 0x1, br#"{"type":"hb"}"#).is_err()
             {
-                write_failed = true;
-                break;
+                let mut w = shared_writer.lock().unwrap();
+                let ping_dl = Instant::now() + Duration::from_secs(5);
+                // Send RFC 6455 Ping (checked by server Pong watchdog) AND a lightweight JSON heartbeat
+                // so the browser's JS watchdog can detect silent host sleep/network drops on static screens.
+                if kicked_io.load(Ordering::Acquire) {
+                    if state.registry.is_web_lock_disconnect_blocking() {
+                        kicked_by_lock = true;
+                    } else {
+                        kicked_by_admin = true;
+                    }
+                    break;
+                }
+                if main_write_failed.load(Ordering::Acquire)
+                    || write_ws_frame_tcp_deadline(&mut w, 0x9, b"ping", ping_dl).is_err()
+                    || write_ws_frame_tcp_deadline(&mut w, 0x1, br#"{"type":"hb"}"#, ping_dl)
+                        .is_err()
+                {
+                    write_failed = true;
+                    main_write_failed.store(true, Ordering::Release);
+                    break;
+                }
             }
             state.p2p.maybe_rebalance_periodic();
             last_ping = Instant::now();
@@ -683,11 +891,14 @@ pub(super) fn handle_ws_stream(
     }
 
     closed.store(true, Ordering::SeqCst);
+    // Unregister from P2P hub FIRST so downstream children immediately restore direct WS video
+    // before `drop(sub)` runs any blocking virtual-display/capture teardown.
     let _remaining_viewers = state
         .p2p
         .unregister_and_maybe_reset(viewer_id, || state.mux_cache.reset());
-    if let Ok(mut w) = shared_writer.lock() {
-        if !write_failed {
+    drop(sub);
+    if !write_failed && !main_write_failed.load(Ordering::Acquire) {
+        if let Ok(mut w) = shared_writer.try_lock() {
             let close_payload: &[u8] = if kicked_by_lock {
                 // Custom RFC 6455 close code 4002 ("host screen locked") so viewer stops auto-reconnecting.
                 &4002u16.to_be_bytes()
@@ -697,11 +908,16 @@ pub(super) fn handle_ws_stream(
             } else {
                 &[]
             };
-            let _ = write_ws_frame(&mut *w, 0x8, close_payload);
+            let _ = write_ws_frame_tcp_deadline(
+                &mut w,
+                0x8,
+                close_payload,
+                Instant::now() + Duration::from_millis(200),
+            );
         }
-        let _ = w.shutdown(Shutdown::Both);
     }
+    // Always shut down lock-free so any blocked `reader_handle` Pong/read unblocks immediately.
+    let _ = shutdown_sock.shutdown(Shutdown::Both);
     let _ = reader_handle.join();
-    drop(sub);
     Ok(())
 }

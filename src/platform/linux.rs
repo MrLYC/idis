@@ -5,7 +5,9 @@ use crate::platform::{
     clamp_pixel_dimensions, latest_frame_channel, BonjourHandle, CaptureHandle, CaptureParams,
     CursorState, DisplayBackend, FrameReceiver, FrameSender, HostSystemInfo,
 };
-use crate::protocol::messages::InputEvent;
+use crate::protocol::messages::{
+    InputEvent, KEY_MOD_ALT, KEY_MOD_CTRL, KEY_MOD_META, KEY_MOD_SHIFT,
+};
 use anyhow::Result;
 use std::fs;
 use std::sync::Mutex;
@@ -20,6 +22,25 @@ use x11rb::rust_connection::RustConnection;
 /// - Pure-Rust `mdns-sd` Bonjour advertisement
 /// - `ffmpeg` `x11grab` -> Baseline CAVLC intra-only H.264 Annex-B
 /// - Pure-Rust `x11rb` (RandR + XTEST) for monitor geometry, cursor query, and touch/mouse/keyboard injection
+fn map_special_key_to_x11_keysym(key_code: u16) -> Option<u32> {
+    match key_code {
+        0x33 => Some(0xFF08), // XK_BackSpace
+        0x24 => Some(0xFF0D), // XK_Return
+        0x30 => Some(0xFF09), // XK_Tab
+        0x35 => Some(0xFF1B), // XK_Escape
+        0x75 => Some(0xFFFF), // XK_Delete
+        0x7E => Some(0xFF52), // XK_Up
+        0x7D => Some(0xFF54), // XK_Down
+        0x7B => Some(0xFF51), // XK_Left
+        0x7C => Some(0xFF53), // XK_Right
+        0x73 => Some(0xFF50), // XK_Home
+        0x77 => Some(0xFF57), // XK_End
+        0x74 => Some(0xFF55), // XK_Page_Up
+        0x79 => Some(0xFF56), // XK_Page_Down
+        _ => None,
+    }
+}
+
 pub struct LinuxBackend;
 
 impl LinuxBackend {
@@ -121,21 +142,41 @@ impl X11Handle {
         let _ = self.conn.flush();
     }
 
-    fn tap_key(&self, keycode: u8, shift: bool) {
-        let shift_kc = if shift {
-            self.find_keycode_for_keysym(0xFFE1 /* XK_Shift_L */).map(|v| v.0)
-        } else {
-            None
-        };
-        if let Some(sk) = shift_kc {
-            let _ = self.conn.xtest_fake_input(2 /* KeyPress */, sk, 0, self.root, 0, 0, 0);
+    fn tap_key_with_mods(&self, keycode: u8, shift: bool, modifiers: u8) {
+        let mut mod_kcs: Vec<u8> = Vec::with_capacity(4);
+        if (modifiers & KEY_MOD_CTRL) != 0 {
+            if let Some((kc, _)) = self.find_keycode_for_keysym(0xFFE3 /* XK_Control_L */) {
+                mod_kcs.push(kc);
+            }
+        }
+        if (modifiers & KEY_MOD_ALT) != 0 {
+            if let Some((kc, _)) = self.find_keycode_for_keysym(0xFFE9 /* XK_Alt_L */) {
+                mod_kcs.push(kc);
+            }
+        }
+        if (modifiers & KEY_MOD_META) != 0 {
+            if let Some((kc, _)) = self.find_keycode_for_keysym(0xFFEB /* XK_Super_L */) {
+                mod_kcs.push(kc);
+            }
+        }
+        if shift || (modifiers & KEY_MOD_SHIFT) != 0 {
+            if let Some((kc, _)) = self.find_keycode_for_keysym(0xFFE1 /* XK_Shift_L */) {
+                mod_kcs.push(kc);
+            }
+        }
+        for &mk in &mod_kcs {
+            let _ = self.conn.xtest_fake_input(2 /* KeyPress */, mk, 0, self.root, 0, 0, 0);
         }
         let _ = self.conn.xtest_fake_input(2, keycode, 0, self.root, 0, 0, 0);
         let _ = self.conn.xtest_fake_input(3 /* KeyRelease */, keycode, 0, self.root, 0, 0, 0);
-        if let Some(sk) = shift_kc {
-            let _ = self.conn.xtest_fake_input(3, sk, 0, self.root, 0, 0, 0);
+        for &mk in mod_kcs.iter().rev() {
+            let _ = self.conn.xtest_fake_input(3, mk, 0, self.root, 0, 0, 0);
         }
         let _ = self.conn.flush();
+    }
+
+    fn tap_key(&self, keycode: u8, shift: bool) {
+        self.tap_key_with_mods(keycode, shift, 0);
     }
 
     fn query_cursor(&self, rect: CaptureRect, out_w: u32, out_h: u32) -> Option<CursorState> {
@@ -325,13 +366,8 @@ impl CaptureHandle for LinuxCaptureHandle {
                 }
             }
             InputEvent::KeySpecial { key_code } => {
-                let sym = match key_code {
-                    0x33 => 0xFF08, // XK_BackSpace
-                    0x24 => 0xFF0D, // XK_Return
-                    0x30 => 0xFF09, // XK_Tab
-                    0x35 => 0xFF1B, // XK_Escape
-                    0x75 => 0xFFFF, // XK_Delete
-                    _ => return Ok(()),
+                let Some(sym) = map_special_key_to_x11_keysym(key_code) else {
+                    return Ok(());
                 };
                 if let Some((kc, sh)) = x11.find_keycode_for_keysym(sym) {
                     x11.tap_key(kc, sh);
@@ -345,6 +381,36 @@ impl CaptureHandle for LinuxCaptureHandle {
                 };
                 if let Some((kc, sh)) = x11.find_keycode_for_keysym(sym) {
                     x11.tap_key(kc, sh);
+                }
+            }
+            InputEvent::KeyText { ref text } => {
+                for ch in text.chars().take(64) {
+                    let cp = ch as u32;
+                    let sym = if cp < 0x100 { cp } else { 0x0100_0000 | cp };
+                    if let Some((kc, sh)) = x11.find_keycode_for_keysym(sym) {
+                        x11.tap_key(kc, sh);
+                    }
+                }
+            }
+            InputEvent::KeyModified {
+                key_code,
+                ch,
+                modifiers,
+            } => {
+                let sym = key_code.and_then(map_special_key_to_x11_keysym).or_else(|| {
+                    ch.map(|c| {
+                        let low = if c < 0x80 {
+                            (c as u8).to_ascii_lowercase() as u32
+                        } else {
+                            c as u32
+                        };
+                        if low < 0x100 { low } else { 0x0100_0000 | low }
+                    })
+                });
+                if let Some(sym) = sym {
+                    if let Some((kc, sh)) = x11.find_keycode_for_keysym(sym) {
+                        x11.tap_key_with_mods(kc, sh, modifiers);
+                    }
                 }
             }
         }

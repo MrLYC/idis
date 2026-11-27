@@ -54,6 +54,17 @@ impl DebugRecorder {
                 })?;
             }
         }
+        // Preserve one previous non-empty debug trace across crash-restarts (`<path>.prev`)
+        // instead of unconditionally truncating pre-crash diagnostics.
+        if fs::metadata(&path).ok().is_some_and(|m| m.len() > 0) {
+            let prev_name = format!(
+                "{}.prev",
+                path.file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("debug.jsonl")
+            );
+            let _ = fs::rename(&path, path.with_file_name(prev_name));
+        }
         let mut opts = OpenOptions::new();
         opts.create(true).write(true).truncate(true);
         #[cfg(unix)]
@@ -68,7 +79,7 @@ impl DebugRecorder {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+            let _ = file.set_permissions(fs::Permissions::from_mode(0o600));
         }
 
         Ok(Arc::new(Self {
@@ -120,15 +131,10 @@ impl DebugRecorder {
             let _ = guard.writer.flush();
             return;
         }
-        if guard.writer.write_all(encoded.as_bytes()).is_ok() {
+        if guard.writer.write_all(encoded.as_bytes()).is_ok()
+            && guard.writer.flush().is_ok()
+        {
             guard.bytes_written += encoded.len();
-            // Flush important non-log/non-ui events promptly so crashes/Ctrl-C never lose context,
-            // while batching high-frequency logs and UI telemetry.
-            if (category != "log" && category != "web_ui")
-                || guard.bytes_written % 4096 < encoded.len()
-            {
-                let _ = guard.writer.flush();
-            }
         }
     }
 

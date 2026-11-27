@@ -504,37 +504,44 @@ fn save_trusted_file(path: &Path, devices: &[TrustedDevice]) -> Result<()> {
             .with_context(|| format!("failed to create directory {}", parent.display()))?;
     }
     let content = format_trusted_file(devices);
-    let seq = TMP_SAVE_SEQ.fetch_add(1, Ordering::Relaxed);
-    let tmp_name = format!(
-        "{}.{}.{}.tmp",
-        path.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("trusted_devices.txt"),
-        std::process::id(),
-        seq
-    );
-    let tmp_path = path.with_file_name(tmp_name);
-    {
-        use std::io::Write as _;
+    let base_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("trusted_devices.txt");
+    let pid = std::process::id();
+    let (tmp_path, mut f) = loop {
+        let seq = TMP_SAVE_SEQ.fetch_add(1, Ordering::Relaxed);
+        let candidate = path.with_file_name(format!("{base_name}.{pid}.{seq}.tmp"));
         let mut opts = fs::OpenOptions::new();
-        opts.create(true).write(true).truncate(true);
+        opts.create_new(true).write(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
             opts.mode(0o600);
         }
-        let mut f = opts
-            .open(&tmp_path)
-            .with_context(|| format!("failed to open {}", tmp_path.display()))?;
-        f.write_all(content.as_bytes())
-            .with_context(|| format!("failed to write {}", tmp_path.display()))?;
-    }
-
+        match opts.open(&candidate) {
+            Ok(file) => break (candidate, file),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(e).with_context(|| format!("failed to open {}", candidate.display()));
+            }
+        }
+    };
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600));
+        let _ = f.set_permissions(fs::Permissions::from_mode(0o600));
     }
+    {
+        use std::io::Write as _;
+        if let Err(e) = f.write_all(content.as_bytes()).and_then(|()| f.sync_all()) {
+            drop(f);
+            let _ = fs::remove_file(&tmp_path);
+            return Err(e)
+                .with_context(|| format!("failed to write/sync {}", tmp_path.display()));
+        }
+    }
+    drop(f);
 
     if let Err(e) = fs::rename(&tmp_path, path) {
         let _ = fs::remove_file(&tmp_path);

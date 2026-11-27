@@ -38,6 +38,7 @@ pub struct FlowControl {
     seen_picture_rendered: AtomicBool,
     epoch: Instant,
     last_sent_ms: AtomicU64,
+    last_ack_ms: AtomicU64,
     rtt: Mutex<RttTracker>,
     dropped_frames: AtomicU64,
     waker: Mutex<Option<(u64, FrameWaker)>>,
@@ -52,6 +53,7 @@ impl FlowControl {
             seen_picture_rendered: AtomicBool::new(false),
             epoch: Instant::now(),
             last_sent_ms: AtomicU64::new(0),
+            last_ack_ms: AtomicU64::new(0),
             rtt: Mutex::new(RttTracker::default()),
             dropped_frames: AtomicU64::new(0),
             waker: Mutex::new(None),
@@ -112,16 +114,36 @@ impl FlowControl {
             self.record_send_timestamp(now, 4);
             return true;
         }
+        const ACK_EXPIRE_MS: u64 = 500;
         let last = self.last_sent_ms.load(Ordering::Relaxed);
+        let last_ack = self.last_ack_ms.load(Ordering::Relaxed);
         let mut cur = self.in_flight.load(Ordering::Acquire);
-        // Idle decay: if >500ms passed since the last transmitted frame, any leftover in_flight
-        // count came from dropped ACKs during a transient glitch — reset so pipeline depth recovers.
-        if cur > 0 && now.saturating_sub(last) >= 500 {
+        // Idle decay: if >500ms passed since the last transmitted frame, reset leftover in_flight.
+        if cur > 0 && now.saturating_sub(last) >= ACK_EXPIRE_MS {
             self.in_flight.store(0, Ordering::Release);
             if let Ok(mut g) = self.rtt.lock() {
                 g.send_times_ms.clear();
             }
             cur = 0;
+        } else if cur > 0 {
+            // Prune expired send timestamps (>500ms) from dropped ACKs; when ACKs are actively
+            // flowing, reclaim leaked phantom `in_flight` tokens so pipeline depth self-heals!
+            // During a live blackhole (`now - last_ack >= 500`), keep `in_flight` clamped so we
+            // only probe every 120ms without bursting.
+            let mut expired = 0u32;
+            if let Ok(mut g) = self.rtt.lock() {
+                while let Some(&oldest) = g.send_times_ms.front() {
+                    if now.saturating_sub(oldest) >= ACK_EXPIRE_MS {
+                        g.send_times_ms.pop_front();
+                        expired = expired.saturating_add(1);
+                    } else {
+                        break;
+                    }
+                }
+            }
+            if expired > 0 && now.saturating_sub(last_ack) < ACK_EXPIRE_MS {
+                cur = self.subtract_in_flight(expired);
+            }
         }
         if cur < limit {
             self.in_flight.fetch_add(1, Ordering::AcqRel);
@@ -130,9 +152,8 @@ impl FlowControl {
             return true;
         }
         // Safety release: if >120ms passed without any ACK, allow 1 probe frame without clobbering
-        // any concurrent ACK decrements (atomic CAS bounded to `limit`). Never overwrite existing
-        // older in-flight send timestamps, but seed `send_times_ms` if empty so returning ACKs can
-        // unfreeze `ewma_rtt_ms` instead of stalling forever on a stale RTT value.
+        // any concurrent ACK decrements (atomic CAS bounded to `limit`). Always record `now` so
+        // the first post-blackhole ACK measures true live RTT instead of a stale 1.9s timestamp.
         if now.saturating_sub(last) >= 120 {
             loop {
                 let next = (cur + 1).min(limit);
@@ -147,17 +168,29 @@ impl FlowControl {
                 }
             }
             self.last_sent_ms.store(now, Ordering::Relaxed);
-            if let Ok(mut g) = self.rtt.lock() {
-                if g.send_times_ms.is_empty() {
-                    g.send_times_ms.push_back(now);
-                }
-            }
+            self.record_send_timestamp(now, (limit as usize).max(1));
             return true;
         }
         if count_drop {
             self.dropped_frames.fetch_add(1, Ordering::Relaxed);
         }
         false
+    }
+
+    fn subtract_in_flight(&self, delta: u32) -> u32 {
+        let mut cur = self.in_flight.load(Ordering::Acquire);
+        loop {
+            let next = cur.saturating_sub(delta);
+            match self.in_flight.compare_exchange_weak(
+                cur,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return next,
+                Err(actual) => cur = actual,
+            }
+        }
     }
 
     fn record_send_timestamp(&self, now: u64, cap: usize) {
@@ -177,12 +210,17 @@ impl FlowControl {
     }
 
     fn decrement_in_flight_at(&self, now: u64) {
+        const ACK_EXPIRE_MS: u64 = 500;
         self.acked_ever.store(true, Ordering::Release);
+        self.last_ack_ms.store(now, Ordering::Relaxed);
+        let mut expired = 0u32;
         if let Ok(mut g) = self.rtt.lock() {
-            // Discard obviously expired timestamps (>2000ms) from lost ACKs before sampling.
+            // Discard expired timestamps (>500ms) from lost ACKs and reclaim their leaked tokens.
             while let Some(&oldest) = g.send_times_ms.front() {
-                if now.saturating_sub(oldest) > 2000 {
+                let age = now.saturating_sub(oldest);
+                if (age > ACK_EXPIRE_MS && g.send_times_ms.len() > 1) || age > 2000 {
                     g.send_times_ms.pop_front();
+                    expired = expired.saturating_add(1);
                 } else {
                     break;
                 }
@@ -200,18 +238,7 @@ impl FlowControl {
                 }
             }
         }
-        let mut cur = self.in_flight.load(Ordering::Acquire);
-        while cur > 0 {
-            match self.in_flight.compare_exchange_weak(
-                cur,
-                cur - 1,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => break,
-                Err(next) => cur = next,
-            }
-        }
+        let _ = self.subtract_in_flight(1u32.saturating_add(expired));
         self.wake_streamer();
     }
 
@@ -359,6 +386,16 @@ pub(super) struct WebSubscriberEntry {
     pub(super) connected_at: Instant,
     pub(super) visible: Arc<AtomicBool>,
     pub(super) tx: FrameSender,
+    pub(super) unblock_io: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+impl WebSubscriberEntry {
+    pub(super) fn kick(&self) {
+        self.tx.close();
+        if let Some(ref f) = self.unblock_io {
+            f();
+        }
+    }
 }
 
 /// RAII subscription to the extended display's H.264 Annex-B frame broadcast for a Web viewer.
@@ -467,6 +504,14 @@ pub(super) fn sync_capture_pause_states_inner(
                     Err(_) => candidate,
                 }
             } else {
+                if follow_owner != 0 {
+                    let _ = web_follow_ipad_session_id.compare_exchange(
+                        follow_owner,
+                        0,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    );
+                }
                 candidate
             }
         };

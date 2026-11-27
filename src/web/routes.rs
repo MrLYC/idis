@@ -12,8 +12,8 @@ use crate::trust::{compute_web_viewer_fingerprint, parse_web_client_label};
 use crate::user_config::WindowRule;
 use anyhow::Result;
 use serde::Deserialize;
-use std::net::{SocketAddr, TcpStream};
-use std::sync::atomic::AtomicBool;
+use std::net::{Shutdown, SocketAddr, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tracing::{info, warn};
 
@@ -171,6 +171,13 @@ pub(super) fn handle_connection(
     stop_g: Arc<AtomicBool>,
     scope: ListenerScope,
 ) -> Result<()> {
+    if stop_a.load(Ordering::Acquire)
+        || stop_g.load(Ordering::Acquire)
+        || state.stopping.load(Ordering::Acquire)
+    {
+        let _ = stream.shutdown(Shutdown::Both);
+        return Ok(());
+    }
     let Some(req) = read_http_request(&stream)? else {
         return Ok(());
     };
@@ -287,34 +294,28 @@ pub(super) fn handle_connection(
                                 "尝试次数过多，请 1 分钟后再试".as_bytes(),
                             );
                         }
-                        let expected = state.view_token.lock().unwrap().clone();
-                        if let Some(exp) = expected {
-                            if ct_eq(candidate, &exp) {
-                                state.clear_login_failures(peer.ip(), false);
-                                state.registry.record_external_activity();
-                                state.registry.record_web_activity();
-                                // Revoke any prior viewer session cookie before issuing a new one (Iter-6 P1-C3).
-                                state.revoke_viewer_cookie(viewer_cookie);
-                                let sid = state.create_viewer_session();
-                                info!("[web {peer}] Extended-screen viewer authenticated via URL ?token=");
-                                let mut hdrs = vec![
-                                    format!(
-                                        "Set-Cookie: idis_view={sid}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}",
-                                        SESSION_TTL.as_secs()
-                                    ),
-                                    "Location: /view".to_string(),
-                                ];
-                                if let Some(vc) = vid_set_cookie {
-                                    hdrs.push(vc);
-                                }
-                                return send_response(
-                                    &mut stream,
-                                    "302 Found",
-                                    "text/plain; charset=utf-8",
-                                    &hdrs,
-                                    b"Redirecting to /view",
-                                );
+                        if let Some(sid) = state.login_viewer_with_token(candidate, viewer_cookie) {
+                            state.clear_login_failures(peer.ip(), false);
+                            state.registry.record_external_activity();
+                            state.registry.record_web_activity();
+                            info!("[web {peer}] Extended-screen viewer authenticated via URL ?token=");
+                            let mut hdrs = vec![
+                                format!(
+                                    "Set-Cookie: idis_view={sid}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}",
+                                    SESSION_TTL.as_secs()
+                                ),
+                                "Location: /view".to_string(),
+                            ];
+                            if let Some(vc) = vid_set_cookie {
+                                hdrs.push(vc);
                             }
+                            return send_response(
+                                &mut stream,
+                                "302 Found",
+                                "text/plain; charset=utf-8",
+                                &hdrs,
+                                b"Redirecting to /view",
+                            );
                         }
                         state.record_login_failure(peer.ip(), false);
                         warn!("[web {peer}] Failed /view?token= authentication attempt");
@@ -537,15 +538,14 @@ pub(super) fn handle_connection(
             )
         }
         ("POST", "/api/view/login") => {
-            let active_view_token = state.view_token.lock().unwrap().clone();
-            let Some(expected) = active_view_token else {
+            if state.view_token.lock().unwrap().is_none() {
                 return send_json(
                     &mut stream,
                     "403 Forbidden",
                     &[],
                     &serde_json::json!({ "error": "管理员尚未开启网页扩展屏观看口令" }),
                 );
-            };
+            }
             if !state.check_rate_limit(peer.ip(), false) {
                 return send_json(
                     &mut stream,
@@ -562,12 +562,10 @@ pub(super) fn handle_connection(
                     &serde_json::json!({ "error": "invalid json" }),
                 );
             };
-            if ct_eq(payload.token.trim(), &expected) {
+            if let Some(sid) = state.login_viewer_with_token(payload.token.trim(), viewer_cookie) {
                 state.clear_login_failures(peer.ip(), false);
                 state.registry.record_external_activity();
                 state.registry.record_web_activity();
-                state.revoke_viewer_cookie(viewer_cookie);
-                let sid = state.create_viewer_session();
                 info!("[web {peer}] Extended-screen viewer authenticated");
                 let mut hdrs = vec![format!(
                     "Set-Cookie: idis_view={sid}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}",
@@ -766,6 +764,7 @@ pub(super) fn handle_connection(
                 return send_response(&mut stream, "403 Forbidden", "text/plain", &[], b"forbidden");
             }
             let mut ws_authed = is_viewer || is_admin;
+            let mut matched_query_token_gen: Option<u64> = None;
             if !ws_authed {
                 if let Some(raw_tok) = parse_query_param(req.query.as_deref(), "token") {
                     let candidate = raw_tok.trim();
@@ -780,13 +779,13 @@ pub(super) fn handle_connection(
                                 b"too many authentication attempts",
                             );
                         }
-                        let expected = state.view_token.lock().unwrap().clone();
-                        if expected.as_deref().is_some_and(|exp| ct_eq(candidate, exp)) {
+                        if let Some(tok_gen) = state.verify_view_token_with_gen(candidate) {
                             state.clear_login_failures(peer.ip(), false);
                             state.registry.record_external_activity();
                             state.registry.record_web_activity();
                             info!("[web {peer}] WebSocket viewer authenticated via URL ?token=");
                             ws_authed = true;
+                            matched_query_token_gen = Some(tok_gen);
                         } else {
                             state.record_login_failure(peer.ip(), false);
                             warn!("[web {peer}] Failed /ws/stream?token= authentication attempt");
@@ -843,10 +842,10 @@ pub(super) fn handle_connection(
             } else if is_viewer {
                 match viewer_cookie {
                     Some(tok) => WsAuth::ViewerCookie(tok.to_string()),
-                    None => WsAuth::QueryViewToken,
+                    None => WsAuth::QueryViewToken(matched_query_token_gen.unwrap_or(0)),
                 }
             } else {
-                WsAuth::QueryViewToken
+                WsAuth::QueryViewToken(matched_query_token_gen.unwrap_or(0))
             };
             handle_ws_stream(
                 stream,
@@ -1723,6 +1722,16 @@ fn handle_admin_settings(
     }
     if let Some(wifi_en) = payload.wifi_enabled {
         if wifi_en {
+            if state.stopping.load(Ordering::Acquire)
+                || state.global_stop.load(Ordering::Acquire)
+            {
+                return send_json(
+                    stream,
+                    "503 Service Unavailable",
+                    &[],
+                    &serde_json::json!({ "error": "server is shutting down" }),
+                );
+            }
             if let Err(e) = state.wifi_controller.start() {
                 return send_json(
                     stream,

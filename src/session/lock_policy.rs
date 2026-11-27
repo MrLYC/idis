@@ -465,13 +465,14 @@ impl SessionRegistry {
 
         // 1) Web lock enforcement FIRST (so if both disconnect, closing iPad doesn't spuriously spin up standalone Web).
         let web_blocking = locked && act_web == LockAction::Disconnect;
-        let was_web_disconnecting = self
-            .web_lock_disconnecting
-            .swap(web_blocking, Ordering::AcqRel);
         match (locked, act_web) {
             (true, LockAction::Pause) => {
                 if self.lock_state_epoch.load(Ordering::Acquire) != epoch {
                     return;
+                }
+                self.web_lock_disconnecting.store(false, Ordering::Release);
+                if let Ok(mut g) = self.standalone_web_resume_after.lock() {
+                    *g = None;
                 }
                 let was = self.host_lock_paused_web.swap(true, Ordering::SeqCst);
                 if !was {
@@ -491,6 +492,11 @@ impl SessionRegistry {
                 if self.lock_state_epoch.load(Ordering::Acquire) != epoch {
                     return;
                 }
+                self.web_lock_disconnecting
+                    .store(web_blocking, Ordering::Release);
+                if let Ok(mut g) = self.standalone_web_resume_after.lock() {
+                    *g = None;
+                }
                 self.host_lock_paused_web.store(false, Ordering::SeqCst);
                 self.bump_web_source_epoch();
                 if let Ok(mut lf) = self.last_ipad_web_frame.lock() {
@@ -506,6 +512,9 @@ impl SessionRegistry {
                 if self.lock_state_epoch.load(Ordering::Acquire) != epoch {
                     return;
                 }
+                let was_web_disconnecting = self
+                    .web_lock_disconnecting
+                    .swap(false, Ordering::AcqRel);
                 let was = self.host_lock_paused_web.swap(false, Ordering::SeqCst);
                 if was || was_web_disconnecting {
                     info!("Resuming Web viewer transmission after host unlock or policy change");
@@ -518,12 +527,10 @@ impl SessionRegistry {
                     if let Ok(mut lf) = self.last_standalone_web_frame.lock() {
                         *lf = None;
                     }
-                    // Re-start standalone Web capture if all iPads were disconnected while locked & paused.
-                    self.resume_standalone_web_capture_if_needed();
-                    // Trigger a live IDR keyframe on resume (never re-inject stale cached IDR with
-                    // a fake sequence number into SharedWebMuxer).
                     self.request_active_keyframes();
                 }
+                // Always check if standalone Web capture needs to resume (covers grace-period mode/iPad transitions).
+                self.resume_standalone_web_capture_if_needed();
             }
         }
 
@@ -536,6 +543,7 @@ impl SessionRegistry {
                 let was = self.host_lock_paused_ipad.swap(true, Ordering::SeqCst);
                 if !was {
                     info!("Host locked (ipad=pause): pausing iPad video/cursor/input transmission while keeping sessions & virtual displays alive");
+                    self.release_all_stuck_mouse_buttons();
                 }
             }
             (true, LockAction::Disconnect) => {

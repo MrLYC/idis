@@ -9,7 +9,9 @@ use crate::platform::{
     CaptureHandle, CaptureParams, CursorState, DesktopWindowInfo, DisplayBackend, FrameReceiver,
     FrameSender, HostSystemInfo, WindowMoveLayout,
 };
-use crate::protocol::messages::InputEvent;
+use crate::protocol::messages::{
+    InputEvent, KEY_MOD_ALT, KEY_MOD_CTRL, KEY_MOD_META, KEY_MOD_SHIFT,
+};
 use anyhow::{anyhow, Result};
 use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
@@ -35,8 +37,9 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_KEYUP,
     KEYEVENTF_UNICODE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN,
     MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
-    MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEINPUT, VK_BACK, VK_DELETE, VK_ESCAPE,
-    VK_RETURN, VK_TAB,
+    MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEINPUT, VK_BACK, VK_CONTROL, VK_DELETE,
+    VK_DOWN, VK_END, VK_ESCAPE, VK_HOME, VK_LEFT, VK_LWIN, VK_MENU, VK_NEXT, VK_PRIOR, VK_RETURN,
+    VK_RIGHT, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetCursorPos, GetShellWindow, GetSystemMetrics, GetWindowLongW, GetWindowRect,
@@ -298,36 +301,67 @@ fn send_mouse_input(dx: i32, dy: i32, flags: u32, mouse_data: u32) {
     }
 }
 
-fn send_vk(vk: u16) {
-    let inputs = [
-        INPUT {
-            r#type: INPUT_KEYBOARD,
-            Anonymous: INPUT_0 {
-                ki: KEYBDINPUT {
-                    wVk: vk,
-                    wScan: 0,
-                    dwFlags: 0,
-                    time: 0,
-                    dwExtraInfo: 0,
-                },
+fn map_special_key_to_vk(key_code: u16) -> Option<u16> {
+    match key_code {
+        0x33 => Some(VK_BACK),
+        0x24 => Some(VK_RETURN),
+        0x30 => Some(VK_TAB),
+        0x35 => Some(VK_ESCAPE),
+        0x75 => Some(VK_DELETE),
+        0x7E => Some(VK_UP),
+        0x7D => Some(VK_DOWN),
+        0x7B => Some(VK_LEFT),
+        0x7C => Some(VK_RIGHT),
+        0x73 => Some(VK_HOME),
+        0x77 => Some(VK_END),
+        0x74 => Some(VK_PRIOR),
+        0x79 => Some(VK_NEXT),
+        _ => None,
+    }
+}
+
+fn send_vk_with_mods(vk: u16, modifiers: u8) {
+    let mut mods = Vec::with_capacity(4);
+    if (modifiers & KEY_MOD_CTRL) != 0 {
+        mods.push(VK_CONTROL);
+    }
+    if (modifiers & KEY_MOD_ALT) != 0 {
+        mods.push(VK_MENU);
+    }
+    if (modifiers & KEY_MOD_META) != 0 {
+        mods.push(VK_LWIN);
+    }
+    if (modifiers & KEY_MOD_SHIFT) != 0 {
+        mods.push(VK_SHIFT);
+    }
+    let make_vk = |code: u16, up: bool| INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: code,
+                wScan: 0,
+                dwFlags: if up { KEYEVENTF_KEYUP } else { 0 },
+                time: 0,
+                dwExtraInfo: 0,
             },
         },
-        INPUT {
-            r#type: INPUT_KEYBOARD,
-            Anonymous: INPUT_0 {
-                ki: KEYBDINPUT {
-                    wVk: vk,
-                    wScan: 0,
-                    dwFlags: KEYEVENTF_KEYUP,
-                    time: 0,
-                    dwExtraInfo: 0,
-                },
-            },
-        },
-    ];
+    };
+    let mut inputs = Vec::with_capacity(mods.len() * 2 + 2);
+    for &m in &mods {
+        inputs.push(make_vk(m, false));
+    }
+    inputs.push(make_vk(vk, false));
+    inputs.push(make_vk(vk, true));
+    for &m in mods.iter().rev() {
+        inputs.push(make_vk(m, true));
+    }
     unsafe {
         SendInput(inputs.len() as u32, inputs.as_ptr(), size_of::<INPUT>() as i32);
     }
+}
+
+fn send_vk(vk: u16) {
+    send_vk_with_mods(vk, 0);
 }
 
 fn send_unicode(ch: u16) {
@@ -565,16 +599,40 @@ impl CaptureHandle for WindowsCaptureHandle {
                     send_mouse_input(0, 0, MOUSEEVENTF_HWHEEL, delta as u32);
                 }
             }
-            InputEvent::KeySpecial { key_code } => match key_code {
-                0x33 => send_vk(VK_BACK),
-                0x24 => send_vk(VK_RETURN),
-                0x30 => send_vk(VK_TAB),
-                0x35 => send_vk(VK_ESCAPE),
-                0x75 => send_vk(VK_DELETE),
-                _ => {}
-            },
+            InputEvent::KeySpecial { key_code } => {
+                if let Some(vk) = map_special_key_to_vk(key_code) {
+                    send_vk(vk);
+                }
+            }
             InputEvent::KeyUnicode { ch } => {
                 send_unicode(ch);
+            }
+            InputEvent::KeyText { ref text } => {
+                let mut units: Vec<u16> = text.encode_utf16().take(64).collect();
+                if units.last().is_some_and(|&u| (0xD800..=0xDBFF).contains(&u)) {
+                    units.pop();
+                }
+                for unit in units {
+                    send_unicode(unit);
+                }
+            }
+            InputEvent::KeyModified {
+                key_code,
+                ch,
+                modifiers,
+            } => {
+                if let Some(vk) = key_code.and_then(map_special_key_to_vk) {
+                    send_vk_with_mods(vk, modifiers);
+                } else if let Some(u) = ch {
+                    let ascii = (u as u8).to_ascii_uppercase();
+                    if u == 0x20 {
+                        send_vk_with_mods(VK_SPACE, modifiers);
+                    } else if u < 0x80 && (ascii.is_ascii_uppercase() || ascii.is_ascii_digit()) {
+                        send_vk_with_mods(ascii as u16, modifiers);
+                    } else {
+                        send_unicode(u);
+                    }
+                }
             }
         }
         Ok(())

@@ -1,6 +1,6 @@
 [package]
 name = "idis"
-version = "0.3.7"
+version = "0.3.8"
 edition = "2021"
 description = "Cross-platform Web Extended Screen, macOS virtual display & window routing host (with optional legacy display client compatibility)"
 license = "MIT"

@@ -1,8 +1,10 @@
 use crate::config::AppConfig;
 use crate::platform::{BonjourHandle, DisplayBackend};
+#[cfg(not(windows))]
+use crate::protocol::framing::{write_canal_block, write_canal_parts};
 use crate::protocol::framing::{
-    read_canal_block_limited, read_canal_block_limited_deadline, write_canal_block,
-    write_canal_parts, MAX_CONTROL_FRAME_SIZE, MAX_PREAUTH_FRAME_SIZE,
+    read_canal_block_limited, read_canal_block_limited_deadline, MAX_CONTROL_FRAME_SIZE,
+    MAX_PREAUTH_FRAME_SIZE,
 };
 use crate::session::SessionRegistry;
 use crate::transport::{

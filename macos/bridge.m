@@ -2328,6 +2328,7 @@ static void id_unlock_keepalive_timer_cb(CFRunLoopTimerRef timer, void *info) {
     __block uint32_t newPixW = 0, newPixH = 0;
     __block BOOL needStreamUpdate = NO;
     __block uint32_t effFps = 30;
+    __block uint32_t effMaxEdge = 0;
     __block uint32_t savedPrevFps = 30;
     __block uint32_t savedPrevBitrate = 16;
     __block uint32_t savedPrevMaxEdge = 0;
@@ -2343,6 +2344,7 @@ static void id_unlock_keepalive_timer_cb(CFRunLoopTimerRef timer, void *info) {
         if (bitrateMbps > 0) self.bitrateMbps = bitrateMbps;
         if (maxPixelEdge >= 320) self.maxPixelEdge = maxPixelEdge;
         effFps = self.fps > 0 ? self.fps : 30;
+        effMaxEdge = self.maxPixelEdge;
 
         uint32_t logW = self.requestedLogicalW >= 320 ? self.requestedLogicalW : 1024;
         uint32_t logH = self.requestedLogicalH >= 240 ? self.requestedLogicalH : 768;

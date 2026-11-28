@@ -803,6 +803,36 @@ use std::time::Duration;
         let png_bytes = std::fs::read(&saved_path).unwrap();
         assert!(png_bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]));
         let _ = std::fs::remove_dir_all(&shot_tmp);
+
+        // 4.6) Rebind left-top to CloseWebSharing & left-bottom to LockHost (both work while view-only!)
+        let close_web_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let close_web_calls_cb = close_web_calls.clone();
+        reg.set_close_web_sharing_handler(Arc::new(move || {
+            close_web_calls_cb.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            true
+        }));
+        let mut g_priv = reg.gestures_config();
+        g_priv.left_top_swipe_right = GestureAction::CloseWebSharing;
+        g_priv.left_bottom_swipe_right = GestureAction::LockHost;
+        reg.set_gestures_config(g_priv).unwrap();
+
+        send_swipe(12.0, sh as f64 * 0.2, sw as f64 * 0.25, sh as f64 * 0.21);
+        assert_eq!(close_web_calls.load(std::sync::atomic::Ordering::Acquire), 1);
+        assert!(reg.last_gesture().unwrap().blocked_reason.is_none());
+
+        send_swipe(12.0, sh as f64 * 0.8, sw as f64 * 0.25, sh as f64 * 0.81);
+        assert_eq!(
+            backend
+                .lock_host_screen_calls
+                .load(std::sync::atomic::Ordering::Acquire),
+            1
+        );
+        assert!(reg.is_host_screen_locked());
+        assert!(reg.last_gesture().unwrap().blocked_reason.is_none());
+        backend
+            .screen_locked
+            .store(false, std::sync::atomic::Ordering::Release);
+        reg.refresh_host_lock_state_now(true);
         reg.set_input_allowed(true);
 
         // 5) Rebind right-top swipe left to Disconnect -> closes the session cleanly.

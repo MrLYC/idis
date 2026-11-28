@@ -511,6 +511,28 @@ impl DisplayBackend for LinuxBackend {
         }
     }
 
+    fn lock_host_screen(&self) -> Result<()> {
+        if let Ok(st) = std::process::Command::new("loginctl")
+            .arg("lock-session")
+            .status()
+        {
+            if st.success() {
+                return Ok(());
+            }
+        }
+        if let Ok(st) = std::process::Command::new("xdg-screensaver")
+            .arg("lock")
+            .status()
+        {
+            if st.success() {
+                return Ok(());
+            }
+        }
+        Err(anyhow::anyhow!(
+            "Linux 锁屏失败（未检测到可用的 loginctl 或 xdg-screensaver）"
+        ))
+    }
+
     fn host_system_info(&self, override_host_name: &str) -> HostSystemInfo {
         let host_name = if override_host_name.is_empty() {
             read_linux_hostname()

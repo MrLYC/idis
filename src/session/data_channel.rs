@@ -1942,6 +1942,35 @@ impl SessionRegistry {
                     }
                 }
             }
+            GestureAction::LockHost => {
+                self.release_all_stuck_mouse_buttons();
+                match self.backend.lock_host_screen() {
+                    Ok(()) => {
+                        info!("[{key}] Gesture LockHost -> locked host screen");
+                        self.refresh_host_lock_state_now(true);
+                        detail = Some("已锁定主机屏幕".to_string());
+                    }
+                    Err(e) => {
+                        warn!("[{key}] Gesture LockHost failed: {e:#}");
+                        blocked_reason = Some(format!("锁屏失败: {e}"));
+                    }
+                }
+            }
+            GestureAction::CloseWebSharing => {
+                let prev_viewers = self.active_web_viewers();
+                let was_open = self.trigger_close_web_sharing();
+                self.kick_all_web_viewers();
+                info!(
+                    "[{key}] Gesture CloseWebSharing -> was_open={was_open}, disconnected_viewers={prev_viewers}"
+                );
+                detail = Some(if prev_viewers > 0 {
+                    format!("已关闭网页分享并断开 {prev_viewers} 个观看端")
+                } else if was_open {
+                    "已关闭网页分享入口".to_string()
+                } else {
+                    "网页分享当前未开启".to_string()
+                });
+            }
             GestureAction::Hotkey { keys } => match parse_hotkey_spec(keys) {
                 Ok(parsed) => {
                     if let Some(ref hdl) = handle_opt {

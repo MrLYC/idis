@@ -602,6 +602,11 @@ pub trait DisplayBackend: Send + Sync {
         is_host_screen_locked()
     }
 
+    /// Trigger the host OS screen lock immediately (invoked by the iPad `lock_host` edge gesture).
+    fn lock_host_screen(&self) -> Result<()> {
+        anyhow::bail!("当前平台暂不支持一键锁屏")
+    }
+
     /// OS display ID for the host primary screen (`0` when unsupported).
     fn main_display_id(&self) -> u32 {
         0

@@ -1092,6 +1092,17 @@ pub fn start_web_server_with_listener(
                 st.sync_viewer_listener();
             }
         }));
+        let st_close_web_weak = Arc::downgrade(&state);
+        registry.set_close_web_sharing_handler(Arc::new(move || {
+            if let Some(st) = st_close_web_weak.upgrade() {
+                let was_open =
+                    st.view_token.lock().unwrap().is_some() || st.viewer_addr().is_some();
+                st.set_view_token(None);
+                was_open
+            } else {
+                false
+            }
+        }));
     }
     // Open the dedicated 0.0.0.0 random-port Web Viewer listener immediately if startup already
     // enables Web viewing (`max_web_viewers > 0` and a view passcode is configured).

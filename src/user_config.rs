@@ -349,6 +349,10 @@ pub enum GestureAction {
     RequestKeyframe,
     /// Capture a PNG screenshot of the iPad screen into `<screenshot_dir>/idis-YYYY-MM-DD/`.
     Screenshot,
+    /// Immediately lock the host computer screen (no Accessibility permission required).
+    LockHost,
+    /// Disable Web extended-screen sharing (clears viewer passcode, kicks viewers, closes viewer port).
+    CloseWebSharing,
     /// Inject a custom keyboard shortcut (e.g. `ctrl+left`, `cmd+tab`, `ctrl+up`).
     Hotkey { keys: String },
     /// Inject a mouse right-click at the swipe start location.
@@ -404,6 +408,8 @@ impl GestureAction {
             Self::ApplyPreset { preset } => format!("应用预设: {preset}"),
             Self::RequestKeyframe => "刷新关键帧".to_string(),
             Self::Screenshot => "截屏并保存".to_string(),
+            Self::LockHost => "锁定电脑屏幕".to_string(),
+            Self::CloseWebSharing => "关闭网页分享".to_string(),
             Self::Hotkey { keys } => format!("快捷键: {keys}"),
             Self::RightClick => "模拟鼠标右键".to_string(),
             Self::Scroll { delta } => {
@@ -1491,6 +1497,23 @@ gestures:
         assert!(re_yaml.contains("gestures:"));
         let re_parsed = UserConfigFile::from_yaml_str(&re_yaml).unwrap();
         assert_eq!(re_parsed.gestures, parsed.gestures);
+
+        let lock_and_close_yaml = "\
+gestures:
+  enabled: true
+  left_top_swipe_right:
+    kind: lock_host
+  right_top_swipe_left:
+    kind: close_web_sharing
+";
+        let lc_parsed = UserConfigFile::from_yaml_str(lock_and_close_yaml).unwrap();
+        assert_eq!(lc_parsed.gestures.left_top_swipe_right, GestureAction::LockHost);
+        assert_eq!(
+            lc_parsed.gestures.right_top_swipe_left,
+            GestureAction::CloseWebSharing
+        );
+        assert!(!lc_parsed.gestures.left_top_swipe_right.requires_host_input());
+        assert!(!lc_parsed.gestures.right_top_swipe_left.requires_host_input());
 
         let bad_hotkey_yaml = "\
 gestures:

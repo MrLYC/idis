@@ -122,6 +122,7 @@ extern "C" {
     fn id_macos_probe_screen_capture_permission() -> i32;
     fn id_macos_request_permission(kind: i32) -> i32;
     fn id_macos_is_screen_locked() -> i32;
+    fn id_macos_lock_screen() -> i32;
     fn id_macos_pump_main_runloop();
     fn id_macos_resolve_iface_ip(
         iface_name: *const c_char,
@@ -809,6 +810,20 @@ impl DisplayBackend for MacOsBackend {
 
     fn recheck_permissions(&self) {
         let _ = unsafe { id_macos_probe_screen_capture_permission() };
+    }
+
+    fn lock_host_screen(&self) -> Result<()> {
+        if unsafe { id_macos_lock_screen() } != 0 {
+            return Ok(());
+        }
+        let status = std::process::Command::new("/usr/bin/pmset")
+            .arg("displaysleepnow")
+            .status()?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(anyhow!("macOS 锁屏命令退出异常: {status}"))
+        }
     }
 
     fn host_system_info(&self, override_host_name: &str) -> HostSystemInfo {

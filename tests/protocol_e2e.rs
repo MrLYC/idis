@@ -6194,3 +6194,200 @@ fn macos_permission_guidance_and_capture_error_lifecycle_e2e() {
     reg.close_all();
     web.stop();
 }
+
+#[test]
+fn edge_gesture_lock_host_and_close_web_sharing_e2e() {
+    use idis::user_config::{EdgeGesturesConfig, GestureAction};
+    use idis::web::{start_web_server, LogBuffer};
+    use std::io::{Read, Write};
+    use std::net::SocketAddr;
+
+    fn http_call(
+        addr: SocketAddr,
+        method: &str,
+        path: &str,
+        cookie: Option<&str>,
+        body: Option<&str>,
+    ) -> (u16, Vec<String>, String) {
+        let mut s = TcpStream::connect(addr).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let b = body.unwrap_or("");
+        let mut req = format!(
+            "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nOrigin: http://{addr}\r\nConnection: close\r\n"
+        );
+        if let Some(c) = cookie {
+            req.push_str(&format!("Cookie: {c}\r\n"));
+        }
+        if !b.is_empty() {
+            req.push_str("Content-Type: application/json\r\n");
+            req.push_str(&format!("Content-Length: {}\r\n", b.len()));
+        }
+        req.push_str("\r\n");
+        req.push_str(b);
+        s.write_all(req.as_bytes()).unwrap();
+        let mut raw = Vec::new();
+        let _ = s.read_to_end(&mut raw);
+        let text = String::from_utf8_lossy(&raw).to_string();
+        let (head, resp_body) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
+        let code = head
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|c| c.parse().ok())
+            .unwrap_or(0);
+        let cookies = head
+            .lines()
+            .filter_map(|l| {
+                let (k, v) = l.split_once(':')?;
+                if k.eq_ignore_ascii_case("set-cookie") {
+                    Some(v.trim().split(';').next().unwrap_or("").to_string())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        (code, cookies, resp_body.to_string())
+    }
+
+    let mock = Arc::new(MockBackend::new());
+    let mut cfg = test_config();
+    cfg.wifi = false;
+    cfg.max_web_viewers = 2;
+    cfg.web_screen_mode = Some(idis::config::WebScreenMode::Independent);
+    cfg.web_independent_screen = true;
+    cfg.web_require_approval = false;
+    cfg.auto_accept = true;
+    cfg.allow_input = false; // Must still work while touch-locked!
+    cfg.port_idle_close_secs = 0;
+
+    let reg = Arc::new(SessionRegistry::new(cfg, mock.clone()));
+    reg.set_gestures_config(EdgeGesturesConfig {
+        enabled: true,
+        edge_zone_pct: 10,
+        min_swipe_pct: 8,
+        screenshot_dir: String::new(),
+        left_top_swipe_right: GestureAction::CloseWebSharing,
+        left_bottom_swipe_right: GestureAction::LockHost,
+        right_top_swipe_left: GestureAction::None,
+        right_bottom_swipe_left: GestureAction::None,
+    })
+    .unwrap();
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut web = start_web_server(
+        "127.0.0.1:0",
+        None,
+        Some("share-tok-7".to_string()),
+        reg.clone(),
+        LogBuffer::new(),
+        stop.clone(),
+    )
+    .unwrap();
+    let admin_addr = web.addr;
+    let wifi_ctrl = web.wifi_controller();
+    assert_eq!(
+        http_call(
+            admin_addr,
+            "POST",
+            "/api/admin/settings",
+            None,
+            Some(r#"{"wifi_enabled":true}"#)
+        )
+        .0,
+        200
+    );
+    let (tel_addr, data_addr) = wifi_ctrl.addrs().expect("Wi-Fi listener must open");
+
+    // 1) Connect an active Web viewer on the dynamic viewer port
+    let vaddr = SocketAddr::from(([127, 0, 0, 1], web.viewer_addr().unwrap().port()));
+    let (cv, vc, _) = http_call(
+        vaddr,
+        "POST",
+        "/api/view/login",
+        None,
+        Some(r#"{"token":"share-tok-7"}"#),
+    );
+    assert_eq!(cv, 200);
+    let v_cookie = vc.into_iter().find(|c| c.starts_with("idis_view=")).unwrap();
+    let mut ws = TcpStream::connect(vaddr).unwrap();
+    ws.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let ws_req = format!(
+        "GET /ws/stream HTTP/1.1\r\nHost: {vaddr}\r\nOrigin: http://{vaddr}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nCookie: {v_cookie}\r\n\r\n"
+    );
+    ws.write_all(ws_req.as_bytes()).unwrap();
+    let mut hdr = Vec::new();
+    let mut b1 = [0u8; 1];
+    while !hdr.ends_with(b"\r\n\r\n") {
+        ws.read_exact(&mut b1).unwrap();
+        hdr.push(b1[0]);
+    }
+    assert!(String::from_utf8_lossy(&hdr).contains("101 Switching Protocols"));
+    assert_eq!(reg.active_web_viewers(), 1);
+
+    // 2) Connect iPad over Wi-Fi (1024x768)
+    let mut tel = TcpStream::connect(tel_addr).unwrap();
+    tel.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    write_canal_block(
+        &mut tel,
+        &make_handshake_packet_custom("GEST-LOCK-1", "Gesture-iPad", 1024, 768, "5"),
+    )
+    .unwrap();
+    for _ in 0..4 {
+        if let Some(blk) = read_canal_block(&mut tel).unwrap() {
+            if let Ok(pkt) = MessagePacket::decode(&blk) {
+                if pkt.name_method == "VideoServiceAccessibleOnPort" {
+                    break;
+                }
+            }
+        }
+    }
+    let mut data = TcpStream::connect(data_addr).unwrap();
+    data.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    // Wait until iPad session is streaming
+    let _ = read_canal_block(&mut data).unwrap();
+
+    // 3) Swipe left-top -> right: CloseWebSharing disables view_token, closes viewer port, kicks viewer!
+    write_canal_block(&mut data, &make_touch_event_bytes(0, 12.0, 150.0)).unwrap();
+    write_canal_block(&mut data, &make_touch_event_bytes(1, 260.0, 155.0)).unwrap();
+    write_canal_block(&mut data, &make_touch_event_bytes(3, 260.0, 155.0)).unwrap();
+    let mut closed = false;
+    for _ in 0..40 {
+        if web.viewer_addr().is_none() && reg.active_web_viewers() == 0 {
+            closed = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    assert!(
+        closed,
+        "CloseWebSharing edge gesture must close viewer port and disconnect active Web viewer"
+    );
+    let (_, _, st_b) = http_call(admin_addr, "GET", "/api/admin/state", None, None);
+    let st_j: serde_json::Value = serde_json::from_str(&st_b).unwrap();
+    assert_eq!(st_j["settings"]["view_token_enabled"], false);
+    assert_eq!(st_j["connection"]["web_viewer_listening"], false);
+
+    // 4) Swipe left-bottom -> right: LockHost locks the host OS screen!
+    write_canal_block(&mut data, &make_touch_event_bytes(0, 12.0, 620.0)).unwrap();
+    write_canal_block(&mut data, &make_touch_event_bytes(1, 260.0, 625.0)).unwrap();
+    write_canal_block(&mut data, &make_touch_event_bytes(3, 260.0, 625.0)).unwrap();
+    let mut locked = false;
+    for _ in 0..40 {
+        if mock.lock_host_screen_calls.load(Ordering::Acquire) == 1 && reg.is_host_screen_locked() {
+            locked = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    assert!(
+        locked,
+        "LockHost edge gesture must invoke backend.lock_host_screen() and mark host locked"
+    );
+
+    drop(ws);
+    drop(data);
+    drop(tel);
+    stop.store(true, Ordering::SeqCst);
+    reg.close_all();
+    web.stop();
+}

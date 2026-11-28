@@ -1324,6 +1324,11 @@ console.log('PASS [2/5]: viewer.html approval, 4001 non-reconnect, QuotaExceeded
     envPerm.elements.get('gestureSlotsGrid').innerHTML.includes('gesture-quick-chip selected'),
     'gestureSlotsGrid must highlight matching hotkey quick chip with .selected'
   );
+  assert.ok(
+    envPerm.elements.get('gestureSlotsGrid').innerHTML.includes('value="lock_host"')
+      && envPerm.elements.get('gestureSlotsGrid').innerHTML.includes('value="close_web_sharing"'),
+    'gestureSlotsGrid must expose lock_host and close_web_sharing gesture action options'
+  );
 }
 console.log('PASS [3/5]: admin.html pendingByAddr isolation, XSS escaping, unfocused badge & low_power toast');
 
@@ -1557,6 +1562,7 @@ console.log('PASS [4/5]: admin.html CLI builder emits all new feature flags clea
   for (const sym of [
     'id_macos_probe_screen_capture_permission',
     'id_macos_request_permission',
+    'id_macos_lock_screen',
     'id_macos_capture_display_bounds',
     'fit_capture_to_sc_frame',
     'sc_padding_heal',

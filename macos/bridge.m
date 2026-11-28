@@ -3522,6 +3522,21 @@ int32_t id_macos_is_screen_locked(void) {
     return id_is_screen_locked() ? 1 : 0;
 }
 
+int32_t id_macos_lock_screen(void) {
+    @autoreleasepool {
+        typedef void (*IDSACLockScreenImmediateFn)(void);
+        void *h = dlopen("/System/Library/PrivateFrameworks/login.framework/Versions/Current/login", RTLD_LAZY);
+        if (h) {
+            IDSACLockScreenImmediateFn fn = (IDSACLockScreenImmediateFn)dlsym(h, "SACLockScreenImmediate");
+            if (fn) {
+                fn();
+                return 1;
+            }
+        }
+        return 0;
+    }
+}
+
 void id_macos_pump_main_runloop(void) {
     @autoreleasepool {
         // Non-blocking drain (0.0s timeout) of pending CoreGraphics / SkyLight display

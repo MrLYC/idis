@@ -62,6 +62,7 @@ pub struct MockBackend {
     pub recorded_permission_requests: Arc<Mutex<Vec<String>>>,
     pub recheck_permission_calls: Arc<AtomicUsize>,
     pub auto_grant_screen_recording_on_recheck: Arc<AtomicBool>,
+    pub lock_host_screen_calls: Arc<AtomicUsize>,
 }
 
 impl Default for MockBackend {
@@ -98,6 +99,7 @@ impl Default for MockBackend {
             recorded_permission_requests: Arc::new(Mutex::new(Vec::new())),
             recheck_permission_calls: Arc::new(AtomicUsize::new(0)),
             auto_grant_screen_recording_on_recheck: Arc::new(AtomicBool::new(false)),
+            lock_host_screen_calls: Arc::new(AtomicUsize::new(0)),
         }
     }
 }
@@ -441,6 +443,12 @@ impl DisplayBackend for MockBackend {
         {
             self.screen_recording_granted.store(true, Ordering::Release);
         }
+    }
+
+    fn lock_host_screen(&self) -> Result<()> {
+        self.lock_host_screen_calls.fetch_add(1, Ordering::AcqRel);
+        self.screen_locked.store(true, Ordering::Release);
+        Ok(())
     }
 
     fn host_system_info(&self, override_host_name: &str) -> HostSystemInfo {

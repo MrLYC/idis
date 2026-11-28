@@ -91,6 +91,7 @@ pub struct PendingDevice {
 pub type ConfirmHandler = Arc<dyn Fn(&PendingDevice) -> ConfirmDecision + Send + Sync>;
 pub type CancelPendingHandler = Arc<dyn Fn(Option<u64>, Option<&str>) + Send + Sync>;
 pub type WebViewerLimitHandler = Arc<dyn Fn(usize) + Send + Sync>;
+pub type CloseWebSharingHandler = Arc<dyn Fn() -> bool + Send + Sync>;
 
 /// Serializable snapshot of an active iDisplay (Wi-Fi or USB) client session.
 #[derive(Debug, Clone, Serialize)]
@@ -303,6 +304,7 @@ pub struct SessionRegistry {
     confirm_handler: Mutex<Option<ConfirmHandler>>,
     cancel_pending_handler: Mutex<Option<CancelPendingHandler>>,
     web_viewer_limit_handler: Mutex<Option<WebViewerLimitHandler>>,
+    close_web_sharing_handler: Mutex<Option<CloseWebSharingHandler>>,
     allow_input: AtomicBool,
     client_cursor: Arc<AtomicBool>,
     web_require_approval: AtomicBool,
@@ -867,6 +869,7 @@ impl SessionRegistry {
             confirm_handler: Mutex::new(None),
             cancel_pending_handler: Mutex::new(None),
             web_viewer_limit_handler: Mutex::new(None),
+            close_web_sharing_handler: Mutex::new(None),
             allow_input,
             client_cursor,
             web_require_approval,
@@ -1190,6 +1193,12 @@ impl SessionRegistry {
         *self.web_viewer_limit_handler.lock().unwrap() = Some(handler);
     }
 
+    /// Install a hook invoked by the iPad `close_web_sharing` edge gesture to disable the Web
+    /// viewer passcode, disconnect active Web viewers, and immediately close the viewer port.
+    pub fn set_close_web_sharing_handler(&self, handler: CloseWebSharingHandler) {
+        *self.close_web_sharing_handler.lock().unwrap() = Some(handler);
+    }
+
     fn notify_cancel_pending(&self, session_id: Option<u64>, addr: Option<&str>) {
         let cb = self.cancel_pending_handler.lock().ok().and_then(|g| g.clone());
         if let Some(f) = cb {
@@ -1201,6 +1210,19 @@ impl SessionRegistry {
         let cb = self.web_viewer_limit_handler.lock().ok().and_then(|g| g.clone());
         if let Some(f) = cb {
             f(max_viewers);
+        }
+    }
+
+    pub(super) fn trigger_close_web_sharing(&self) -> bool {
+        let cb = self
+            .close_web_sharing_handler
+            .lock()
+            .ok()
+            .and_then(|g| g.clone());
+        if let Some(f) = cb {
+            f()
+        } else {
+            false
         }
     }
 

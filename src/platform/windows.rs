@@ -890,6 +890,17 @@ impl DisplayBackend for WindowsBackend {
         }
     }
 
+    fn lock_host_screen(&self) -> Result<()> {
+        let st = std::process::Command::new("rundll32.exe")
+            .arg("user32.dll,LockWorkStation")
+            .status()?;
+        if st.success() {
+            Ok(())
+        } else {
+            Err(anyhow!("Windows 锁屏命令退出异常: {st}"))
+        }
+    }
+
     fn main_display_id(&self) -> u32 {
         enumerate_monitors()
             .into_iter()

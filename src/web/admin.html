@@ -298,6 +298,12 @@
     color: var(--text);
     border-color: var(--accent);
   }
+  .gesture-quick-chip.selected {
+    background: rgba(88, 166, 255, 0.16);
+    border-color: var(--accent);
+    color: #b8dcff;
+    font-weight: 600;
+  }
   @media (max-width: 720px) {
     header { padding: 10px 12px; }
     main { margin: 10px auto; padding: 0 10px 32px; }
@@ -3919,7 +3925,7 @@ function renderGesturesForm() {
     enBox.innerHTML = [
       { v: true, label: '开启' },
       { v: false, label: '关闭' },
-    ].map(it => `<button type="button" class="sku-chip${gestureDraft.enabled === it.v ? ' active' : ''}" data-gesture-enabled="${it.v ? '1' : '0'}">${it.label}</button>`).join('');
+    ].map(it => `<button type="button" class="sku-chip${gestureDraft.enabled === it.v ? (it.v ? ' selected-ok' : ' selected') : ''}" data-gesture-enabled="${it.v ? '1' : '0'}">${it.label}</button>`).join('');
     enBox.querySelectorAll('[data-gesture-enabled]').forEach(btn => {
       btn.addEventListener('click', () => {
         gestureDraft.enabled = btn.dataset.gestureEnabled === '1';
@@ -3935,7 +3941,7 @@ function renderGesturesForm() {
     const opts = [5, 8, 12, 15];
     if (!opts.includes(gestureDraft.edge_zone_pct)) opts.push(gestureDraft.edge_zone_pct);
     opts.sort((a, b) => a - b);
-    ezBox.innerHTML = opts.map(v => `<button type="button" class="sku-chip${gestureDraft.edge_zone_pct === v ? ' active' : ''}" data-gesture-ez="${v}">${v}%</button>`).join('');
+    ezBox.innerHTML = opts.map(v => `<button type="button" class="sku-chip${gestureDraft.edge_zone_pct === v ? ' selected' : ''}" data-gesture-ez="${v}">${v}%</button>`).join('');
     ezBox.querySelectorAll('[data-gesture-ez]').forEach(btn => {
       btn.addEventListener('click', () => {
         gestureDraft.edge_zone_pct = Number(btn.dataset.gestureEz);
@@ -3951,7 +3957,7 @@ function renderGesturesForm() {
     const opts = [4, 6, 10, 15];
     if (!opts.includes(gestureDraft.min_swipe_pct)) opts.push(gestureDraft.min_swipe_pct);
     opts.sort((a, b) => a - b);
-    msBox.innerHTML = opts.map(v => `<button type="button" class="sku-chip${gestureDraft.min_swipe_pct === v ? ' active' : ''}" data-gesture-ms="${v}">${v}%</button>`).join('');
+    msBox.innerHTML = opts.map(v => `<button type="button" class="sku-chip${gestureDraft.min_swipe_pct === v ? ' selected' : ''}" data-gesture-ms="${v}">${v}%</button>`).join('');
     msBox.querySelectorAll('[data-gesture-ms]').forEach(btn => {
       btn.addEventListener('click', () => {
         gestureDraft.min_swipe_pct = Number(btn.dataset.gestureMs);
@@ -3978,8 +3984,9 @@ function renderGesturesForm() {
 
       let extraHtml = '';
       if (act.kind === 'hotkey') {
+        const curKeys = String(act.keys || '').trim().toLowerCase();
         const chipsHtml = GESTURE_HOTKEY_PRESETS.map(hp =>
-          `<button type="button" class="gesture-quick-chip" data-gesture-hk-chip="${esc(slot.key)}" data-keys="${esc(hp.keys)}">${esc(hp.label)}</button>`
+          `<button type="button" class="gesture-quick-chip${curKeys === hp.keys ? ' selected' : ''}" data-gesture-hk-chip="${esc(slot.key)}" data-keys="${esc(hp.keys)}">${esc(hp.label)}</button>`
         ).join('');
         extraHtml = `
           <div class="gesture-extra">
@@ -4004,8 +4011,8 @@ function renderGesturesForm() {
         extraHtml = `
           <div class="gesture-extra">
             <input type="number" class="gesture-scroll-input" data-gesture-scroll="${esc(slot.key)}" value="${val}" min="-1000" max="1000" step="20" style="width:96px">
-            <button type="button" class="gesture-quick-chip" data-gesture-sc-chip="${esc(slot.key)}" data-delta="180">向上滚</button>
-            <button type="button" class="gesture-quick-chip" data-gesture-sc-chip="${esc(slot.key)}" data-delta="-180">向下滚</button>
+            <button type="button" class="gesture-quick-chip${val > 0 ? ' selected' : ''}" data-gesture-sc-chip="${esc(slot.key)}" data-delta="180">向上滚</button>
+            <button type="button" class="gesture-quick-chip${val < 0 ? ' selected' : ''}" data-gesture-sc-chip="${esc(slot.key)}" data-delta="-180">向下滚</button>
           </div>
         `;
       }

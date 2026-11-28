@@ -1302,6 +1302,28 @@ console.log('PASS [2/5]: viewer.html approval, 4001 non-reconnect, QuotaExceeded
   assert.equal(envPerm.elements.get('screenRecordingWarnBanner').classList.contains('hidden'), true, 'granted permission must hide screenRecordingWarnBanner');
   assert.equal(envPerm.elements.get('captureErrorBanner').classList.contains('hidden'), false, 'capture_failed must show captureErrorBanner');
   assert.equal(envPerm.elements.get('captureErrorDetail').textContent, '虚拟屏尚未就绪');
+
+  // Guard: iPad edge gesture chips must use .selected / .selected-ok (NOT undefined .active) so selected state highlights
+  assert.ok(
+    !/sku-chip\$\{[^}]*['"] active['"]/.test(adminHtml),
+    'admin.html must never assign undefined .active class to .sku-chip (use .selected / .selected-ok)'
+  );
+  assert.ok(
+    envPerm.elements.get('gestureEnabledChips').innerHTML.includes('sku-chip selected'),
+    'gestureEnabledChips must render .selected / .selected-ok highlight class'
+  );
+  assert.ok(
+    envPerm.elements.get('gestureEdgeZoneChips').innerHTML.includes('sku-chip selected'),
+    'gestureEdgeZoneChips must render .selected highlight class'
+  );
+  assert.ok(
+    envPerm.elements.get('gestureMinSwipeChips').innerHTML.includes('sku-chip selected'),
+    'gestureMinSwipeChips must render .selected highlight class'
+  );
+  assert.ok(
+    envPerm.elements.get('gestureSlotsGrid').innerHTML.includes('gesture-quick-chip selected'),
+    'gestureSlotsGrid must highlight matching hotkey quick chip with .selected'
+  );
 }
 console.log('PASS [3/5]: admin.html pendingByAddr isolation, XSS escaping, unfocused badge & low_power toast');
 

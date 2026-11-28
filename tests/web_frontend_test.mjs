@@ -1201,6 +1201,107 @@ console.log('PASS [2/5]: viewer.html approval, 4001 non-reconnect, QuotaExceeded
     [],
     `admin.html option labels must not contain parenthetical descriptions: ${JSON.stringify(noisyLabels)}`
   );
+
+  // Guard: Guided macOS Screen Recording permission banner & capture error banner isolation + one-click API
+  const permRequests = [];
+  let permStatePayload = {
+    host: {
+      host_name: 'MacTest',
+      os: 'macos',
+      arch: 'aarch64',
+      version: '0.3.9',
+      mode: 'Extend',
+      fps: 30,
+      bitrate_mbps: 16,
+      wifi: true,
+      usb: true,
+      uptime_secs: 10,
+      executable_path: '/opt/homebrew/bin/idis',
+      capabilities: {
+        hidpi: true,
+        virtual_display: true,
+        window_routing: true,
+        screen_lock_detection: true,
+        live_abr_quality: true,
+        true_capture_pause: true,
+        accessibility_permission_required: true,
+        accessibility_granted: false,
+        screen_recording_permission_required: true,
+        screen_recording_granted: false,
+      },
+      last_capture_error: {
+        code: 'screen_recording_denied',
+        source: 'ipad',
+        message: 'macOS 拒绝了屏幕录制权限',
+        ts_unix: 1,
+      },
+    },
+    connection: { lan_ips: ['127.0.0.1'], web_admin_urls: ['http://127.0.0.1:8787/'], web_viewer_urls: [], wifi_endpoints: [] },
+    settings: {
+      allow_input: true,
+      client_cursor: false,
+      input_stats: {},
+      wifi_enabled: true,
+      max_extended_screens: 2,
+      active_extended_screens: 0,
+      max_web_viewers: 1,
+      active_web_viewers: 0,
+      auto_max_in_flight: true,
+      max_in_flight: 2,
+      view_token_enabled: false,
+      web_screen_mode: 'follow_ipad',
+      web_require_approval: false,
+      lock_action_ipad: 'pause',
+      lock_action_web: 'pause',
+      lock_delay_secs: 10,
+      low_power: false,
+      polling: { main_loop_ms: 250, cursor_poll_ms: 8, usb_retry_ms: 1000, admin_poll_ms: 2000 },
+    },
+    video: { width: 0, height: 0, fps: 30, bitrate_mbps: 16, hidpi: 1, max_pixel_edge: 0, adaptive_quality: true, abr_sensitivity: 'balanced', web_width: 1280, web_height: 720, web_fps: 30, web_bitrate_mbps: 16, web_hidpi: 1, web_max_pixel_edge: 0 },
+    cli_config: {},
+    sessions: [],
+    pending_approvals: [],
+    trusted_devices: [],
+    web_viewers: [],
+    screens: [],
+    virtual_displays: [],
+    window_rules: [],
+    presets: [],
+    builtin_presets: [],
+    logs: [],
+  };
+  const envPerm = createDomEnv(adminHtml, {
+    fetchImpl: async (url, opts) => {
+      if (url === '/api/auth/status') {
+        return { ok: true, status: 200, json: async () => ({ admin_logged_in: true, viewer_logged_in: false, viewer_enabled: false }) };
+      }
+      if (url === '/api/admin/state') {
+        return { ok: true, status: 200, json: async () => permStatePayload };
+      }
+      if (url === '/api/admin/permissions/request') {
+        permRequests.push(JSON.parse(opts.body));
+        return { ok: true, status: 200, json: async () => ({ ok: true, message: '已在主机上打开系统设置' }) };
+      }
+      return { ok: true, status: 200, json: async () => ({ ok: true }) };
+    },
+  });
+  await envPerm.ctx.checkAuth();
+  await envPerm.ctx.refreshAdmin();
+  assert.equal(envPerm.elements.get('screenRecordingWarnBanner').classList.contains('hidden'), false, 'missing Screen Recording permission must show guided banner');
+  assert.equal(envPerm.elements.get('screenRecExePath').textContent, '/opt/homebrew/bin/idis', 'banner must display host executable_path');
+  assert.equal(envPerm.elements.get('captureErrorBanner').classList.contains('hidden'), true, 'screen_recording_denied must not show duplicate generic captureErrorBanner');
+  assert.equal(envPerm.elements.get('accessibilityWarnBanner').classList.contains('hidden'), false, 'missing Accessibility with allow_input=true must show guided banner');
+
+  await envPerm.ctx.requestOsPermission('screen_recording');
+  assert.deepEqual(permRequests[0], { kind: 'screen_recording' }, 'requestOsPermission must POST { kind } to /api/admin/permissions/request');
+
+  // Switch to granted + generic capture_failed -> generic banner shows exact message, permission banner hides
+  permStatePayload.host.capabilities.screen_recording_granted = true;
+  permStatePayload.host.last_capture_error = { code: 'capture_failed', source: 'web', message: '虚拟屏尚未就绪', ts_unix: 2 };
+  await envPerm.ctx.refreshAdmin();
+  assert.equal(envPerm.elements.get('screenRecordingWarnBanner').classList.contains('hidden'), true, 'granted permission must hide screenRecordingWarnBanner');
+  assert.equal(envPerm.elements.get('captureErrorBanner').classList.contains('hidden'), false, 'capture_failed must show captureErrorBanner');
+  assert.equal(envPerm.elements.get('captureErrorDetail').textContent, '虚拟屏尚未就绪');
 }
 console.log('PASS [3/5]: admin.html pendingByAddr isolation, XSS escaping, unfocused badge & low_power toast');
 
@@ -1379,5 +1480,75 @@ console.log('PASS [4/5]: admin.html CLI builder emits all new feature flags clea
       && bridgeSrc.includes('MAX(30, fpsVal * 8)'),
     'macos/bridge.m must preserve VSync headroom helper and 8s IPPP keyframe interval'
   );
+
+  // Guard (v0.3.8/v0.3.9 regressions):
+  // 1) Never pre-block ScreenCaptureKit on buggy CGPreflightScreenCaptureAccess() (false-negatives on macOS 14/15 CLI)
+  const startScMatch = bridgeSrc.match(/- \(BOOL\)startScreenCaptureKitLockedWithWidth:[\s\S]*?\n\}\n\n- \(BOOL\)ensureVirtualDisplayOnlineForceRecreate:/);
+  assert.ok(startScMatch, 'startScreenCaptureKitLockedWithWidth: method must exist in macos/bridge.m');
+  const startScCode = startScMatch[0].replace(/\/\/[^\n]*/g, '');
+  assert.ok(
+    !startScCode.includes('CGPreflightScreenCaptureAccess'),
+    'startScreenCaptureKitLockedWithWidth: must NEVER gate on CGPreflightScreenCaptureAccess() (false-negative on macOS 14/15 CLI)'
+  );
+  assert.ok(
+    startScCode.includes('error.code == -3801') && startScCode.includes('gLastScreenCaptureDenied'),
+    'startScreenCaptureKitLockedWithWidth: must detect real SCStreamErrorUserDeclined (-3801)'
+  );
+  assert.ok(
+    startScCode.includes('sc_virtual_display_placeholder')
+      && startScCode.includes('kCVPixelFormatType_32BGRA')
+      && startScCode.includes('startCoreGraphicsFallbackLockedWithFilter:'),
+    'startScreenCaptureKitLockedWithWidth: must filter Intel 1x1 placeholders and keep 3-tier capture fallback'
+  );
+  assert.ok(
+    startScCode.includes('scheduleCaptureRestartAfterMs:120 targetW:0 targetH:0 attempt:0'),
+    'sc_first_frame_watchdog must escalate with attempt:0 so it never recreates online CGVirtualDisplay or flickers main screen'
+  );
+
+  // 2) Never re-apply CGVirtualDisplay mode when display is already online at matching geometry (prevents Intel main-screen flicker)
+  const ensureVdMatch = bridgeSrc.match(/- \(BOOL\)ensureVirtualDisplayOnlineForceRecreate:\(BOOL\)forceRecreate \{[\s\S]*?\n\}\n\n- \(void\)scheduleCaptureRestartAfterMs:/);
+  assert.ok(ensureVdMatch, 'ensureVirtualDisplayOnlineForceRecreate: method must exist');
+  assert.ok(
+    ensureVdMatch[0].includes('sameDims && self.virtualDisplay.hiDPI == self.hiDPI')
+      && ensureVdMatch[0].includes('return YES;'),
+    'ensureVirtualDisplayOnlineForceRecreate: must skip applyWidth:height: when display is already online at requested size/HiDPI'
+  );
+
+  // 3) Restart scheduler must have a hard retry bound and stop immediately on Screen Recording denial
+  const restartMatch = bridgeSrc.match(/- \(void\)scheduleCaptureRestartAfterMs:\(int64_t\)delayMs targetW:\(uint32_t\)targetW targetH:\(uint32_t\)targetH attempt:\(int\)attempt \{[\s\S]*?\n\}\n\n- \(void\)scheduleCaptureRestartAfterMs:\(int64_t\)delayMs targetW:/);
+  assert.ok(restartMatch, 'scheduleCaptureRestartAfterMs: must exist');
+  assert.ok(
+    restartMatch[0].includes('gLastScreenCaptureDenied') && restartMatch[0].includes('attempt >= 6'),
+    'scheduleCaptureRestartAfterMs: must stop on permission denial and cap retries to prevent infinite flicker loops'
+  );
+
+  // 4) updateStreamFps: must declare effMaxEdge before calling fit_capture_to_sc_frame (prevents macOS clang compile break)
+  const updateFpsMatch = bridgeSrc.match(/- \(BOOL\)updateStreamFps:[\s\S]*?\n\}\n\n- \(BOOL\)updateShowCursor:/);
+  assert.ok(updateFpsMatch, 'updateStreamFps: must exist');
+  assert.ok(
+    updateFpsMatch[0].includes('__block uint32_t effMaxEdge')
+      && updateFpsMatch[0].includes('fit_capture_to_sc_frame(&cfgW, &cfgH, cachedScFrame, self.hiDPI, effMaxEdge)'),
+    'updateStreamFps: must declare __block uint32_t effMaxEdge before calling fit_capture_to_sc_frame'
+  );
+
+  // 5) Permission probe/request & padding-heal symbols must remain wired
+  for (const sym of [
+    'id_macos_probe_screen_capture_permission',
+    'id_macos_request_permission',
+    'id_macos_capture_display_bounds',
+    'fit_capture_to_sc_frame',
+    'sc_padding_heal',
+    'CGDisplayStreamCreateWithDispatchQueue',
+    'SCScreenshotManager',
+  ]) {
+    assert.ok(bridgeSrc.includes(sym), `macos/bridge.m missing required reliability symbol: ${sym}`);
+  }
+
+  // 6) Cross-platform Windows clippy guard: Unix-only canal write helpers in wifi.rs must stay #[cfg(not(windows))]
+  const wifiSrc = fs.readFileSync(path.join(repoRoot, 'src/transport/wifi.rs'), 'utf8');
+  assert.ok(
+    /#\[cfg\(not\(windows\)\)\]\s*\nuse crate::protocol::framing::\{write_canal_block, write_canal_parts\};/.test(wifiSrc),
+    'src/transport/wifi.rs must gate write_canal_block/write_canal_parts under #[cfg(not(windows))] to keep Windows clippy clean'
+  );
 }
-console.log('PASS [5/5]: macos/bridge.m static Objective-C selector integrity verified');
+console.log('PASS [5/5]: macos/bridge.m static Objective-C selector & regression guardrails verified');

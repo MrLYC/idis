@@ -5907,3 +5907,290 @@ fn wifi_port_dynamic_toggle_and_port_idle_auto_close_e2e() {
     reg.close_all();
     web.stop();
 }
+
+#[test]
+fn macos_permission_guidance_and_capture_error_lifecycle_e2e() {
+    use idis::web::{start_web_server, LogBuffer};
+    use std::io::{Read, Write};
+    use std::net::SocketAddr;
+
+    fn http_call(
+        addr: SocketAddr,
+        method: &str,
+        path: &str,
+        cookie: Option<&str>,
+        body: Option<&str>,
+    ) -> (u16, Vec<String>, String) {
+        let mut s = TcpStream::connect(addr).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let b = body.unwrap_or("");
+        let mut req = format!(
+            "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nOrigin: http://{addr}\r\nConnection: close\r\n"
+        );
+        if let Some(c) = cookie {
+            req.push_str(&format!("Cookie: {c}\r\n"));
+        }
+        if !b.is_empty() {
+            req.push_str("Content-Type: application/json\r\n");
+            req.push_str(&format!("Content-Length: {}\r\n", b.len()));
+        }
+        req.push_str("\r\n");
+        req.push_str(b);
+        s.write_all(req.as_bytes()).unwrap();
+        let mut raw = Vec::new();
+        let _ = s.read_to_end(&mut raw);
+        let text = String::from_utf8_lossy(&raw).to_string();
+        let (head, resp_body) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
+        let code = head
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|c| c.parse().ok())
+            .unwrap_or(0);
+        let cookies = head
+            .lines()
+            .filter_map(|l| {
+                let (k, v) = l.split_once(':')?;
+                if k.eq_ignore_ascii_case("set-cookie") {
+                    Some(v.trim().split(';').next().unwrap_or("").to_string())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        (code, cookies, resp_body.to_string())
+    }
+
+    let mock = Arc::new(MockBackend::new());
+    mock.screen_recording_permission_required
+        .store(true, Ordering::Release);
+    mock.screen_recording_granted
+        .store(false, Ordering::Release);
+    mock.accessibility_permission_required
+        .store(true, Ordering::Release);
+    mock.accessibility_granted.store(false, Ordering::Release);
+
+    let mut cfg = test_config();
+    cfg.wifi = false;
+    cfg.web_screen_mode = Some(idis::config::WebScreenMode::Independent);
+    cfg.web_independent_screen = true;
+    cfg.max_web_viewers = 2;
+    cfg.web_require_approval = false;
+    cfg.auto_accept = true;
+    cfg.port_idle_close_secs = 0;
+
+    let reg = Arc::new(SessionRegistry::new(cfg, mock.clone()));
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut web = start_web_server(
+        "127.0.0.1:0",
+        None,
+        Some("perm-tok-1".to_string()),
+        reg.clone(),
+        LogBuffer::new(),
+        stop.clone(),
+    )
+    .unwrap();
+    let admin_addr = web.addr;
+    let wifi_ctrl = web.wifi_controller();
+    let (cw, _, _) = http_call(
+        admin_addr,
+        "POST",
+        "/api/admin/settings",
+        None,
+        Some(r#"{"wifi_enabled":true}"#),
+    );
+    assert_eq!(cw, 200);
+    let (tel_addr, data_addr) = wifi_ctrl.addrs().expect("Wi-Fi listener must open");
+
+    // 1) Initial /api/admin/state must disclose missing Screen Recording & Accessibility permissions + executable_path
+    let (c0, _, body0) = http_call(admin_addr, "GET", "/api/admin/state", None, None);
+    assert_eq!(c0, 200);
+    let st0: serde_json::Value = serde_json::from_str(&body0).unwrap();
+    assert_eq!(
+        st0["host"]["capabilities"]["screen_recording_permission_required"],
+        true
+    );
+    assert_eq!(
+        st0["host"]["capabilities"]["screen_recording_granted"],
+        false
+    );
+    assert_eq!(
+        st0["host"]["capabilities"]["accessibility_permission_required"],
+        true
+    );
+    assert_eq!(st0["host"]["capabilities"]["accessibility_granted"], false);
+    assert!(
+        st0["host"]["executable_path"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty()),
+        "admin state must include host.executable_path so user knows which binary to tick in System Settings"
+    );
+    assert!(st0["host"]["last_capture_error"].is_null());
+
+    // 2) Connecting an iPad while Screen Recording is denied must fail cleanly and record `screen_recording_denied`
+    let mut tel = TcpStream::connect(tel_addr).unwrap();
+    tel.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let hs_pkt = make_handshake_packet_custom("PERM-UID-1", "PermTest-iPad", 1024, 768, "5");
+    write_canal_block(&mut tel, &hs_pkt).unwrap();
+    let mut got_port = false;
+    for _ in 0..4 {
+        if let Some(blk) = read_canal_block(&mut tel).unwrap() {
+            if let Ok(pkt) = MessagePacket::decode(&blk) {
+                if pkt.name_method == "VideoServiceAccessibleOnPort" {
+                    got_port = true;
+                    break;
+                }
+            }
+        }
+    }
+    assert!(got_port, "expected VideoServiceAccessibleOnPort after handshake");
+    let _data = TcpStream::connect(data_addr).unwrap();
+
+    // Wait briefly for start_capture() to fail & record last_capture_error
+    let mut saw_perm_err = false;
+    for _ in 0..40 {
+        let (_, _, b) = http_call(admin_addr, "GET", "/api/admin/state", None, None);
+        let j: serde_json::Value = serde_json::from_str(&b).unwrap();
+        if j["host"]["last_capture_error"]["code"] == "screen_recording_denied" {
+            assert_eq!(j["host"]["last_capture_error"]["source"], "ipad");
+            assert!(
+                j["host"]["last_capture_error"]["message"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("屏幕录制")
+            );
+            saw_perm_err = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    assert!(
+        saw_perm_err,
+        "iPad capture failure when Screen Recording is denied must surface code=screen_recording_denied in admin state"
+    );
+    drop(_data);
+    drop(tel);
+
+    // 3) Admin triggers guided permission approval buttons -> backend hooks invoked with clear Chinese guidance
+    let (cr1, _, rb1) = http_call(
+        admin_addr,
+        "POST",
+        "/api/admin/permissions/request",
+        None,
+        Some(r#"{"kind":"screen_recording"}"#),
+    );
+    assert_eq!(cr1, 200);
+    let rj1: serde_json::Value = serde_json::from_str(&rb1).unwrap();
+    assert_eq!(rj1["ok"], true);
+    assert!(rj1["message"].as_str().unwrap_or("").contains("屏幕录制"));
+
+    let (cr2, _, rb2) = http_call(
+        admin_addr,
+        "POST",
+        "/api/admin/permissions/request",
+        None,
+        Some(r#"{"kind":"accessibility"}"#),
+    );
+    assert_eq!(cr2, 200);
+    let rj2: serde_json::Value = serde_json::from_str(&rb2).unwrap();
+    assert_eq!(rj2["ok"], true);
+    assert!(rj2["message"].as_str().unwrap_or("").contains("辅助功能"));
+    assert_eq!(
+        *mock.recorded_permission_requests.lock().unwrap(),
+        vec!["screen_recording".to_string(), "accessibility".to_string()]
+    );
+
+    // 4) Simulate user granting permission + clicking "重新检测权限" -> auto-clears screen_recording_denied!
+    mock.auto_grant_screen_recording_on_recheck
+        .store(true, Ordering::Release);
+    let (cr3, _, rb3) = http_call(
+        admin_addr,
+        "POST",
+        "/api/admin/permissions/request",
+        None,
+        Some(r#"{"kind":"recheck"}"#),
+    );
+    assert_eq!(cr3, 200);
+    let rj3: serde_json::Value = serde_json::from_str(&rb3).unwrap();
+    assert_eq!(rj3["capabilities"]["screen_recording_granted"], true);
+    assert!(
+        rj3["last_capture_error"].is_null(),
+        "recheck after Screen Recording is granted must auto-clear screen_recording_denied"
+    );
+    assert_eq!(mock.recheck_permission_calls.load(Ordering::Acquire), 1);
+
+    // 5) Transient non-permission capture error -> code=capture_failed, dismissable AND auto-cleared on next success
+    mock.fail_next_start_capture.store(true, Ordering::Release);
+    let vaddr = SocketAddr::from(([127, 0, 0, 1], web.viewer_addr().unwrap().port()));
+    let (cv, vc, _) = http_call(
+        vaddr,
+        "POST",
+        "/api/view/login",
+        None,
+        Some(r#"{"token":"perm-tok-1"}"#),
+    );
+    assert_eq!(cv, 200);
+    let v_cookie = vc.into_iter().find(|c| c.starts_with("idis_view=")).unwrap();
+    let mut ws_fail = TcpStream::connect(vaddr).unwrap();
+    ws_fail
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let ws_req = format!(
+        "GET /ws/stream HTTP/1.1\r\nHost: {vaddr}\r\nOrigin: http://{vaddr}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nCookie: {v_cookie}\r\n\r\n"
+    );
+    ws_fail.write_all(ws_req.as_bytes()).unwrap();
+    let mut resp_buf = [0u8; 512];
+    let _ = ws_fail.read(&mut resp_buf);
+    drop(ws_fail);
+
+    let (_, _, st_fail_b) = http_call(admin_addr, "GET", "/api/admin/state", None, None);
+    let st_fail: serde_json::Value = serde_json::from_str(&st_fail_b).unwrap();
+    assert_eq!(st_fail["host"]["last_capture_error"]["code"], "capture_failed");
+    assert_eq!(st_fail["host"]["last_capture_error"]["source"], "web");
+
+    // Dismiss error explicitly
+    let (cd, _, db) = http_call(
+        admin_addr,
+        "POST",
+        "/api/admin/permissions/request",
+        None,
+        Some(r#"{"kind":"dismiss_capture_error"}"#),
+    );
+    assert_eq!(cd, 200);
+    let dj: serde_json::Value = serde_json::from_str(&db).unwrap();
+    assert!(dj["last_capture_error"].is_null());
+
+    // Fail once more, then connect successfully -> must auto-clear last_capture_error!
+    mock.fail_next_start_capture.store(true, Ordering::Release);
+    let mut ws_fail2 = TcpStream::connect(vaddr).unwrap();
+    ws_fail2.write_all(ws_req.as_bytes()).unwrap();
+    let _ = ws_fail2.read(&mut resp_buf);
+    drop(ws_fail2);
+    let (_, _, st_fail2_b) = http_call(admin_addr, "GET", "/api/admin/state", None, None);
+    let st_fail2: serde_json::Value = serde_json::from_str(&st_fail2_b).unwrap();
+    assert_eq!(st_fail2["host"]["last_capture_error"]["code"], "capture_failed");
+
+    let mut ws_ok = TcpStream::connect(vaddr).unwrap();
+    ws_ok
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    ws_ok.write_all(ws_req.as_bytes()).unwrap();
+    let mut hdr = Vec::new();
+    let mut b1 = [0u8; 1];
+    while !hdr.ends_with(b"\r\n\r\n") {
+        ws_ok.read_exact(&mut b1).unwrap();
+        hdr.push(b1[0]);
+    }
+    assert!(String::from_utf8_lossy(&hdr).contains("101 Switching Protocols"));
+    let (_, _, st_ok_b) = http_call(admin_addr, "GET", "/api/admin/state", None, None);
+    let st_ok: serde_json::Value = serde_json::from_str(&st_ok_b).unwrap();
+    assert!(
+        st_ok["host"]["last_capture_error"].is_null(),
+        "successful capture must auto-clear previous last_capture_error"
+    );
+
+    drop(ws_ok);
+    stop.store(true, Ordering::SeqCst);
+    reg.close_all();
+    web.stop();
+}

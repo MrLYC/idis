@@ -55,7 +55,13 @@ pub struct MockBackend {
     pub mock_display_bounds: DisplayBoundsMap,
     pub mock_windows: Arc<Mutex<Vec<DesktopWindowInfo>>>,
     pub recorded_window_moves: Arc<Mutex<Vec<WindowMoveRecord>>>,
+    pub accessibility_permission_required: Arc<AtomicBool>,
     pub accessibility_granted: Arc<AtomicBool>,
+    pub screen_recording_permission_required: Arc<AtomicBool>,
+    pub screen_recording_granted: Arc<AtomicBool>,
+    pub recorded_permission_requests: Arc<Mutex<Vec<String>>>,
+    pub recheck_permission_calls: Arc<AtomicUsize>,
+    pub auto_grant_screen_recording_on_recheck: Arc<AtomicBool>,
 }
 
 impl Default for MockBackend {
@@ -85,7 +91,13 @@ impl Default for MockBackend {
             mock_display_bounds: Arc::new(Mutex::new(bounds)),
             mock_windows: Arc::new(Mutex::new(Vec::new())),
             recorded_window_moves: Arc::new(Mutex::new(Vec::new())),
+            accessibility_permission_required: Arc::new(AtomicBool::new(false)),
             accessibility_granted: Arc::new(AtomicBool::new(true)),
+            screen_recording_permission_required: Arc::new(AtomicBool::new(false)),
+            screen_recording_granted: Arc::new(AtomicBool::new(true)),
+            recorded_permission_requests: Arc::new(Mutex::new(Vec::new())),
+            recheck_permission_calls: Arc::new(AtomicUsize::new(0)),
+            auto_grant_screen_recording_on_recheck: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -390,10 +402,44 @@ impl DisplayBackend for MockBackend {
             screen_lock_detection: true,
             live_abr_quality: self.live_abr_quality.load(Ordering::Acquire),
             true_capture_pause: true,
-            accessibility_permission_required: false,
+            accessibility_permission_required: self
+                .accessibility_permission_required
+                .load(Ordering::Acquire),
             accessibility_granted: self.accessibility_granted.load(Ordering::Acquire),
-            screen_recording_permission_required: false,
-            screen_recording_granted: true,
+            screen_recording_permission_required: self
+                .screen_recording_permission_required
+                .load(Ordering::Acquire),
+            screen_recording_granted: self.screen_recording_granted.load(Ordering::Acquire),
+        }
+    }
+
+    fn request_permission(&self, kind: &str) -> Result<String> {
+        self.recorded_permission_requests
+            .lock()
+            .unwrap()
+            .push(kind.to_string());
+        match kind {
+            "screen_recording" => Ok(if self.screen_recording_granted.load(Ordering::Acquire) {
+                "屏幕录制权限已授权，可直接连接使用。".to_string()
+            } else {
+                "已在主机上打开「系统设置 → 隐私与安全性 → 屏幕录制」。".to_string()
+            }),
+            "accessibility" => Ok(if self.accessibility_granted.load(Ordering::Acquire) {
+                "辅助功能权限已授权，远程键鼠与触控已可用。".to_string()
+            } else {
+                "已在主机上打开「系统设置 → 隐私与安全性 → 辅助功能」。".to_string()
+            }),
+            other => Err(anyhow!("未知权限类型: {other}")),
+        }
+    }
+
+    fn recheck_permissions(&self) {
+        self.recheck_permission_calls.fetch_add(1, Ordering::AcqRel);
+        if self
+            .auto_grant_screen_recording_on_recheck
+            .load(Ordering::Acquire)
+        {
+            self.screen_recording_granted.store(true, Ordering::Release);
         }
     }
 
@@ -425,6 +471,15 @@ impl DisplayBackend for MockBackend {
         &self,
         params: &CaptureParams,
     ) -> Result<(Box<dyn CaptureHandle>, FrameReceiver)> {
+        if self
+            .screen_recording_permission_required
+            .load(Ordering::Acquire)
+            && !self.screen_recording_granted.load(Ordering::Acquire)
+        {
+            anyhow::bail!(
+                "macOS 拒绝了屏幕录制权限：请前往「系统设置 → 隐私与安全性 → 屏幕录制」勾选当前终端或 idis。（Screen Recording permission denied）"
+            );
+        }
         if self.fail_next_start_capture.swap(false, Ordering::AcqRel) {
             anyhow::bail!("mock injected start_capture failure");
         }
